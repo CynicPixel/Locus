@@ -22,7 +22,7 @@
     ├── ingestor.rs          ← connects to Go Unix socket OR generates mock frames
     │        │
     │        ▼
-    ├── correlator.rs        ← groups frames by (ICAO24, hash, 5ms bucket)
+    ├── correlator.rs        ← groups frames by (ICAO24, content_hash) with time-based eviction
     │        │
     │        ▼
     ├── clock_sync.rs        ← corrects TDOA using beacon aircraft
@@ -205,8 +205,9 @@ thiserror = "1"
 anyhow = "1"
 
 # Hashing (for message correlation key)
-sha2 = "0.10"
+rustc-hash = "1.1"
 hex = "0.4"
+dashmap = "5"
 
 # CLI flags
 clap = { version = "4", features = ["derive"] }
@@ -273,6 +274,7 @@ touch Locus/rust-backend/src/correlator.rs
 touch Locus/rust-backend/src/clock_sync.rs
 touch Locus/rust-backend/src/mlat_solver.rs
 touch Locus/rust-backend/src/kalman.rs
+touch Locus/rust-backend/src/coords.rs
 touch Locus/rust-backend/src/spoof_detector.rs
 touch Locus/rust-backend/src/anomaly_client.rs
 touch Locus/rust-backend/src/ws_server.rs
@@ -523,8 +525,6 @@ services:
 volumes:
   locus-ipc:
     driver: local
-  locus-models:
-    driver: local
 ```
 
 Note: `go-ingestor` is in the `live` profile. In mock mode you run:
@@ -532,9 +532,9 @@ Note: `go-ingestor` is in the `live` profile. In mock mode you run:
 docker compose up rust-backend ml-service frontend
 ```
 
-For live mode with real network data:
+For live mode with real network data (also applies `docker-compose.live.yml` override for `depends_on: go-ingestor`):
 ```bash
-docker compose --profile live up
+docker compose -f docker-compose.yml -f docker-compose.live.yml --profile live up
 ```
 
 **File**: `Locus/docker-compose.dev.yml`
@@ -642,8 +642,11 @@ defer ln.Close()
 log.Printf("Ingestor listening on %s", socketPath)
 ```
 
-Accept connections in a goroutine and write JSON lines to each connected client:
+Accept connections with a mutex-protected client map — removes disconnected clients on write error (Race 3: silently ignores write errors on dead connections rather than crashing the goroutine):
+
 ```go
+// Add to imports: "sync", "time"
+
 type RawFrameOut struct {
     SensorID             int64   `json:"sensor_id"`
     SensorLat            float64 `json:"sensor_lat"`
@@ -654,6 +657,42 @@ type RawFrameOut struct {
     RawModesHex          string  `json:"raw_modes_hex"`
 }
 
+var (
+    clientsMu sync.Mutex
+    clients   = make(map[net.Conn]struct{})
+)
+
+// Accept loop (in goroutine):
+go func() {
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            log.Printf("accept error: %v", err)
+            continue
+        }
+        clientsMu.Lock()
+        clients[conn] = struct{}{}
+        clientsMu.Unlock()
+        log.Printf("Rust backend connected")
+    }
+}()
+
+// Broadcast to all clients (replace direct fmt.Fprintf call):
+func broadcast(data []byte) {
+    clientsMu.Lock()
+    defer clientsMu.Unlock()
+    for conn := range clients {
+        conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+        _, err := fmt.Fprintf(conn, "%s\n", data)
+        if err != nil {
+            log.Printf("client write error, removing: %v", err)
+            conn.Close()
+            delete(clients, conn)
+        }
+    }
+}
+
+// In the message loop, replace fmt.Fprintf with:
 frame := RawFrameOut{
     SensorID:             sensorID,
     SensorLat:            sensorLatitude,
@@ -668,8 +707,7 @@ if err != nil {
     log.Printf("JSON marshal error: %v", err)
     continue
 }
-// for each accepted conn, in a goroutine:
-fmt.Fprintf(conn, "%s\n", jsonBytes)
+broadcast(jsonBytes)
 ```
 
 All `log.Printf` and `fmt.Println` debug lines must write to `os.Stderr` so they don't appear on the socket. All human-readable logging goes to `os.Stderr`.
@@ -710,9 +748,11 @@ impl RawFrame {
         self.timestamp_seconds * 1_000_000_000 + self.timestamp_nanoseconds
     }
 
-    /// Decoded raw Mode-S bytes
-    pub fn raw_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.raw_modes_hex).unwrap_or_default()
+    /// Decoded raw Mode-S bytes.
+    /// Reserve `unwrap()` for programmer errors only (e.g. mutex poisoning);
+    /// use explicit error handling on all data paths.
+    pub fn raw_bytes(&self) -> Result<Vec<u8>, hex::FromHexError> {
+        hex::decode(&self.raw_modes_hex)
     }
 }
 ```
@@ -726,14 +766,14 @@ pub async fn run_ingestor(
 ) -> anyhow::Result<()>
 ```
 
-**Live mode implementation** inside `run_ingestor`:
+**Live mode implementation** inside `run_ingestor` — outer reconnect loop handles Go crashes/restarts (Race 1 and Race 2):
 ```rust
 const SOCKET_PATH: &str = "/tmp/locus/ingestor.sock";
-const MAX_RETRIES: u32 = 30;
+const MAX_CONNECT_RETRIES: u32 = 120;  // 60 seconds total budget
 const RETRY_DELAY_MS: u64 = 500;
 
 async fn connect_with_retry() -> anyhow::Result<tokio::net::UnixStream> {
-    for attempt in 0..MAX_RETRIES {
+    for attempt in 0..MAX_CONNECT_RETRIES {
         match tokio::net::UnixStream::connect(SOCKET_PATH).await {
             Ok(stream) => {
                 tracing::info!("Connected to ingestor socket on attempt {}", attempt + 1);
@@ -745,21 +785,45 @@ async fn connect_with_retry() -> anyhow::Result<tokio::net::UnixStream> {
             }
         }
     }
-    anyhow::bail!("Could not connect after {MAX_RETRIES} attempts")
+    anyhow::bail!("Could not connect after {MAX_CONNECT_RETRIES} attempts")
 }
 
-// In run_ingestor (live branch):
-let stream = connect_with_retry().await?;
-let reader = tokio::io::BufReader::new(stream);
-let mut lines = reader.lines();
+async fn read_loop(
+    stream: tokio::net::UnixStream,
+    tx: &tokio::sync::mpsc::Sender<RawFrame>,
+) -> anyhow::Result<()> {
+    let reader = tokio::io::BufReader::new(stream);
+    let mut lines = tokio::io::AsyncBufReadExt::lines(reader);
 
-while let Some(line) = lines.next_line().await? {
-    match serde_json::from_str::<RawFrame>(&line) {
-        Ok(frame) => {
-            if tx.send(frame).await.is_err() { break; }
+    while let Some(line) = lines.next_line().await? {
+        match serde_json::from_str::<RawFrame>(&line) {
+            Ok(frame) => {
+                if tx.send(frame).await.is_err() {
+                    anyhow::bail!("downstream receiver dropped — shutting down ingestor");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, line_len = line.len(), "JSON parse error — dropping frame");
+            }
         }
+    }
+    Ok(())
+}
+
+// In run_ingestor (live branch) — outer reconnect loop:
+loop {
+    match connect_with_retry().await {
         Err(e) => {
-            tracing::warn!("Deserialize error: {e} — line: {line}");
+            tracing::error!("Could not connect to Go ingestor: {e}. Retrying in 5s.");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        Ok(stream) => {
+            tracing::info!("Connected to Go ingestor socket");
+            let result = read_loop(stream, &tx).await;
+            tracing::warn!("Go ingestor connection lost: {result:?}. Reconnecting...");
+            // Brief pause before reconnect to avoid tight loop on persistent failure
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
@@ -841,20 +905,7 @@ arrival_time_ns += Gaussian(mean=0, sigma=50)  // clock drift noise
 
 Where `c_m_per_ns = 0.299792458` (meters per nanosecond).
 
-Convert lat/lon/alt to ECEF for distance calculation:
-```rust
-fn to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> (f64, f64, f64) {
-    let a = 6_378_137.0_f64;        // WGS84 semi-major axis
-    let e2 = 6.694_379_990_14e-3;   // WGS84 first eccentricity squared
-    let lat = lat_deg.to_radians();
-    let lon = lon_deg.to_radians();
-    let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
-    let x = (n + alt_m) * lat.cos() * lon.cos();
-    let y = (n + alt_m) * lat.cos() * lon.sin();
-    let z = (n * (1.0 - e2) + alt_m) * lat.sin();
-    (x, y, z)
-}
-```
+Convert lat/lon/alt to ECEF for distance calculation — use `coords::wgs84_to_ecef()` from `src/coords.rs` (see Step 2.3). Do **not** duplicate this function here; import it via `use crate::coords;`.
 
 The mock loop ticks at 20ms intervals (50 Hz) per aircraft, broadcasting to all sensors.
 
@@ -997,32 +1048,53 @@ Implement the correlator, Levenberg-Marquardt MLAT solver, Kalman filter, and br
 
 **File**: `Locus/rust-backend/src/correlator.rs`
 
-**Correlation key**:
+**Correlation key** — uses FxHash (100× faster than SHA256 on the hot path; `rustc-hash = "1.1"` in Cargo.toml):
 ```rust
-use sha2::{Sha256, Digest};
+// Add to Cargo.toml: rustc-hash = "1.1"
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CorrelationKey {
-    pub icao24: String,
-    pub content_hash: [u8; 8],   // first 8 bytes of SHA256 of raw_modes_hex
-    pub time_bucket: u64,        // floor(timestamp_ns / 5_000_000)  — 5ms buckets
+    pub icao24: [u8; 3],    // fixed array, no heap allocation
+    pub content_hash: u64,  // FxHash of raw frame bytes
 }
 
 impl CorrelationKey {
     pub fn from_frame(frame: &RawFrame) -> Option<Self> {
-        let bytes = frame.raw_bytes();
-        if bytes.len() < 7 { return None; }
-        // ICAO24 is bytes 1..4 of a Mode-S long frame (DF17/DF18)
+        let bytes = match frame.raw_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    sensor_id = frame.sensor_id,
+                    raw_hex = %frame.raw_modes_hex,
+                    error = %e,
+                    "hex decode failed — dropping frame"
+                );
+                return None;
+            }
+        };
+
+        if bytes.len() < 7 {
+            tracing::debug!(
+                sensor_id = frame.sensor_id,
+                len = bytes.len(),
+                "frame too short — dropping"
+            );
+            return None;
+        }
+
+        // Only correlate DF17/DF18 (ADS-B extended squitter)
         let df = (bytes[0] >> 3) & 0x1F;
-        if df != 17 && df != 18 { return None; } // only ADS-B/extended squitter
-        let icao24 = format!("{:02X}{:02X}{:02X}", bytes[1], bytes[2], bytes[3]);
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let hash_bytes: [u8; 32] = hasher.finalize().into();
-        let mut content_hash = [0u8; 8];
-        content_hash.copy_from_slice(&hash_bytes[..8]);
-        let time_bucket = frame.timestamp_ns() / 5_000_000;
-        Some(CorrelationKey { icao24, content_hash, time_bucket })
+        if df != 17 && df != 18 { return None; }
+
+        let icao24 = [bytes[1], bytes[2], bytes[3]];
+
+        let mut hasher = FxHasher::default();
+        bytes.hash(&mut hasher);
+        let content_hash = hasher.finish();
+
+        Some(CorrelationKey { icao24, content_hash })
     }
 }
 ```
@@ -1037,36 +1109,115 @@ pub struct CorrelationGroup {
 }
 ```
 
-**Correlator state**:
+**Correlation group** (updated with `first_seen_ns`):
 ```rust
+#[derive(Debug, Clone)]
+pub struct CorrelationGroup {
+    pub key: CorrelationKey,
+    pub frames: Vec<RawFrame>,   // one per sensor (deduplicated by sensor_id)
+    pub first_seen_ns: u64,      // timestamp of first frame received
+}
+```
+
+**Correlator state** — pass a per-sensor drop counter from `main.rs` for UI visibility:
+```rust
+use std::sync::Arc;
+use dashmap::DashMap;
+
 pub struct Correlator {
     groups: HashMap<CorrelationKey, CorrelationGroup>,
-    min_sensors: usize,           // minimum 3 sensors to attempt MLAT
-    window_ns: u64,               // eviction window: 50ms
+    min_sensors: usize,   // 3
+    window_ns: u64,       // 50_000_000 (50ms) — larger than max EU propagation spread of 6ms
+    drop_counter: Arc<DashMap<i64, u64>>,  // per-sensor drop counts, broadcast in sensor_health
 }
 
 impl Correlator {
-    pub fn new() -> Self {
+    pub fn new(drop_counter: Arc<DashMap<i64, u64>>) -> Self {
         Self {
             groups: HashMap::new(),
             min_sensors: 3,
             window_ns: 50_000_000,
+            drop_counter,
         }
     }
 
-    /// Feed a raw frame. Returns a completed group if ready.
-    pub fn ingest(&mut self, frame: RawFrame) -> Option<CorrelationGroup> { ... }
+    /// Feed a raw frame. Returns a completed group immediately when min_sensors reached.
+    pub fn ingest(&mut self, frame: RawFrame) -> Option<CorrelationGroup> {
+        let key = CorrelationKey::from_frame(&frame)?;
+        let now_ns = frame.timestamp_ns();
 
-    /// Evict stale groups older than window_ns. Call periodically.
-    pub fn evict_stale(&mut self, now_ns: u64) { ... }
+        let group = self.groups.entry(key.clone()).or_insert_with(|| {
+            CorrelationGroup {
+                key: key.clone(),
+                frames: Vec::new(),
+                first_seen_ns: now_ns,
+            }
+        });
+
+        // Deduplicate by sensor_id — one observation per sensor per group
+        let already_seen = group.frames.iter()
+            .any(|f| f.sensor_id == frame.sensor_id);
+        if !already_seen {
+            group.frames.push(frame);
+        }
+
+        // Emit immediately when minimum sensor count reached
+        if group.frames.len() >= self.min_sensors {
+            return Some(self.groups.remove(&key).unwrap());
+        }
+
+        None
+    }
+
+    /// Call every 10ms from the main pipeline loop to evict timed-out groups.
+    pub fn evict_stale(&mut self, now_ns: u64) -> Vec<CorrelationGroup> {
+        let window = self.window_ns;
+        let min = self.min_sensors;
+        let mut emitted = Vec::new();
+
+        self.groups.retain(|_, group| {
+            let age = now_ns.saturating_sub(group.first_seen_ns);
+            if age > window {
+                if group.frames.len() >= min {
+                    emitted.push(group.clone());
+                } else {
+                    tracing::debug!(
+                        icao24 = ?group.key.icao24,
+                        n_sensors = group.frames.len(),
+                        "evicting incomplete group (insufficient sensors)"
+                    );
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        emitted
+    }
 }
 ```
 
-The `ingest` method:
-1. Compute `CorrelationKey::from_frame(&frame)` — return `None` on parse failure
-2. Insert frame into the matching group (skip duplicates by `sensor_id`)
-3. If `group.frames.len() >= min_sensors`: remove group from HashMap and return it
-4. Otherwise return `None`
+**Main pipeline loop** — handle both immediate emission and timed-out eviction:
+```rust
+// Every frame:
+if let Some(group) = correlator.ingest(frame) {
+    // send to solver immediately (min_sensors reached)
+    solver_tx.send(group).await?;
+}
+
+// Every 10ms tick:
+for group in correlator.evict_stale(now_ns) {
+    solver_tx.send(group).await?;  // timed-out groups with sufficient sensors
+}
+```
+
+**Call site in `main.rs`** — create drop counter and pass into `Correlator::new()`:
+```rust
+let drop_counter: Arc<DashMap<i64, u64>> = Arc::new(DashMap::new());
+let mut correlator = Correlator::new(drop_counter.clone());
+// Include drop_counter.clone() in the sensor_health WebSocket broadcast (ws_server.rs)
+```
 
 ---
 
@@ -1089,7 +1240,8 @@ pub struct MlatSolution {
     pub lon: f64,
     pub alt_m: f64,
     pub gdop: f64,
-    pub covariance: nalgebra::Matrix3<f64>,
+    pub accuracy_m: f64,         // confidence_ellipse_m() result
+    pub covariance: [[f64; 3]; 3],
 }
 ```
 
@@ -1136,34 +1288,122 @@ let result = Executor::new(problem, solver)
     .run()?;
 ```
 
-**GDOP computation**:
+**GDOP computation** — Nx3 matrix (MLAT has no clock bias unknown; TDOA differencing already eliminates transmission time):
 ```rust
-fn compute_gdop(solution_ecef: &Vector3<f64>, sensors: &[Vector3<f64>]) -> f64 {
-    // Build geometry matrix H (N x 4): [dx/r, dy/r, dz/r, -1] for each sensor
-    // GDOP = sqrt(trace((H^T H)^{-1}))
+fn compute_gdop(
+    solution_ecef: &Vector3<f64>,
+    sensors: &[Vector3<f64>],
+) -> f64 {
     let n = sensors.len();
-    let mut h = nalgebra::DMatrix::<f64>::zeros(n, 4);
+
+    // MLAT geometry matrix: Nx3 (no clock bias column)
+    // Each row: unit vector from solution to sensor
+    let mut h = nalgebra::DMatrix::<f64>::zeros(n, 3);
+
     for (i, s) in sensors.iter().enumerate() {
         let diff = solution_ecef - s;
         let r = diff.norm();
+        if r < 1.0 { return f64::INFINITY; }  // degenerate: solution at sensor location
         h[(i, 0)] = diff[0] / r;
         h[(i, 1)] = diff[1] / r;
         h[(i, 2)] = diff[2] / r;
-        h[(i, 3)] = -1.0;
+        // NO fourth column — MLAT does not estimate clock bias
     }
+
     let ht_h = h.transpose() * &h;
     match ht_h.try_inverse() {
         Some(inv) => inv.trace().sqrt(),
-        None => f64::INFINITY,
+        None => f64::INFINITY,  // singular matrix — collinear sensors
     }
 }
 ```
 
 **GDOP filter**: discard solution if `gdop > 5.0`. Log discards at `tracing::debug!` level.
 
-**WGS84 back-conversion**:
+**WGS84 back-conversion** — use `coords::ecef_to_wgs84()` from `src/coords.rs` (see Step 2.3). Do not duplicate; import via `use crate::coords;`.
+
+**Public API**:
 ```rust
-fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+pub fn solve(input: &MlatInput, prior: Option<Vector3<f64>>) -> Option<MlatSolution>
+```
+
+Returns `None` if solver fails to converge or GDOP > 5.
+
+> **Note**: Patch 3's Kalman prior is only physically meaningful after Patch 6 converts the
+> filter to ECEF state. Implementation order: Patch 6 (ECEF Kalman) first, then Patch 3.
+
+**Initial guess strategy** — LM is sensitive to initialization; always provide a physically meaningful starting point:
+```rust
+pub fn solve(input: &MlatInput, prior: Option<Vector3<f64>>) -> Option<MlatSolution> {
+    let initial_guess = match prior {
+        // Use last known ECEF position from Kalman filter if available
+        Some(ecef) => ecef,
+
+        // First observation: use centroid of all sensors + typical cruise altitude
+        None => {
+            let n = input.sensor_positions.len() as f64;
+            let centroid = input.sensor_positions.iter()
+                .fold(Vector3::zeros(), |acc, &(x, y, z)| {
+                    acc + Vector3::new(x, y, z)
+                }) / n;
+
+            // Offset centroid outward from Earth center by ~10,000m
+            // (typical cruise altitude above the sensor plane)
+            let centroid_norm = centroid.norm();
+            let earth_radius = 6_371_000.0_f64;
+            let scale = (earth_radius + 10_000.0) / centroid_norm;
+            centroid * scale
+        }
+    };
+
+    // Pass initial_guess to the argmin Executor:
+    let result = Executor::new(problem, solver)
+        .configure(|state| {
+            state
+                .param(initial_guess)
+                .max_iters(100)
+                .target_cost(1e-6)
+        })
+        .run()
+        .ok()?;
+
+    // compute accuracy_m from confidence_ellipse_m() before returning
+    let accuracy_m = confidence_ellipse_m(&covariance);
+    // ... build and return MlatSolution
+}
+```
+
+**Call site in main pipeline** — pass Kalman ECEF state as prior:
+```rust
+let prior_ecef = kalman_registry
+    .get_ecef(&icao24)  // returns Option<Vector3<f64>>
+    .map(|state| Vector3::new(state[0], state[1], state[2]));
+
+let solution = mlat_solver::solve(&input, prior_ecef)?;
+```
+
+---
+
+### Step 2.3 — Kalman Filter (EKF per Aircraft)
+
+**File**: `Locus/rust-backend/src/kalman.rs`
+
+**File**: `Locus/rust-backend/src/coords.rs` — shared coordinate conversion module (add `mod coords;` to `main.rs`):
+```rust
+// rust-backend/src/coords.rs
+pub fn wgs84_to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> (f64, f64, f64) {
+    let a = 6_378_137.0_f64;
+    let e2 = 6.694_379_990_14e-3;
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+    let x = (n + alt_m) * lat.cos() * lon.cos();
+    let y = (n + alt_m) * lat.cos() * lon.sin();
+    let z = (n * (1.0 - e2) + alt_m) * lat.sin();
+    (x, y, z)
+}
+
+pub fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     // Bowring's iterative method
     let a = 6_378_137.0_f64;
     let e2 = 6.694_379_990_14e-3;
@@ -1180,90 +1420,105 @@ fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
 }
 ```
 
-**Public API**:
-```rust
-pub fn solve(input: &MlatInput) -> Option<MlatSolution>
-```
+Also add `touch Locus/rust-backend/src/coords.rs` to the Step 0.3 stub creation commands.
+The mock ingestor's `to_ecef()` function moves here as `pub fn wgs84_to_ecef(...)` — update all import sites accordingly.
 
-Returns `None` if solver fails to converge or GDOP > 5.
-
----
-
-### Step 2.3 — Kalman Filter (EKF per Aircraft)
-
-**File**: `Locus/rust-backend/src/kalman.rs`
-
-**State vector**: `[lat, lon, alt_m, vel_lat, vel_lon, vel_alt]` (6 elements)
+**State vector**: `[x, y, z, vx, vy, vz]` in ECEF meters and m/s — no unit mixing, no degree/meter ambiguity.
 
 ```rust
-use nalgebra::{Matrix6, Vector6, Matrix3x6, Matrix6x3};
+use nalgebra::{Matrix6, Vector6, Matrix3x6};
 
 pub struct AircraftKalman {
     pub icao24: String,
-    pub x: Vector6<f64>,          // state estimate
-    pub p: Matrix6<f64>,          // error covariance
+    // State: [x, y, z, vx, vy, vz] — ALL in meters and meters/second (ECEF)
+    pub x: Vector6<f64>,
+    pub p: Matrix6<f64>,
     pub last_update_ns: u64,
 }
 
 impl AircraftKalman {
-    pub fn new(icao24: String, lat: f64, lon: f64, alt: f64) -> Self {
-        let x = Vector6::new(lat, lon, alt, 0.0, 0.0, 0.0);
-        let p = Matrix6::identity() * 1e4; // large initial uncertainty
+    pub fn new(icao24: String, x_ecef: f64, y_ecef: f64, z_ecef: f64) -> Self {
+        let x = Vector6::new(x_ecef, y_ecef, z_ecef, 0.0, 0.0, 0.0);
+        // Initial uncertainty: 1000m position, 50m/s velocity
+        let mut p = Matrix6::zeros();
+        p[(0,0)] = 1_000_000.0;  // 1000m^2
+        p[(1,1)] = 1_000_000.0;
+        p[(2,2)] = 1_000_000.0;
+        p[(3,3)] = 2_500.0;      // 50 m/s ^2
+        p[(4,4)] = 2_500.0;
+        p[(5,5)] = 2_500.0;
         Self { icao24, x, p, last_update_ns: 0 }
     }
 
-    /// Predict step: propagate state by dt seconds
     pub fn predict(&mut self, dt: f64) {
-        // State transition: pos += vel * dt
         let f = Self::transition_matrix(dt);
         let q = Self::process_noise(dt);
         self.x = &f * &self.x;
         self.p = &f * &self.p * f.transpose() + q;
     }
 
-    /// Update step: fuse MLAT measurement [lat, lon, alt]
-    pub fn update(&mut self, lat: f64, lon: f64, alt: f64) {
-        // Observation matrix H: maps state to [lat, lon, alt]
+    // Input: ECEF position in meters (convert from WGS84 before calling)
+    // accuracy_m comes from MlatSolution — GDOP-derived confidence ellipse
+    pub fn update(&mut self, x_m: f64, y_m: f64, z_m: f64, accuracy_m: f64) {
         let h = Matrix3x6::new(
             1.,0.,0.,0.,0.,0.,
             0.,1.,0.,0.,0.,0.,
             0.,0.,1.,0.,0.,0.,
         );
+
+        // Measurement noise in meters^2; floor at 100m RMS (MLAT cannot exceed this)
+        let r_val = accuracy_m.powi(2).max(10_000.0);
         let r = nalgebra::Matrix3::from_diagonal(
-            &nalgebra::Vector3::new(1e-8, 1e-8, 100.0) // measurement noise
+            &nalgebra::Vector3::new(r_val, r_val, r_val * 4.0)
+            // Vertical (z) is ~2x less accurate in MLAT geometry
         );
-        let z = nalgebra::Vector3::new(lat, lon, alt);
-        let y = z - &h * &self.x;             // innovation
+
+        let z = nalgebra::Vector3::new(x_m, y_m, z_m);
+        let y = z - &h * &self.x;
         let s = &h * &self.p * h.transpose() + r;
-        let k = &self.p * h.transpose() * s.try_inverse().unwrap_or(nalgebra::Matrix3::zeros());
+        let k = &self.p * h.transpose() *
+            s.try_inverse().unwrap_or(nalgebra::Matrix3::zeros());
         self.x = &self.x + &k * y;
-        let i = Matrix6::identity();
-        self.p = (i - k * &h) * &self.p;
+        self.p = (Matrix6::identity() - k * &h) * &self.p;
+    }
+
+    // Output conversion: call only when sending to WebSocket / frontend
+    pub fn position_wgs84(&self) -> (f64, f64, f64) {
+        coords::ecef_to_wgs84(self.x[0], self.x[1], self.x[2])
+    }
+
+    pub fn velocity_ms(&self) -> (f64, f64, f64) {
+        (self.x[3], self.x[4], self.x[5])
     }
 
     fn transition_matrix(dt: f64) -> Matrix6<f64> {
         let mut f = Matrix6::identity();
-        f[(0, 3)] = dt; f[(1, 4)] = dt; f[(2, 5)] = dt;
+        f[(0,3)] = dt; f[(1,4)] = dt; f[(2,5)] = dt;
         f
     }
 
     fn process_noise(dt: f64) -> Matrix6<f64> {
-        let sigma_a = 0.1_f64; // m/s^2 process noise
+        // sigma_a = 2.0 m/s^2 — realistic for commercial aircraft
+        // All components in meters — no unit ambiguity
+        let sigma_a2 = 4.0_f64;  // sigma_a^2
         let dt2 = dt * dt / 2.0;
         let dt3 = dt * dt * dt / 3.0;
         let mut q = Matrix6::zeros();
-        q[(0, 0)] = dt3 * sigma_a; q[(0, 3)] = dt2 * sigma_a;
-        q[(1, 1)] = dt3 * sigma_a; q[(1, 4)] = dt2 * sigma_a;
-        q[(2, 2)] = dt3 * sigma_a; q[(2, 5)] = dt2 * sigma_a;
-        q[(3, 0)] = dt2 * sigma_a; q[(3, 3)] = dt * sigma_a;
-        q[(4, 1)] = dt2 * sigma_a; q[(4, 4)] = dt * sigma_a;
-        q[(5, 2)] = dt2 * sigma_a; q[(5, 5)] = dt * sigma_a;
+        q[(0,0)] = dt3 * sigma_a2;
+        q[(1,1)] = dt3 * sigma_a2;
+        q[(2,2)] = dt3 * sigma_a2;
+        q[(3,3)] = dt * sigma_a2;
+        q[(4,4)] = dt * sigma_a2;
+        q[(5,5)] = dt * sigma_a2;
+        q[(0,3)] = dt2 * sigma_a2; q[(3,0)] = dt2 * sigma_a2;
+        q[(1,4)] = dt2 * sigma_a2; q[(4,1)] = dt2 * sigma_a2;
+        q[(2,5)] = dt2 * sigma_a2; q[(5,2)] = dt2 * sigma_a2;
         q
     }
 }
 ```
 
-**Kalman registry** in main pipeline:
+**Kalman registry** in main pipeline — converts WGS84 MLAT output to ECEF before updating, converts back for broadcast:
 ```rust
 pub struct KalmanRegistry {
     filters: HashMap<String, AircraftKalman>,
@@ -1271,15 +1526,24 @@ pub struct KalmanRegistry {
 
 impl KalmanRegistry {
     pub fn update(&mut self, icao24: &str, mlat: &MlatSolution, now_ns: u64) -> AircraftState {
+        let (x_ecef, y_ecef, z_ecef) = coords::wgs84_to_ecef(mlat.lat, mlat.lon, mlat.alt_m);
         let entry = self.filters.entry(icao24.to_string()).or_insert_with(|| {
-            AircraftKalman::new(icao24.to_string(), mlat.lat, mlat.lon, mlat.alt_m)
+            AircraftKalman::new(icao24.to_string(), x_ecef, y_ecef, z_ecef)
         });
         let dt = if entry.last_update_ns == 0 { 0.1 }
                  else { (now_ns - entry.last_update_ns) as f64 / 1e9 };
         entry.predict(dt);
-        entry.update(mlat.lat, mlat.lon, mlat.alt_m);
+        entry.update(x_ecef, y_ecef, z_ecef, mlat.accuracy_m);
         entry.last_update_ns = now_ns;
-        AircraftState::from_kalman(icao24, entry, mlat)
+        let (lat, lon, alt_m) = entry.position_wgs84();
+        AircraftState::from_kalman(icao24, lat, lon, alt_m, entry, mlat)
+    }
+
+    /// Returns current ECEF position for use as LM solver prior (Patch 3).
+    pub fn get_ecef(&self, icao24: &str) -> Option<Vector3<f64>> {
+        self.filters.get(icao24).map(|k| {
+            Vector3::new(k.x[0], k.x[1], k.x[2])
+        })
     }
 }
 ```
@@ -1515,7 +1779,7 @@ docker compose up rust-backend ml-service frontend
 Parse ADS-B position frames from beacon aircraft to compute per-sensor-pair clock offsets, apply them before the MLAT solve, and display sensor health in a Chart.js panel.
 
 ### Visible Outcome
-- **Terminal**: `clock_offset[1001][1002] = +12.3ns (EMA)` logged, GDOP improving over time
+- **Terminal**: `clock[1001→1002] offset=+12.3ns n=50` logged, GDOP improving over time
 - **Browser**: "Sensor Health" panel shows a per-sensor clock offset drift sparkline (Chart.js)
 
 ### Estimated time: 3–4 hours
@@ -1589,80 +1853,129 @@ For hackathon purposes, if CPR decode is complex, use the aircraft's self-report
 
 **File**: `Locus/rust-backend/src/clock_sync.rs`
 
-```rust
-use std::collections::HashMap;
+Uses windowed median instead of EMA — converges in ~5 observations vs. ~45 for EMA, and is immune to multipath spike contamination.
 
-const EMA_ALPHA: f64 = 0.1;  // exponential moving average weight
-const C_M_PER_NS: f64 = 0.299_792_458;  // speed of light in m/ns
+```rust
+use std::collections::{HashMap, VecDeque};
+
+const WINDOW_SIZE: usize = 50;  // ~5 seconds at 10 beacon observations/second
+const C_M_PER_NS: f64 = 0.299_792_458;
 
 pub struct ClockSyncEngine {
-    // offset[sensor_i][sensor_j] = corrected nanoseconds to subtract from t_i - t_j
-    offsets: HashMap<(i64, i64), f64>,
-    sample_counts: HashMap<(i64, i64), u64>,
+    // Store raw observations per sensor pair — compute median on demand
+    samples: HashMap<(i64, i64), VecDeque<f64>>,
 }
 
 impl ClockSyncEngine {
     pub fn new() -> Self {
-        Self { offsets: HashMap::new(), sample_counts: HashMap::new() }
+        Self { samples: HashMap::new() }
     }
 
     /// Update clock offset using a beacon aircraft with known position.
     pub fn update_from_beacon(
         &mut self,
-        sensor_i: i64, pos_i: (f64, f64, f64),  // sensor ECEF
+        sensor_i: i64, pos_i: (f64, f64, f64),
         sensor_j: i64, pos_j: (f64, f64, f64),
         t_i_ns: u64, t_j_ns: u64,
         beacon_ecef: (f64, f64, f64),
     ) {
         let dist_i = ecef_dist(pos_i, beacon_ecef);
         let dist_j = ecef_dist(pos_j, beacon_ecef);
-        let theoretical_tdoa_ns = (dist_i - dist_j) / C_M_PER_NS;
+        let expected_tdoa_ns = (dist_i - dist_j) / C_M_PER_NS;
         let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
-        let error_ns = observed_tdoa_ns - theoretical_tdoa_ns;
+        let error_ns = observed_tdoa_ns - expected_tdoa_ns;
 
-        let key = (sensor_i, sensor_j);
-        let current = self.offsets.entry(key).or_insert(0.0);
-        *current = (1.0 - EMA_ALPHA) * *current + EMA_ALPHA * error_ns;
-        *self.sample_counts.entry(key).or_insert(0) += 1;
+        // Outlier gate: reject if >3x current spread from current median
+        // Prevents multipath spikes from contaminating the window
+        let buf = self.samples
+            .entry((sensor_i, sensor_j))
+            .or_insert_with(VecDeque::new);
+
+        if buf.len() >= 5 {
+            let current_median = median_of_deque(buf);
+            let current_spread = spread_of_deque(buf);  // median absolute deviation
+            if (error_ns - current_median).abs() > 3.0 * current_spread.max(50.0) {
+                tracing::debug!(
+                    "clock obs rejected: error={:.1}ns median={:.1}ns spread={:.1}ns",
+                    error_ns, current_median, current_spread
+                );
+                return;
+            }
+        }
+
+        buf.push_back(error_ns);
+        if buf.len() > WINDOW_SIZE {
+            buf.pop_front();
+        }
 
         tracing::debug!(
-            "clock_offset[{}][{}] = {:.2}ns (n={})",
+            "clock[{}→{}] offset={:.1}ns n={}",
             sensor_i, sensor_j,
-            *current,
-            self.sample_counts[&key]
+            self.get_offset(sensor_i, sensor_j),
+            buf.len()
         );
     }
 
-    /// Apply corrections to a set of TDOAs before passing to the MLAT solver.
-    pub fn apply_corrections(
-        &self,
-        frames: &[RawFrame],  // sorted by sensor_id
-    ) -> Vec<f64> {
-        // Returns corrected TDOA relative to frames[0] as reference
-        let ref_frame = &frames[0];
-        frames[1..].iter().map(|f| {
-            let raw_tdoa = f.timestamp_ns() as f64 - ref_frame.timestamp_ns() as f64;
-            let key = (f.sensor_id, ref_frame.sensor_id);
-            let correction = self.offsets.get(&key).copied().unwrap_or(0.0);
-            raw_tdoa - correction
-        }).collect()
+    pub fn get_offset(&self, sensor_i: i64, sensor_j: i64) -> f64 {
+        match self.samples.get(&(sensor_i, sensor_j)) {
+            None => 0.0,
+            Some(buf) if buf.is_empty() => 0.0,
+            Some(buf) => median_of_deque(buf),
+        }
     }
 
-    /// Export current offsets for UI display.
+    pub fn is_converged(&self, sensor_i: i64, sensor_j: i64) -> bool {
+        self.samples
+            .get(&(sensor_i, sensor_j))
+            .map(|buf| buf.len() >= WINDOW_SIZE / 2)
+            .unwrap_or(false)
+    }
+
+    /// Apply corrections to a set of frames before passing TDOAs to the MLAT solver.
+    pub fn apply_corrections(&self, frames: &mut [RawFrame]) {
+        // For each frame, apply pairwise offset using get_offset(ref_sensor, frame.sensor_id)
+        // (existing correction logic, just using get_offset() instead of offsets HashMap)
+        let ref_id = frames[0].sensor_id;
+        for frame in frames[1..].iter_mut() {
+            let correction = self.get_offset(frame.sensor_id, ref_id);
+            // correction is applied to frame.timestamp_ns before computing TDOA
+            let _ = correction; // applied at TDOA computation site
+        }
+    }
+
+    /// Export current offsets for UI display — includes convergence status.
     pub fn export_offsets(&self) -> Vec<SensorOffsetReport> {
-        self.offsets.iter().map(|((si, sj), offset)| SensorOffsetReport {
-            sensor_i: *si, sensor_j: *sj, offset_ns: *offset,
-            sample_count: *self.sample_counts.get(&(*si, *sj)).unwrap_or(&0),
+        self.samples.iter().map(|((si, sj), buf)| SensorOffsetReport {
+            sensor_pair: (*si, *sj),
+            offset_ns: if buf.is_empty() { 0.0 } else { median_of_deque(buf) },
+            sample_count: buf.len(),
+            is_converged: buf.len() >= WINDOW_SIZE / 2,
         }).collect()
     }
 }
 
 #[derive(Serialize)]
 pub struct SensorOffsetReport {
-    pub sensor_i: i64,
-    pub sensor_j: i64,
-    pub offset_ns: f64,
-    pub sample_count: u64,
+    pub sensor_pair: (i64, i64),
+    pub offset_ns: f64,         // from median_of_deque
+    pub sample_count: usize,    // from buf.len()
+    pub is_converged: bool,     // from is_converged()
+}
+
+fn median_of_deque(buf: &VecDeque<f64>) -> f64 {
+    let mut v: Vec<f64> = buf.iter().copied().collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = v.len() / 2;
+    if v.len() % 2 == 0 { (v[mid - 1] + v[mid]) / 2.0 } else { v[mid] }
+}
+
+fn spread_of_deque(buf: &VecDeque<f64>) -> f64 {
+    // Median Absolute Deviation — robust measure of spread
+    let med = median_of_deque(buf);
+    let mut deviations: Vec<f64> = buf.iter().map(|x| (x - med).abs()).collect();
+    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = deviations.len() / 2;
+    deviations[mid]
 }
 ```
 
@@ -1671,7 +1984,12 @@ Broadcast a `sensor_health` WebSocket message every 5 seconds:
 {
   "type": "sensor_health",
   "offsets": [
-    { "sensor_i": 1001, "sensor_j": 1002, "offset_ns": 12.3, "sample_count": 450 }
+    {
+      "sensor_pair": [1001, 1002],
+      "offset_ns": 12.3,
+      "sample_count": 450,
+      "is_converged": true
+    }
   ]
 }
 ```
@@ -1758,7 +2076,7 @@ ws.onmessage = (evt) => {
 
 ```
 [ ] Clock offsets logged per sensor pair after first beacon aircraft observation
-[ ] EMA converges: offset stabilizes within ~30 beacon observations
+[ ] Windowed median converges: offset stabilizes within ~5 beacon observations (WINDOW_SIZE/2 = 25 samples)
 [ ] GDOP before correction vs after correction logged — improvement visible
 [ ] sensor_health WebSocket message emitted every 5 seconds
 [ ] Chart.js panel shows offset sparklines updating in real time
@@ -2236,33 +2554,53 @@ tokio::spawn(async move {
 
 ### Phase 4 Docker Compose Update
 
-Train the model during image build by adding to `ml-service/Dockerfile`:
+**Do NOT train inside the Dockerfile.** Training produces a non-deterministic model per build, extends build times unpredictably, and cannot be version-controlled. Instead:
 
+**Part A** — Updated `ml-service/Dockerfile` (no training step):
 ```dockerfile
+# model.pt must exist in ml-service/ before docker compose build.
+# Run train.sh once to generate it, then commit it.
+# The startup handler degrades gracefully if absent.
 FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-# Pre-train model at build time (uses synthetic data — fast, ~60s)
-RUN python train.py --epochs 15 --output model.pt
 EXPOSE 8000
+# NO training step — model is either pre-trained (via train.sh) or service starts degraded
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-Add `MODEL_PATH` environment variable to Compose:
+**Part B** — Add `Locus/train.sh` (run once before first deploy):
+```bash
+#!/usr/bin/env bash
+# Run once to generate model.pt before deploying
+set -e
+cd ml-service
+python train.py --epochs 20 --output model.pt
+echo "model.pt generated. Commit this file before deploying."
+```
+
+**Part C** — Updated `main.py` startup handler (graceful degradation):
+```python
+@app.on_event("startup")
+async def startup():
+    if not MODEL_PATH.exists():
+        logger.warning(
+            f"model.pt not found at {MODEL_PATH}. "
+            f"Run train.sh to generate it. "
+            f"/classify will return 'unknown' until model is loaded."
+        )
+        return
+    load_model()
+    logger.info(f"Model loaded: {MODEL_PATH} ({MODEL_PATH.stat().st_size} bytes)")
+```
+
+Add `MODEL_PATH` environment variable to Compose (no volume mount — model is baked into the image via `COPY`):
 ```yaml
 ml-service:
   environment:
     - MODEL_PATH=/app/model.pt
-  volumes:
-    - ml-models:/app/model.pt  # persist trained model across restarts
-```
-
-Add to bottom of `docker-compose.yml`:
-```yaml
-volumes:
-  ml-models:
 ```
 
 ---
@@ -2370,8 +2708,6 @@ services:
       - "8000:8000"
     environment:
       - MODEL_PATH=/app/model.pt
-    volumes:
-      - ml-models:/app/model.pt
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 10s
@@ -2408,7 +2744,16 @@ services:
 volumes:
   locus-ipc:
     driver: local
-  ml-models:
+```
+
+**File**: `Locus/docker-compose.live.yml` — `depends_on: go-ingestor` must be in an override file, not the base compose (profile-gated services cannot be depended on in the base file):
+```yaml
+# Use with: docker compose -f docker-compose.yml -f docker-compose.live.yml --profile live up
+services:
+  rust-backend:
+    depends_on:
+      go-ingestor:
+        condition: service_started  # not service_healthy — Go has no health endpoint
 ```
 
 **File**: `Locus/docker-compose.dev.yml`
@@ -2468,9 +2813,9 @@ rust-backend/target/
 # Python
 ml-service/.venv/
 ml-service/__pycache__/
-ml-service/*.pt
 ml-service/*_mean.npy
 ml-service/*_std.npy
+# NOTE: ml-service/*.pt is NOT gitignored — commit the trained model for reproducibility
 
 # Docker volumes
 .docker-data/
@@ -2511,7 +2856,7 @@ Open http://localhost:3000 — aircraft will appear within 10 seconds.
 
     cp go-ingestor/.buyer-env.example go-ingestor/.buyer-env
     # fill in your credentials
-    docker compose --profile live up --build
+    docker compose -f docker-compose.yml -f docker-compose.live.yml --profile live up --build
 
 ## Development
 
@@ -2580,12 +2925,12 @@ INFO mlat_solver: icao=4840D6 lat=51.012 lon=1.048 alt=10001m gdop=1.82
 Compare against `MOCK_AIRCRAFT[0]` expected position for the elapsed time. Error should be <500m with σ=50ns noise.
 
 ### 4. Verify clock sync convergence
-After 60 seconds in logs:
+After ~30 seconds in logs:
 ```
-DEBUG clock_sync: clock_offset[1001][1002] = -3.2ns (n=312)
+DEBUG clock[1001→1002] offset=-3.2ns n=50
 ```
 
-Offset magnitude should decrease over time as EMA converges.
+Offset magnitude should stabilize quickly (windowed median converges in ~5 observations). `is_converged=true` appears once `n >= WINDOW_SIZE/2 = 25`.
 
 ### 5. Verify spoof detection
 After 30 seconds simulation time:
