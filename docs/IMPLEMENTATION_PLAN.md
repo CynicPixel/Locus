@@ -1,0 +1,2659 @@
+# Locus — Implementation Plan
+
+**Project**: Locus MLAT Aircraft Positioning System
+**Hackathon**: 4DSky MLAT Hackathon by Neuron Innovations / Hedera
+**Lead Architect**: Locus team
+**Working directory**: `/home/psychopunk_sage/dev/tools/Locus/`
+
+---
+
+## Dependency Graph
+
+```
+4DSky SDK (Go binary @ port 61336)
+         │
+         │ JSON lines → Unix socket (/tmp/locus/ingestor.sock)
+         ▼
+  go-ingestor/main.go
+         │
+         │ Unix socket client (Rust connects with retry)
+         ▼
+  rust-backend (tokio async runtime)
+    ├── ingestor.rs          ← connects to Go Unix socket OR generates mock frames
+    │        │
+    │        ▼
+    ├── correlator.rs        ← groups frames by (ICAO24, hash, 5ms bucket)
+    │        │
+    │        ▼
+    ├── clock_sync.rs        ← corrects TDOA using beacon aircraft
+    │        │ corrected TDOAs
+    │        ▼
+    ├── mlat_solver.rs       ← Levenberg-Marquardt via argmin
+    │        │ raw (lat,lon,alt) + GDOP
+    │        ▼
+    ├── kalman.rs            ← EKF per ICAO24, smoothed track
+    │        │
+    │        ├──────────────────────────────────────────────────►
+    │        │                                          anomaly_client.rs
+    │        │                                                   │ POST /classify
+    │        │                                                   ▼
+    │        │                                          ml-service (FastAPI + LSTM)
+    │        │                                                   │ anomaly_label
+    │        │ ◄─────────────────────────────────────────────────┘
+    │        ▼
+    ├── spoof_detector.rs    ← compare MLAT pos vs ADS-B claimed pos
+    │        │ enriched AircraftState
+    │        ▼
+    └── ws_server.rs         ← WebSocket broadcast @ port 9001
+               │
+               │ JSON frames
+               ▼
+        frontend/index.html  ← Leaflet.js map + Chart.js + Vanilla JS
+        (nginx @ port 3000 in Docker)
+```
+
+---
+
+## Timeline Estimate
+
+| Phase | Description | Estimated Hours |
+|-------|-------------|-----------------|
+| 0 | Project scaffold + Docker foundation | 2–3 h |
+| 1 | Data pipeline (Go → Rust) + mock mode | 3–4 h |
+| 2 | Core MLAT engine + live map dots | 5–7 h |
+| 3 | Self-calibrating clock sync + sensor health UI | 3–4 h |
+| 4 | Spoof detector + AI anomaly classifier | 4–6 h |
+| 5 | Full polish + production Docker Compose | 2–3 h |
+| **Total** | | **19–27 h** |
+
+---
+
+## Port Assignments (Reference)
+
+| Service | Port | Protocol |
+|---------|------|----------|
+| Go ingestor (P2P buyer) | 61336 | TCP (libp2p) |
+| Rust backend WebSocket | 9001 | WS |
+| Python ML service | 8000 | HTTP |
+| Frontend (nginx, Docker only) | 3000 | HTTP |
+
+---
+
+## Phase 0 — Project Scaffold + Docker Foundation
+
+### Goal
+Establish the full directory skeleton, initialize all three language runtimes, and prove that `docker compose up` starts four containers without errors.
+
+### Visible Outcome
+- Terminal: four services start with no crash loops
+- Browser at `http://localhost:3000`: white page reading "Locus — Connecting..."
+- `curl http://localhost:8000/health` returns `{"status":"ok"}`
+- Rust container logs: "Locus backend starting"
+
+### Estimated time: 2–3 hours
+
+---
+
+### Step 0.1 — Create Directory Structure
+
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus
+
+mkdir -p Locus/go-ingestor
+mkdir -p Locus/rust-backend/src
+mkdir -p Locus/ml-service
+mkdir -p Locus/frontend
+mkdir -p Locus/docs
+```
+
+Verify:
+```bash
+find Locus -type d
+```
+
+Expected output:
+```
+Locus
+Locus/go-ingestor
+Locus/rust-backend
+Locus/rust-backend/src
+Locus/ml-service
+Locus/frontend
+Locus/docs
+```
+
+---
+
+### Step 0.2 — Copy and Configure Go Ingestor
+
+The existing SDK lives at `4dsky-mlat-challenge/`. Copy the structured parser (the `.bak` file) as the base — it already knows how to parse the binary wire format.
+
+```bash
+# Copy the structured parser as the new main.go
+cp 4dsky-mlat-challenge/main-half-4dsky.go.bak Locus/go-ingestor/main.go
+
+# Copy module files — we will update the module name in a later phase
+cp 4dsky-mlat-challenge/go.mod Locus/go-ingestor/go.mod
+cp 4dsky-mlat-challenge/go.sum Locus/go-ingestor/go.sum
+
+# Copy env example
+cp 4dsky-mlat-challenge/.buyer-env.example Locus/go-ingestor/.buyer-env.example
+```
+
+Update the module declaration in `Locus/go-ingestor/go.mod` — change line 1 from `module quickstart` to `module locus-ingestor`. The rest of the file stays identical.
+
+Create `.gitignore` for the ingestor:
+
+**File**: `Locus/go-ingestor/.gitignore`
+```
+.buyer-env
+.seller-env
+```
+
+---
+
+### Step 0.3 — Initialize Rust Workspace
+
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus/Locus/rust-backend
+
+cargo init --name locus-backend
+```
+
+This creates `src/main.rs` and `Cargo.toml`. Replace the generated `Cargo.toml` with:
+
+**File**: `Locus/rust-backend/Cargo.toml`
+```toml
+[package]
+name = "locus-backend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "locus-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WebSocket server
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP client (for Python ML service)
+reqwest = { version = "0.11", features = ["json"] }
+
+# Math / MLAT
+nalgebra = "0.33"
+argmin = "0.9"
+argmin-math = { version = "0.4", features = ["nalgebra_latest"] }
+
+# Geographic utilities
+geo = "0.28"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Hashing (for message correlation key)
+sha2 = "0.10"
+hex = "0.4"
+
+# CLI flags
+clap = { version = "4", features = ["derive"] }
+
+# Random number generation (mock mode)
+rand = "0.8"
+rand_distr = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+```
+
+**File**: `Locus/rust-backend/src/main.rs` (Phase 0 stub)
+```rust
+use clap::Parser;
+use tracing::info;
+
+#[derive(Parser, Debug)]
+#[command(name = "locus-backend", about = "Locus MLAT Engine")]
+pub struct Cli {
+    /// Run in mock data mode (skip Unix socket connection to Go ingestor)
+    #[arg(long, env = "MOCK_DATA")]
+    pub mock: bool,
+
+    /// WebSocket bind address
+    #[arg(long, default_value = "0.0.0.0:9001")]
+    pub ws_addr: String,
+
+    /// Python ML service URL
+    #[arg(long, default_value = "http://localhost:8000")]
+    pub ml_service_url: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("locus_backend=debug".parse()?),
+        )
+        .init();
+
+    let cli = Cli::parse();
+
+    info!("Locus backend starting");
+    info!(mock = cli.mock, ws_addr = %cli.ws_addr, "Configuration loaded");
+
+    // Phase 0: just confirm startup
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down");
+    Ok(())
+}
+```
+
+Create stub source files so the module tree compiles in later phases:
+
+```bash
+touch Locus/rust-backend/src/ingestor.rs
+touch Locus/rust-backend/src/correlator.rs
+touch Locus/rust-backend/src/clock_sync.rs
+touch Locus/rust-backend/src/mlat_solver.rs
+touch Locus/rust-backend/src/kalman.rs
+touch Locus/rust-backend/src/spoof_detector.rs
+touch Locus/rust-backend/src/anomaly_client.rs
+touch Locus/rust-backend/src/ws_server.rs
+```
+
+Verify the stub compiles:
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus/Locus/rust-backend
+cargo build 2>&1 | tail -5
+```
+
+---
+
+### Step 0.4 — Python ML Service Skeleton
+
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus/Locus/ml-service
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi uvicorn torch numpy pandas requests
+pip freeze > requirements.txt
+```
+
+**File**: `Locus/ml-service/main.py` (Phase 0 stub)
+```python
+import logging
+from fastapi import FastAPI
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("locus-ml")
+
+app = FastAPI(title="Locus ML Service", version="0.1.0")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model_loaded": False}
+```
+
+**File**: `Locus/ml-service/model.py` (Phase 0 stub)
+```python
+# LSTM model definition — implemented in Phase 4
+import torch
+import torch.nn as nn
+
+
+class AircraftLSTM(nn.Module):
+    """Placeholder — full implementation in Phase 4."""
+    def __init__(self, input_size: int = 6, hidden_size: int = 64, num_layers: int = 2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 2)  # [normal, anomalous]
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+```
+
+**File**: `Locus/ml-service/train.py` (Phase 0 stub)
+```python
+# Training script — implemented in Phase 4
+if __name__ == "__main__":
+    print("Training not yet implemented. See Phase 4.")
+```
+
+**File**: `Locus/ml-service/requirements.txt`
+```
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+torch>=2.3.0
+numpy>=1.26.0
+pandas>=2.2.0
+requests>=2.32.0
+scikit-learn>=1.5.0
+```
+
+---
+
+### Step 0.5 — Frontend Placeholder
+
+**File**: `Locus/frontend/index.html` (Phase 0 stub)
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Locus — Live MLAT</title>
+  <style>
+    body { margin: 0; background: #0d1117; color: #e6edf3;
+           font-family: 'Segoe UI', sans-serif;
+           display: flex; align-items: center; justify-content: center;
+           height: 100vh; flex-direction: column; }
+    #status { font-size: 1.4rem; color: #58a6ff; }
+    #counter { font-size: 1rem; color: #8b949e; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div id="status">Locus — Connecting...</div>
+  <div id="counter">Frames received: 0</div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const counterEl = document.getElementById('counter');
+    let frameCount = 0;
+
+    function connect() {
+      const ws = new WebSocket('ws://localhost:9001');
+
+      ws.onopen = () => {
+        statusEl.textContent = 'Locus — Connected';
+        statusEl.style.color = '#3fb950';
+      };
+
+      ws.onmessage = (evt) => {
+        frameCount++;
+        counterEl.textContent = `Frames received: ${frameCount}`;
+      };
+
+      ws.onclose = () => {
+        statusEl.textContent = 'Locus — Reconnecting...';
+        statusEl.style.color = '#f85149';
+        setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => ws.close();
+    }
+
+    connect();
+  </script>
+</body>
+</html>
+```
+
+---
+
+### Step 0.6 — Dockerfiles
+
+**File**: `Locus/go-ingestor/Dockerfile`
+```dockerfile
+FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o ingestor .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=builder /app/ingestor .
+# .buyer-env must be mounted at runtime as /app/.buyer-env
+CMD ["./ingestor", "--port=61336", "--mode=peer", \
+     "--buyer-or-seller=buyer", \
+     "--list-of-sellers-source=env", "--envFile=.buyer-env"]
+```
+
+**File**: `Locus/rust-backend/Dockerfile`
+```dockerfile
+FROM rust:1.78-slim AS builder
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+# Pre-cache dependencies
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -rf src
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/target/release/locus-backend .
+EXPOSE 9001
+ENTRYPOINT ["./locus-backend"]
+```
+
+**File**: `Locus/ml-service/Dockerfile`
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**File**: `Locus/frontend/Dockerfile`
+```dockerfile
+FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/index.html
+EXPOSE 80
+```
+
+---
+
+### Step 0.7 — Docker Compose (Phase 0 skeleton)
+
+**File**: `Locus/docker-compose.yml`
+```yaml
+version: "3.9"
+
+services:
+  rust-backend:
+    build: ./rust-backend
+    ports:
+      - "9001:9001"
+    environment:
+      - RUST_LOG=locus_backend=debug
+      - MOCK_DATA=true
+    command: ["./locus-backend", "--mock", "--ws-addr=0.0.0.0:9001",
+              "--ml-service-url=http://ml-service:8000"]
+    volumes:
+      - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
+    depends_on:
+      ml-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ml-service:
+    build: ./ml-service
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+  go-ingestor:
+    build: ./go-ingestor
+    ports:
+      - "61336:61336"
+    volumes:
+      - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
+    profiles:
+      - live
+    restart: unless-stopped
+
+volumes:
+  locus-ipc:
+    driver: local
+  locus-models:
+    driver: local
+```
+
+Note: `go-ingestor` is in the `live` profile. In mock mode you run:
+```bash
+docker compose up rust-backend ml-service frontend
+```
+
+For live mode with real network data:
+```bash
+docker compose --profile live up
+```
+
+**File**: `Locus/docker-compose.dev.yml`
+```yaml
+version: "3.9"
+
+services:
+  rust-backend:
+    build:
+      context: ./rust-backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./rust-backend/src:/app/src
+      - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
+    command: ["cargo", "watch", "-x", "run -- --mock"]
+    environment:
+      - RUST_LOG=locus_backend=trace
+
+  go-ingestor:
+    volumes:
+      - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
+
+  ml-service:
+    volumes:
+      - ./ml-service:/app
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0",
+              "--port", "8000", "--reload"]
+
+  frontend:
+    volumes:
+      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
+
+volumes:
+  locus-ipc:
+    driver: local
+```
+
+Use dev overrides with:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+```
+
+---
+
+### Phase 0 Verification Checklist
+
+```
+[ ] Locus/ directory tree matches the target structure
+[ ] cargo build succeeds in rust-backend/
+[ ] curl http://localhost:8000/health returns {"status":"ok",...}  (after docker compose up)
+[ ] Browser at http://localhost:3000 shows "Locus — Connecting..."
+[ ] docker compose up (mock mode) starts 3 containers without restart loops
+[ ] go-ingestor container starts cleanly under --profile live (credentials not required to build)
+```
+
+---
+
+## Phase 1 — Data Pipeline (Go → Rust) + Mock Mode
+
+### Goal
+Wire the Go ingestor to emit structured JSON lines over a Unix domain socket, have Rust consume them by connecting to that socket, and implement mock mode as a full substitute.
+
+### Visible Outcome
+- **Terminal**: `RUST_LOG=debug cargo run -- --mock` logs "Received frame from sensor X" at >10 fps
+- **Browser**: The counter on the placeholder page increments ("Frames received: N") — this proves the WebSocket pipeline is alive end-to-end even before MLAT
+
+### Estimated time: 3–4 hours
+
+---
+
+### Step 1.1 — Modify Go Ingestor Output Format
+
+**File**: `Locus/go-ingestor/main.go`
+
+The key change from `main-half-4dsky.go.bak`: replace all `fmt.Printf(...)` human-readable lines inside the message loop with a single `json.Marshal` written to a Unix domain socket connection. Everything outside the inner loop (stream setup, error handling) stays identical.
+
+The output JSON schema per line:
+```json
+{
+  "sensor_id": 123456789,
+  "sensor_lat": 51.5074,
+  "sensor_lon": -0.1278,
+  "sensor_alt": 15.0,
+  "timestamp_seconds": 43200,
+  "timestamp_nanoseconds": 123456789,
+  "raw_modes_hex": "8D4840D6202CC371C32CE0576098"
+}
+```
+
+Imports to add: `"encoding/json"`, `"net"`, `"os"`
+
+**Before the stream handler loop**, set up the Unix socket listener:
+```go
+const socketPath = "/tmp/locus/ingestor.sock"
+
+os.MkdirAll("/tmp/locus", 0755)
+os.Remove(socketPath) // clean stale socket from previous run
+
+ln, err := net.Listen("unix", socketPath)
+if err != nil {
+    log.Fatalf("Failed to bind Unix socket: %v", err)
+}
+defer ln.Close()
+log.Printf("Ingestor listening on %s", socketPath)
+```
+
+Accept connections in a goroutine and write JSON lines to each connected client:
+```go
+type RawFrameOut struct {
+    SensorID             int64   `json:"sensor_id"`
+    SensorLat            float64 `json:"sensor_lat"`
+    SensorLon            float64 `json:"sensor_lon"`
+    SensorAlt            float64 `json:"sensor_alt"`
+    TimestampSeconds     uint64  `json:"timestamp_seconds"`
+    TimestampNanoseconds uint64  `json:"timestamp_nanoseconds"`
+    RawModesHex          string  `json:"raw_modes_hex"`
+}
+
+frame := RawFrameOut{
+    SensorID:             sensorID,
+    SensorLat:            sensorLatitude,
+    SensorLon:            sensorLongitude,
+    SensorAlt:            sensorAltitude,
+    TimestampSeconds:     secondsSinceMidnight,
+    TimestampNanoseconds: nanoseconds,
+    RawModesHex:          fmt.Sprintf("%x", rawModeS),
+}
+jsonBytes, err := json.Marshal(frame)
+if err != nil {
+    log.Printf("JSON marshal error: %v", err)
+    continue
+}
+// for each accepted conn, in a goroutine:
+fmt.Fprintf(conn, "%s\n", jsonBytes)
+```
+
+All `log.Printf` and `fmt.Println` debug lines must write to `os.Stderr` so they don't appear on the socket. All human-readable logging goes to `os.Stderr`.
+
+Verify with two terminals — start Go first, then in a second terminal:
+```bash
+nc -U /tmp/locus/ingestor.sock | head -5
+```
+
+Each line should be a valid JSON object.
+
+---
+
+### Step 1.2 — Rust Data Structures
+
+**File**: `Locus/rust-backend/src/ingestor.rs`
+
+Key types (add these — full implementations follow):
+
+```rust
+use serde::{Deserialize, Serialize};
+
+/// Raw frame as received from the Go ingestor via Unix domain socket.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RawFrame {
+    pub sensor_id: i64,
+    pub sensor_lat: f64,
+    pub sensor_lon: f64,
+    pub sensor_alt: f64,          // meters above sea level
+    pub timestamp_seconds: u64,   // seconds since midnight UTC
+    pub timestamp_nanoseconds: u64,
+    pub raw_modes_hex: String,    // hex-encoded Mode-S bytes
+}
+
+impl RawFrame {
+    /// Full timestamp as nanoseconds since midnight
+    pub fn timestamp_ns(&self) -> u64 {
+        self.timestamp_seconds * 1_000_000_000 + self.timestamp_nanoseconds
+    }
+
+    /// Decoded raw Mode-S bytes
+    pub fn raw_bytes(&self) -> Vec<u8> {
+        hex::decode(&self.raw_modes_hex).unwrap_or_default()
+    }
+}
+```
+
+The ingestor module exposes one public async function:
+
+```rust
+pub async fn run_ingestor(
+    mock: bool,
+    tx: tokio::sync::mpsc::Sender<RawFrame>,
+) -> anyhow::Result<()>
+```
+
+**Live mode implementation** inside `run_ingestor`:
+```rust
+const SOCKET_PATH: &str = "/tmp/locus/ingestor.sock";
+const MAX_RETRIES: u32 = 30;
+const RETRY_DELAY_MS: u64 = 500;
+
+async fn connect_with_retry() -> anyhow::Result<tokio::net::UnixStream> {
+    for attempt in 0..MAX_RETRIES {
+        match tokio::net::UnixStream::connect(SOCKET_PATH).await {
+            Ok(stream) => {
+                tracing::info!("Connected to ingestor socket on attempt {}", attempt + 1);
+                return Ok(stream);
+            }
+            Err(e) => {
+                tracing::warn!("Socket connect attempt {} failed: {e}", attempt + 1);
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+    anyhow::bail!("Could not connect after {MAX_RETRIES} attempts")
+}
+
+// In run_ingestor (live branch):
+let stream = connect_with_retry().await?;
+let reader = tokio::io::BufReader::new(stream);
+let mut lines = reader.lines();
+
+while let Some(line) = lines.next_line().await? {
+    match serde_json::from_str::<RawFrame>(&line) {
+        Ok(frame) => {
+            if tx.send(frame).await.is_err() { break; }
+        }
+        Err(e) => {
+            tracing::warn!("Deserialize error: {e} — line: {line}");
+        }
+    }
+}
+```
+
+Add `tokio::net::UnixStream` to imports; `tokio` feature `"net"` is already enabled via `"full"`.
+The `run_ingestor(mock: bool, tx: Sender<RawFrame>)` signature is unchanged.
+The mock branch is unchanged.
+
+---
+
+### Step 1.3 — Mock Mode Implementation
+
+Mock mode generates synthetic frames inside Rust. No Go process is needed and `connect_with_retry()` is never called.
+
+**Sensor positions** (6 European ground stations):
+
+```rust
+pub struct SensorPos {
+    pub id: i64,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt: f64,   // meters
+}
+
+pub const MOCK_SENSORS: &[SensorPos] = &[
+    SensorPos { id: 1001, lat: 51.5074, lon: -0.1278, alt: 15.0 },  // London
+    SensorPos { id: 1002, lat: 52.3676, lon:  4.9041, alt:  5.0 },  // Amsterdam
+    SensorPos { id: 1003, lat: 48.8566, lon:  2.3522, alt: 35.0 },  // Paris
+    SensorPos { id: 1004, lat: 50.1109, lon:  8.6821, alt: 110.0 }, // Frankfurt
+    SensorPos { id: 1005, lat: 50.8503, lon:  4.3517, alt: 60.0 },  // Brussels
+    SensorPos { id: 1006, lat: 53.3498, lon: -6.2603, alt: 20.0 },  // Dublin
+    SensorPos { id: 1007, lat: 47.3769, lon:  8.5417, alt: 440.0 }, // Zurich
+    SensorPos { id: 1008, lat: 48.2082, lon: 16.3738, alt: 170.0 }, // Vienna
+];
+```
+
+**Aircraft motion** (three simulated aircraft):
+
+```rust
+pub struct MockAircraft {
+    pub icao24: &'static str,
+    pub is_spoofer: bool,      // ADS-B position diverges after 30s
+    pub is_beacon: bool,       // Transmits full ADS-B position for clock sync
+    // lat/lon/alt start and velocity (deg/s and m/s)
+    pub start_lat: f64,
+    pub start_lon: f64,
+    pub start_alt: f64,
+    pub vel_lat: f64,
+    pub vel_lon: f64,
+    pub vel_alt: f64,
+}
+
+pub const MOCK_AIRCRAFT: &[MockAircraft] = &[
+    MockAircraft {
+        icao24: "4840D6", is_spoofer: false, is_beacon: true,
+        start_lat: 51.0, start_lon: 1.0, start_alt: 10000.0,
+        vel_lat: 0.003, vel_lon: 0.005, vel_alt: 0.0,
+    },
+    MockAircraft {
+        icao24: "3C6444", is_spoofer: false, is_beacon: false,
+        start_lat: 50.5, start_lon: 3.0, start_alt: 9500.0,
+        vel_lat: 0.002, vel_lon: 0.004, vel_alt: -1.0,
+    },
+    MockAircraft {
+        icao24: "AABBCC", is_spoofer: true, is_beacon: false,
+        start_lat: 52.0, start_lon: 5.0, start_alt: 8000.0,
+        vel_lat: 0.001, vel_lon: 0.003, vel_alt: 0.5,
+    },
+];
+```
+
+**TDOA physics** (inside mock loop):
+```
+dist = sqrt((sensor_x - ac_x)^2 + (sensor_y - ac_y)^2 + (sensor_z - ac_z)^2)
+arrival_time_ns = true_timestamp_ns + (dist / c_m_per_ns)
+arrival_time_ns += Gaussian(mean=0, sigma=50)  // clock drift noise
+```
+
+Where `c_m_per_ns = 0.299792458` (meters per nanosecond).
+
+Convert lat/lon/alt to ECEF for distance calculation:
+```rust
+fn to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> (f64, f64, f64) {
+    let a = 6_378_137.0_f64;        // WGS84 semi-major axis
+    let e2 = 6.694_379_990_14e-3;   // WGS84 first eccentricity squared
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+    let x = (n + alt_m) * lat.cos() * lon.cos();
+    let y = (n + alt_m) * lat.cos() * lon.sin();
+    let z = (n * (1.0 - e2) + alt_m) * lat.sin();
+    (x, y, z)
+}
+```
+
+The mock loop ticks at 20ms intervals (50 Hz) per aircraft, broadcasting to all sensors.
+
+---
+
+### Step 1.4 — Wire WebSocket for Frame Counter
+
+In Phase 1, the WebSocket server is a minimal broadcast. The goal is to prove the UI counter increments.
+
+**File**: `Locus/rust-backend/src/ws_server.rs` (Phase 1 stub)
+
+```rust
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_tungstenite::tungstenite::Message;
+
+pub type BroadcastTx = broadcast::Sender<String>;
+
+pub async fn run_ws_server(
+    addr: &str,
+    rx: broadcast::Receiver<String>,
+) -> anyhow::Result<()> {
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("WebSocket server listening on {addr}");
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tracing::debug!("WS peer connected: {peer}");
+        let mut rx = rx.resubscribe(); // each connection gets own receiver
+        tokio::spawn(async move {
+            let ws = tokio_tungstenite::accept_async(stream).await?;
+            let (mut sink, _source) = futures_util::StreamExt::split(ws);
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        use futures_util::SinkExt;
+                        if sink.send(Message::Text(msg)).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("WS client lagged by {n} messages");
+                    }
+                    Err(_) => break,
+                }
+            }
+            anyhow::Ok(())
+        });
+    }
+}
+```
+
+Update `src/main.rs` to:
+1. Parse CLI args
+2. Create an `mpsc::channel` for raw frames
+3. Create a `broadcast::channel` for WebSocket messages
+4. Spawn `ingestor::run_ingestor` task
+5. Spawn `ws_server::run_ws_server` task
+6. In a loop: receive raw frames, serialize to JSON, broadcast to WebSocket
+
+```rust
+// main.rs Phase 1 additions (inside tokio::main)
+let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<RawFrame>(1024);
+let (ws_tx, ws_rx) = tokio::sync::broadcast::channel::<String>(1024);
+
+let mock = cli.mock;
+let ingestor_handle = tokio::spawn(ingestor::run_ingestor(mock, frame_tx));
+let ws_handle = tokio::spawn(ws_server::run_ws_server(cli.ws_addr.clone(), ws_rx));
+
+// Forward raw frames directly to WebSocket (Phase 1 — no MLAT yet)
+let forwarder = tokio::spawn(async move {
+    let mut count = 0u64;
+    while let Some(frame) = frame_rx.recv().await {
+        count += 1;
+        if count % 100 == 0 {
+            tracing::info!("Received frame #{count} from sensor {}", frame.sensor_id);
+        }
+        let msg = serde_json::json!({ "type": "raw_frame", "sensor_id": frame.sensor_id });
+        let _ = ws_tx.send(msg.to_string());
+    }
+});
+
+tokio::select! {
+    _ = tokio::signal::ctrl_c() => { info!("Shutting down"); }
+    r = ingestor_handle => { tracing::error!("Ingestor exited: {r:?}"); }
+    r = ws_handle => { tracing::error!("WS server exited: {r:?}"); }
+    r = forwarder => { tracing::error!("Forwarder exited: {r:?}"); }
+}
+```
+
+---
+
+### Step 1.5 — Update Frontend Counter
+
+Update `Locus/frontend/index.html` — the WebSocket `onmessage` handler already increments `frameCount`. In Phase 1 we also log the sensor ID received:
+
+```javascript
+ws.onmessage = (evt) => {
+  frameCount++;
+  const data = JSON.parse(evt.data);
+  counterEl.textContent =
+    `Frames received: ${frameCount} (last sensor: ${data.sensor_id ?? '?'})`;
+};
+```
+
+---
+
+### Phase 1 Verification Checklist
+
+```
+[ ] Go ingestor outputs valid JSON lines to stdout (manually verified with head -5)
+[ ] cargo run -- --mock logs frame receipts at >10 fps
+[ ] Browser counter at localhost:3000 increments in real time
+[ ] No panic or unwrap failures in Rust logs
+[ ] docker compose up (mock) shows all 3 services healthy
+[ ] ECEF conversion unit test: London (51.5074, -0.1278, 15) → ~(3978553, -8837, 4968195) m
+```
+
+---
+
+### Phase 1 Docker Compose Update
+
+No changes needed — Phase 0 `docker-compose.yml` already has `MOCK_DATA=true` set for the Rust backend and the `locus-ipc` volume already mounted on both services. In mock mode `MOCK_DATA=true`, `go-ingestor` is skipped (it's in the `live` profile) and Rust never calls `connect_with_retry()`, so the absence of a socket file causes no crash.
+
+---
+
+## Phase 2 — Core MLAT Engine + Aircraft on Map
+
+### Goal
+Implement the correlator, Levenberg-Marquardt MLAT solver, Kalman filter, and broadcast full `AircraftState` objects over WebSocket so aircraft markers appear on the Leaflet map.
+
+### Visible Outcome
+- **Terminal**: `GDOP=1.8 lat=51.234 lon=-0.456 alt=10032m icao=4840D6` logged per solution
+- **Browser**: Leaflet map appears; aircraft markers move in real time; clicking a marker shows ICAO24, altitude, GDOP
+
+### Estimated time: 5–7 hours
+
+---
+
+### Step 2.1 — Message Correlator
+
+**File**: `Locus/rust-backend/src/correlator.rs`
+
+**Correlation key**:
+```rust
+use sha2::{Sha256, Digest};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CorrelationKey {
+    pub icao24: String,
+    pub content_hash: [u8; 8],   // first 8 bytes of SHA256 of raw_modes_hex
+    pub time_bucket: u64,        // floor(timestamp_ns / 5_000_000)  — 5ms buckets
+}
+
+impl CorrelationKey {
+    pub fn from_frame(frame: &RawFrame) -> Option<Self> {
+        let bytes = frame.raw_bytes();
+        if bytes.len() < 7 { return None; }
+        // ICAO24 is bytes 1..4 of a Mode-S long frame (DF17/DF18)
+        let df = (bytes[0] >> 3) & 0x1F;
+        if df != 17 && df != 18 { return None; } // only ADS-B/extended squitter
+        let icao24 = format!("{:02X}{:02X}{:02X}", bytes[1], bytes[2], bytes[3]);
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash_bytes: [u8; 32] = hasher.finalize().into();
+        let mut content_hash = [0u8; 8];
+        content_hash.copy_from_slice(&hash_bytes[..8]);
+        let time_bucket = frame.timestamp_ns() / 5_000_000;
+        Some(CorrelationKey { icao24, content_hash, time_bucket })
+    }
+}
+```
+
+**Correlation group**:
+```rust
+#[derive(Debug, Clone)]
+pub struct CorrelationGroup {
+    pub key: CorrelationKey,
+    pub frames: Vec<RawFrame>,   // one per sensor (deduplicated by sensor_id)
+    pub first_seen_ns: u64,
+}
+```
+
+**Correlator state**:
+```rust
+pub struct Correlator {
+    groups: HashMap<CorrelationKey, CorrelationGroup>,
+    min_sensors: usize,           // minimum 3 sensors to attempt MLAT
+    window_ns: u64,               // eviction window: 50ms
+}
+
+impl Correlator {
+    pub fn new() -> Self {
+        Self {
+            groups: HashMap::new(),
+            min_sensors: 3,
+            window_ns: 50_000_000,
+        }
+    }
+
+    /// Feed a raw frame. Returns a completed group if ready.
+    pub fn ingest(&mut self, frame: RawFrame) -> Option<CorrelationGroup> { ... }
+
+    /// Evict stale groups older than window_ns. Call periodically.
+    pub fn evict_stale(&mut self, now_ns: u64) { ... }
+}
+```
+
+The `ingest` method:
+1. Compute `CorrelationKey::from_frame(&frame)` — return `None` on parse failure
+2. Insert frame into the matching group (skip duplicates by `sensor_id`)
+3. If `group.frames.len() >= min_sensors`: remove group from HashMap and return it
+4. Otherwise return `None`
+
+---
+
+### Step 2.2 — MLAT Solver
+
+**File**: `Locus/rust-backend/src/mlat_solver.rs`
+
+**Coordinate handling**: The solver works in ECEF (meters). Convert all sensor positions and the initial guess to ECEF before calling. Convert the solution back to WGS84.
+
+**Input type**:
+```rust
+pub struct MlatInput {
+    pub sensor_positions: Vec<(f64, f64, f64)>,  // ECEF meters
+    pub tdoa_ns: Vec<Vec<f64>>,     // tdoa_ns[i][j] = t_i - t_j in nanoseconds
+                                    // reference sensor is index 0
+}
+
+pub struct MlatSolution {
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_m: f64,
+    pub gdop: f64,
+    pub covariance: nalgebra::Matrix3<f64>,
+}
+```
+
+**Residual function** (implement `argmin::core::CostFunction`):
+
+```rust
+struct MlatResiduals {
+    sensor_ecef: Vec<nalgebra::Vector3<f64>>,
+    observed_tdoa_m: Vec<f64>,  // TDOAs converted to meters: tdoa_ns * c_m_per_ns
+}
+
+impl argmin::core::CostFunction for MlatResiduals {
+    type Param = nalgebra::Vector3<f64>;  // [x, y, z] in ECEF meters
+    type Output = nalgebra::DVector<f64>;
+
+    fn cost(&self, p: &Self::Param) -> Result<Self::Output, argmin::core::Error> {
+        // residuals[k] = observed_tdoa_m[k] - theoretical_tdoa_m(p)
+        // theoretical_tdoa_m[k] = dist(p, sensor[k+1]) - dist(p, sensor[0])
+        let ref_dist = (p - &self.sensor_ecef[0]).norm();
+        let residuals: Vec<f64> = self.observed_tdoa_m.iter().enumerate().map(|(k, obs)| {
+            let dist_k = (p - &self.sensor_ecef[k + 1]).norm();
+            obs - (dist_k - ref_dist)
+        }).collect();
+        Ok(nalgebra::DVector::from_vec(residuals))
+    }
+}
+```
+
+Also implement `argmin::core::Jacobian` for the LM solver — compute the Jacobian analytically:
+```
+J[k][i] = d/dx_i (dist(p, sensor[k+1]) - dist(p, sensor[0]))
+         = (p_i - sensor[k+1][i]) / dist(p, sensor[k+1])
+           - (p_i - sensor[0][i]) / dist(p, sensor[0])
+```
+
+**Solver call**:
+```rust
+use argmin::solver::leastsquares::GaussNewton;
+// or: argmin::solver::levenbergmarquardt::LevenbergMarquardt
+
+let solver = LevenbergMarquardt::new();
+let result = Executor::new(problem, solver)
+    .configure(|state| state.param(initial_guess).max_iters(100).target_cost(1e-6))
+    .run()?;
+```
+
+**GDOP computation**:
+```rust
+fn compute_gdop(solution_ecef: &Vector3<f64>, sensors: &[Vector3<f64>]) -> f64 {
+    // Build geometry matrix H (N x 4): [dx/r, dy/r, dz/r, -1] for each sensor
+    // GDOP = sqrt(trace((H^T H)^{-1}))
+    let n = sensors.len();
+    let mut h = nalgebra::DMatrix::<f64>::zeros(n, 4);
+    for (i, s) in sensors.iter().enumerate() {
+        let diff = solution_ecef - s;
+        let r = diff.norm();
+        h[(i, 0)] = diff[0] / r;
+        h[(i, 1)] = diff[1] / r;
+        h[(i, 2)] = diff[2] / r;
+        h[(i, 3)] = -1.0;
+    }
+    let ht_h = h.transpose() * &h;
+    match ht_h.try_inverse() {
+        Some(inv) => inv.trace().sqrt(),
+        None => f64::INFINITY,
+    }
+}
+```
+
+**GDOP filter**: discard solution if `gdop > 5.0`. Log discards at `tracing::debug!` level.
+
+**WGS84 back-conversion**:
+```rust
+fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    // Bowring's iterative method
+    let a = 6_378_137.0_f64;
+    let e2 = 6.694_379_990_14e-3;
+    let lon = y.atan2(x);
+    let p = (x * x + y * y).sqrt();
+    let mut lat = z.atan2(p * (1.0 - e2));
+    for _ in 0..10 {
+        let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+        lat = (z + e2 * n * lat.sin()).atan2(p);
+    }
+    let n = a / (1.0 - e2 * lat.sin().powi(2)).sqrt();
+    let alt = p / lat.cos() - n;
+    (lat.to_degrees(), lon.to_degrees(), alt)
+}
+```
+
+**Public API**:
+```rust
+pub fn solve(input: &MlatInput) -> Option<MlatSolution>
+```
+
+Returns `None` if solver fails to converge or GDOP > 5.
+
+---
+
+### Step 2.3 — Kalman Filter (EKF per Aircraft)
+
+**File**: `Locus/rust-backend/src/kalman.rs`
+
+**State vector**: `[lat, lon, alt_m, vel_lat, vel_lon, vel_alt]` (6 elements)
+
+```rust
+use nalgebra::{Matrix6, Vector6, Matrix3x6, Matrix6x3};
+
+pub struct AircraftKalman {
+    pub icao24: String,
+    pub x: Vector6<f64>,          // state estimate
+    pub p: Matrix6<f64>,          // error covariance
+    pub last_update_ns: u64,
+}
+
+impl AircraftKalman {
+    pub fn new(icao24: String, lat: f64, lon: f64, alt: f64) -> Self {
+        let x = Vector6::new(lat, lon, alt, 0.0, 0.0, 0.0);
+        let p = Matrix6::identity() * 1e4; // large initial uncertainty
+        Self { icao24, x, p, last_update_ns: 0 }
+    }
+
+    /// Predict step: propagate state by dt seconds
+    pub fn predict(&mut self, dt: f64) {
+        // State transition: pos += vel * dt
+        let f = Self::transition_matrix(dt);
+        let q = Self::process_noise(dt);
+        self.x = &f * &self.x;
+        self.p = &f * &self.p * f.transpose() + q;
+    }
+
+    /// Update step: fuse MLAT measurement [lat, lon, alt]
+    pub fn update(&mut self, lat: f64, lon: f64, alt: f64) {
+        // Observation matrix H: maps state to [lat, lon, alt]
+        let h = Matrix3x6::new(
+            1.,0.,0.,0.,0.,0.,
+            0.,1.,0.,0.,0.,0.,
+            0.,0.,1.,0.,0.,0.,
+        );
+        let r = nalgebra::Matrix3::from_diagonal(
+            &nalgebra::Vector3::new(1e-8, 1e-8, 100.0) // measurement noise
+        );
+        let z = nalgebra::Vector3::new(lat, lon, alt);
+        let y = z - &h * &self.x;             // innovation
+        let s = &h * &self.p * h.transpose() + r;
+        let k = &self.p * h.transpose() * s.try_inverse().unwrap_or(nalgebra::Matrix3::zeros());
+        self.x = &self.x + &k * y;
+        let i = Matrix6::identity();
+        self.p = (i - k * &h) * &self.p;
+    }
+
+    fn transition_matrix(dt: f64) -> Matrix6<f64> {
+        let mut f = Matrix6::identity();
+        f[(0, 3)] = dt; f[(1, 4)] = dt; f[(2, 5)] = dt;
+        f
+    }
+
+    fn process_noise(dt: f64) -> Matrix6<f64> {
+        let sigma_a = 0.1_f64; // m/s^2 process noise
+        let dt2 = dt * dt / 2.0;
+        let dt3 = dt * dt * dt / 3.0;
+        let mut q = Matrix6::zeros();
+        q[(0, 0)] = dt3 * sigma_a; q[(0, 3)] = dt2 * sigma_a;
+        q[(1, 1)] = dt3 * sigma_a; q[(1, 4)] = dt2 * sigma_a;
+        q[(2, 2)] = dt3 * sigma_a; q[(2, 5)] = dt2 * sigma_a;
+        q[(3, 0)] = dt2 * sigma_a; q[(3, 3)] = dt * sigma_a;
+        q[(4, 1)] = dt2 * sigma_a; q[(4, 4)] = dt * sigma_a;
+        q[(5, 2)] = dt2 * sigma_a; q[(5, 5)] = dt * sigma_a;
+        q
+    }
+}
+```
+
+**Kalman registry** in main pipeline:
+```rust
+pub struct KalmanRegistry {
+    filters: HashMap<String, AircraftKalman>,
+}
+
+impl KalmanRegistry {
+    pub fn update(&mut self, icao24: &str, mlat: &MlatSolution, now_ns: u64) -> AircraftState {
+        let entry = self.filters.entry(icao24.to_string()).or_insert_with(|| {
+            AircraftKalman::new(icao24.to_string(), mlat.lat, mlat.lon, mlat.alt_m)
+        });
+        let dt = if entry.last_update_ns == 0 { 0.1 }
+                 else { (now_ns - entry.last_update_ns) as f64 / 1e9 };
+        entry.predict(dt);
+        entry.update(mlat.lat, mlat.lon, mlat.alt_m);
+        entry.last_update_ns = now_ns;
+        AircraftState::from_kalman(icao24, entry, mlat)
+    }
+}
+```
+
+---
+
+### Step 2.4 — AircraftState and WebSocket Broadcast
+
+**File**: `Locus/rust-backend/src/ws_server.rs` — add the full `AircraftState` struct:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AircraftState {
+    pub icao24: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_m: f64,
+    pub vel_lat: f64,
+    pub vel_lon: f64,
+    pub vel_alt: f64,
+    pub gdop: f64,
+    pub confidence_ellipse_m: f64,
+    pub spoof_flag: bool,
+    pub divergence_m: f64,
+    pub anomaly_label: String,       // "normal" | "anomalous" | "unknown"
+    pub anomaly_confidence: f64,
+    pub sensor_count: usize,
+    pub timestamp_ms: u64,
+}
+```
+
+Serialize to JSON and send over the broadcast channel from `main.rs` after each Kalman update.
+
+---
+
+### Step 2.5 — Frontend Leaflet Map
+
+Replace the placeholder `index.html` with the Phase 2 version. Key additions:
+
+- Leaflet.js map centered on Europe (lat=51, lon=5, zoom=5)
+- `aircraft` Map: `icao24 → { marker, track_polyline, last_seen }`
+- WebSocket `onmessage` updates marker position and extends polyline
+- Marker tooltip: ICAO24, alt, GDOP
+- Stale aircraft (no update >30s) get marker removed
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Locus — Live MLAT</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { display: flex; height: 100vh; background: #0d1117; color: #e6edf3;
+           font-family: 'Segoe UI', sans-serif; }
+    #sidebar { width: 300px; background: #161b22; border-right: 1px solid #30363d;
+               display: flex; flex-direction: column; overflow: hidden; }
+    #sidebar-header { padding: 16px; border-bottom: 1px solid #30363d; }
+    #sidebar-header h1 { font-size: 1.2rem; color: #58a6ff; }
+    #status-bar { font-size: 0.75rem; color: #8b949e; margin-top: 4px; }
+    #aircraft-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .aircraft-item { background: #0d1117; border: 1px solid #30363d;
+                     border-radius: 6px; padding: 10px; margin-bottom: 8px;
+                     cursor: pointer; transition: border-color 0.2s; }
+    .aircraft-item:hover { border-color: #58a6ff; }
+    .aircraft-item.spoofed { border-color: #f85149; }
+    .aircraft-icao { font-weight: bold; font-size: 0.9rem; }
+    .aircraft-detail { font-size: 0.75rem; color: #8b949e; margin-top: 4px; }
+    #map { flex: 1; }
+    #alert-feed { height: 120px; background: #0d1117;
+                  border-top: 1px solid #30363d; overflow-y: auto; padding: 8px; }
+    .alert { font-size: 0.75rem; padding: 4px;
+             border-left: 3px solid #f85149; padding-left: 8px;
+             margin-bottom: 4px; color: #ffa657; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <h1>Locus</h1>
+      <div id="status-bar">Connecting...</div>
+    </div>
+    <div id="aircraft-list"></div>
+    <div id="alert-feed"></div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // Map setup
+    const map = L.map('map').setView([51.0, 5.0], 5);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: 'Locus | CartoDB'
+    }).addTo(map);
+
+    const aircraft = new Map();
+    const statusBar = document.getElementById('status-bar');
+    const aircraftList = document.getElementById('aircraft-list');
+    const alertFeed = document.getElementById('alert-feed');
+
+    function makeIcon(spoofed, anomalous) {
+      const color = spoofed ? '#f85149' : anomalous ? '#ffa657' : '#3fb950';
+      return L.divIcon({
+        className: '',
+        html: `<div style="width:10px;height:10px;border-radius:50%;
+                           background:${color};border:2px solid #fff;"></div>`,
+        iconSize: [10, 10],
+        iconAnchor: [5, 5],
+      });
+    }
+
+    function updateAircraft(state) {
+      const key = state.icao24;
+      if (!aircraft.has(key)) {
+        const marker = L.marker([state.lat, state.lon], {
+          icon: makeIcon(state.spoof_flag, state.anomaly_label === 'anomalous')
+        }).addTo(map);
+        const track = L.polyline([], { color: '#58a6ff', weight: 1, opacity: 0.6 }).addTo(map);
+        aircraft.set(key, { marker, track, last_seen: Date.now() });
+      }
+      const ac = aircraft.get(key);
+      ac.marker.setLatLng([state.lat, state.lon]);
+      ac.marker.setIcon(makeIcon(state.spoof_flag, state.anomaly_label === 'anomalous'));
+      ac.marker.bindTooltip(
+        `<b>${state.icao24}</b><br>` +
+        `Alt: ${Math.round(state.alt_m)}m<br>` +
+        `GDOP: ${state.gdop.toFixed(2)}<br>` +
+        `Sensors: ${state.sensor_count}`
+      );
+      ac.track.addLatLng([state.lat, state.lon]);
+      ac.last_seen = Date.now();
+
+      // Sidebar card
+      let card = document.getElementById(`ac-${key}`);
+      if (!card) {
+        card = document.createElement('div');
+        card.id = `ac-${key}`;
+        card.className = 'aircraft-item';
+        card.onclick = () => map.setView([state.lat, state.lon], 8);
+        aircraftList.prepend(card);
+      }
+      card.className = `aircraft-item${state.spoof_flag ? ' spoofed' : ''}`;
+      card.innerHTML = `
+        <div class="aircraft-icao">${state.icao24}
+          ${state.spoof_flag ? ' <span style="color:#f85149">SPOOF</span>' : ''}
+          ${state.anomaly_label === 'anomalous' ? ' <span style="color:#ffa657">ANOMALY</span>' : ''}
+        </div>
+        <div class="aircraft-detail">
+          Alt: ${Math.round(state.alt_m)}m | GDOP: ${state.gdop.toFixed(2)} |
+          Sensors: ${state.sensor_count}
+        </div>`;
+
+      // Alerts
+      if (state.spoof_flag) {
+        const alert = document.createElement('div');
+        alert.className = 'alert';
+        alert.textContent = `${new Date().toLocaleTimeString()} SPOOF: ${state.icao24} divergence ${Math.round(state.divergence_m)}m`;
+        alertFeed.prepend(alert);
+        if (alertFeed.children.length > 50) alertFeed.lastChild.remove();
+      }
+    }
+
+    // Stale aircraft cleanup (every 10s)
+    setInterval(() => {
+      const cutoff = Date.now() - 30000;
+      for (const [key, ac] of aircraft.entries()) {
+        if (ac.last_seen < cutoff) {
+          map.removeLayer(ac.marker);
+          map.removeLayer(ac.track);
+          aircraft.delete(key);
+          document.getElementById(`ac-${key}`)?.remove();
+        }
+      }
+    }, 10000);
+
+    // WebSocket
+    let frameCount = 0;
+    function connect() {
+      const ws = new WebSocket('ws://localhost:9001');
+      ws.onopen = () => { statusBar.textContent = 'Connected'; };
+      ws.onmessage = (evt) => {
+        const state = JSON.parse(evt.data);
+        if (state.icao24) {
+          frameCount++;
+          updateAircraft(state);
+          statusBar.textContent = `Connected | ${frameCount} updates | ${aircraft.size} aircraft`;
+        }
+      };
+      ws.onclose = () => {
+        statusBar.textContent = 'Reconnecting...';
+        setTimeout(connect, 3000);
+      };
+      ws.onerror = () => ws.close();
+    }
+    connect();
+  </script>
+</body>
+</html>
+```
+
+---
+
+### Phase 2 Verification Checklist
+
+```
+[ ] Correlator groups frames correctly in unit test (inject 5 frames same ICAO24 + hash)
+[ ] MLAT solver converges on mock data: solution within 500m of true position
+[ ] GDOP values logged per solution; solutions with GDOP>5 discarded
+[ ] Kalman filter smooths position (no position jumps >2km between 100ms updates)
+[ ] Aircraft markers appear on Leaflet map and move continuously
+[ ] Clicking a marker shows tooltip with ICAO24, altitude, GDOP
+[ ] Track polylines drawn correctly (no wraparound artifacts)
+[ ] No memory leak: stale aircraft cleaned up from map after 30s
+```
+
+---
+
+### Phase 2 Docker Compose Update
+
+No Compose changes required. The Rust container already builds and runs. Verify:
+```bash
+docker compose build rust-backend
+docker compose up rust-backend ml-service frontend
+```
+
+---
+
+## Phase 3 — Self-Calibrating Clock Sync + Sensor Health UI
+
+### Goal
+Parse ADS-B position frames from beacon aircraft to compute per-sensor-pair clock offsets, apply them before the MLAT solve, and display sensor health in a Chart.js panel.
+
+### Visible Outcome
+- **Terminal**: `clock_offset[1001][1002] = +12.3ns (EMA)` logged, GDOP improving over time
+- **Browser**: "Sensor Health" panel shows a per-sensor clock offset drift sparkline (Chart.js)
+
+### Estimated time: 3–4 hours
+
+---
+
+### Step 3.1 — ADS-B Position Parser
+
+Inside `correlator.rs` or a new `adsb_parser.rs`, add a function to extract the ADS-B (DF17) airborne position from raw Mode-S bytes:
+
+```rust
+pub struct AdsbPosition {
+    pub icao24: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_m: f64,
+}
+
+/// Attempt to decode an ADS-B airborne position message (DF17, TC=9..18).
+/// Returns None if frame is not a position message or CPR decode fails.
+pub fn parse_adsb_position(bytes: &[u8]) -> Option<AdsbPosition> {
+    if bytes.len() < 14 { return None; }
+    let df = (bytes[0] >> 3) & 0x1F;
+    if df != 17 && df != 18 { return None; }
+    let tc = (bytes[4] >> 3) & 0x1F;
+    if !(9..=18).contains(&tc) { return None; } // airborne position TCs
+    let icao24 = format!("{:02X}{:02X}{:02X}", bytes[1], bytes[2], bytes[3]);
+    // Altitude (ME bytes 4-5, bits 40-52)
+    let alt_raw = ((bytes[5] as u16) << 4) | ((bytes[6] as u16) >> 4);
+    let alt_m = decode_altitude_m(alt_raw)?;
+    // CPR position (simplified: use globally-unambiguous decode)
+    let lat_cpr = ((bytes[6] as u32 & 0x03) << 15)
+                | ((bytes[7] as u32) << 7)
+                | ((bytes[8] as u32) >> 1);
+    let lon_cpr = ((bytes[8] as u32 & 0x01) << 16)
+                | ((bytes[9] as u32) << 8)
+                | (bytes[10] as u32);
+    let f_flag = (bytes[6] >> 2) & 0x01; // 0=even, 1=odd
+    // For ground truth use, we do simple surface-relative decode:
+    // In production, maintain even/odd pair cache; for clock sync use
+    // recent pair to compute precise lat/lon.
+    // TODO: implement full CPR decode — see Step 3.1 note
+    None // placeholder until CPR decoder implemented
+}
+```
+
+Note: Full CPR decoding requires accumulating even/odd frame pairs per ICAO24. Implement a `CprDecoder` struct:
+
+```rust
+pub struct CprDecoder {
+    even: Option<(u32, u32)>,  // (lat_cpr, lon_cpr)
+    odd:  Option<(u32, u32)>,
+}
+
+impl CprDecoder {
+    pub fn feed(&mut self, lat_cpr: u32, lon_cpr: u32, f_flag: u8)
+        -> Option<(f64, f64)>
+    {
+        // Store even/odd frames
+        // When both available, apply the standard CPR global decode algorithm
+        // Reference: ICAO Doc 9684 §3.2.6 and OpenSky Network decoder
+    }
+}
+```
+
+For hackathon purposes, if CPR decode is complex, use the aircraft's self-reported position via the ADS-B velocity message (TC=19) combined with known reference points. An alternative shortcut: use the claimed lat/lon directly from the spoof detector (Step 4.1) and trust it only for beacon aircraft that are validated by two independent ground stations — log a warning if only clock-sync beacons are ADS-B-only.
+
+---
+
+### Step 3.2 — Clock Sync Engine
+
+**File**: `Locus/rust-backend/src/clock_sync.rs`
+
+```rust
+use std::collections::HashMap;
+
+const EMA_ALPHA: f64 = 0.1;  // exponential moving average weight
+const C_M_PER_NS: f64 = 0.299_792_458;  // speed of light in m/ns
+
+pub struct ClockSyncEngine {
+    // offset[sensor_i][sensor_j] = corrected nanoseconds to subtract from t_i - t_j
+    offsets: HashMap<(i64, i64), f64>,
+    sample_counts: HashMap<(i64, i64), u64>,
+}
+
+impl ClockSyncEngine {
+    pub fn new() -> Self {
+        Self { offsets: HashMap::new(), sample_counts: HashMap::new() }
+    }
+
+    /// Update clock offset using a beacon aircraft with known position.
+    pub fn update_from_beacon(
+        &mut self,
+        sensor_i: i64, pos_i: (f64, f64, f64),  // sensor ECEF
+        sensor_j: i64, pos_j: (f64, f64, f64),
+        t_i_ns: u64, t_j_ns: u64,
+        beacon_ecef: (f64, f64, f64),
+    ) {
+        let dist_i = ecef_dist(pos_i, beacon_ecef);
+        let dist_j = ecef_dist(pos_j, beacon_ecef);
+        let theoretical_tdoa_ns = (dist_i - dist_j) / C_M_PER_NS;
+        let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
+        let error_ns = observed_tdoa_ns - theoretical_tdoa_ns;
+
+        let key = (sensor_i, sensor_j);
+        let current = self.offsets.entry(key).or_insert(0.0);
+        *current = (1.0 - EMA_ALPHA) * *current + EMA_ALPHA * error_ns;
+        *self.sample_counts.entry(key).or_insert(0) += 1;
+
+        tracing::debug!(
+            "clock_offset[{}][{}] = {:.2}ns (n={})",
+            sensor_i, sensor_j,
+            *current,
+            self.sample_counts[&key]
+        );
+    }
+
+    /// Apply corrections to a set of TDOAs before passing to the MLAT solver.
+    pub fn apply_corrections(
+        &self,
+        frames: &[RawFrame],  // sorted by sensor_id
+    ) -> Vec<f64> {
+        // Returns corrected TDOA relative to frames[0] as reference
+        let ref_frame = &frames[0];
+        frames[1..].iter().map(|f| {
+            let raw_tdoa = f.timestamp_ns() as f64 - ref_frame.timestamp_ns() as f64;
+            let key = (f.sensor_id, ref_frame.sensor_id);
+            let correction = self.offsets.get(&key).copied().unwrap_or(0.0);
+            raw_tdoa - correction
+        }).collect()
+    }
+
+    /// Export current offsets for UI display.
+    pub fn export_offsets(&self) -> Vec<SensorOffsetReport> {
+        self.offsets.iter().map(|((si, sj), offset)| SensorOffsetReport {
+            sensor_i: *si, sensor_j: *sj, offset_ns: *offset,
+            sample_count: *self.sample_counts.get(&(*si, *sj)).unwrap_or(&0),
+        }).collect()
+    }
+}
+
+#[derive(Serialize)]
+pub struct SensorOffsetReport {
+    pub sensor_i: i64,
+    pub sensor_j: i64,
+    pub offset_ns: f64,
+    pub sample_count: u64,
+}
+```
+
+Broadcast a `sensor_health` WebSocket message every 5 seconds:
+```json
+{
+  "type": "sensor_health",
+  "offsets": [
+    { "sensor_i": 1001, "sensor_j": 1002, "offset_ns": 12.3, "sample_count": 450 }
+  ]
+}
+```
+
+---
+
+### Step 3.3 — Sensor Health Panel (Chart.js)
+
+Add to `frontend/index.html` below the alert feed:
+
+```html
+<!-- Add to sidebar, below alert-feed -->
+<div id="sensor-health" style="height:200px;padding:8px;border-top:1px solid #30363d;">
+  <div style="font-size:0.75rem;color:#8b949e;margin-bottom:4px;">Sensor Clock Offsets (ns)</div>
+  <canvas id="offset-chart"></canvas>
+</div>
+```
+
+Add Chart.js CDN in `<head>`:
+```html
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+```
+
+In the `<script>` block, add the sensor health chart:
+
+```javascript
+const offsetHistory = {}; // sensorPair -> [last 60 values]
+let offsetChart = null;
+
+function initOffsetChart() {
+  const ctx = document.getElementById('offset-chart').getContext('2d');
+  offsetChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: Array(60).fill(''), datasets: [] },
+    options: {
+      animation: false,
+      scales: {
+        x: { display: false },
+        y: { ticks: { color: '#8b949e', font: { size: 10 } },
+             grid: { color: '#30363d' } }
+      },
+      plugins: { legend: { labels: { color: '#8b949e', font: { size: 9 } } } }
+    }
+  });
+}
+
+function updateSensorHealth(msg) {
+  if (!offsetChart) initOffsetChart();
+  for (const o of msg.offsets) {
+    const key = `${o.sensor_i}-${o.sensor_j}`;
+    if (!offsetHistory[key]) offsetHistory[key] = [];
+    offsetHistory[key].push(o.offset_ns);
+    if (offsetHistory[key].length > 60) offsetHistory[key].shift();
+  }
+  // Rebuild datasets
+  const colors = ['#58a6ff','#3fb950','#ffa657','#f85149','#d2a8ff','#79c0ff'];
+  offsetChart.data.datasets = Object.entries(offsetHistory).map(([key, vals], i) => ({
+    label: key,
+    data: vals,
+    borderColor: colors[i % colors.length],
+    borderWidth: 1,
+    pointRadius: 0,
+    tension: 0.3,
+  }));
+  offsetChart.update();
+}
+
+// Update WebSocket message handler to dispatch by type:
+ws.onmessage = (evt) => {
+  const msg = JSON.parse(evt.data);
+  if (msg.type === 'sensor_health') {
+    updateSensorHealth(msg);
+  } else if (msg.icao24) {
+    frameCount++;
+    updateAircraft(msg);
+    statusBar.textContent = `Connected | ${frameCount} updates | ${aircraft.size} aircraft`;
+  }
+};
+```
+
+---
+
+### Phase 3 Verification Checklist
+
+```
+[ ] Clock offsets logged per sensor pair after first beacon aircraft observation
+[ ] EMA converges: offset stabilizes within ~30 beacon observations
+[ ] GDOP before correction vs after correction logged — improvement visible
+[ ] sensor_health WebSocket message emitted every 5 seconds
+[ ] Chart.js panel shows offset sparklines updating in real time
+[ ] Beacon aircraft (is_beacon=true in mock) drives clock sync, not the spoofer
+```
+
+---
+
+### Phase 3 Docker Compose Update
+
+No additional Compose changes. Verify the 5-second health broadcast does not flood the WebSocket.
+
+---
+
+## Phase 4 — Spoof Detector + AI Anomaly Classifier
+
+### Goal
+Flag aircraft whose ADS-B claimed position diverges from MLAT-derived position by >2km, and classify aircraft tracks as normal/anomalous using the LSTM model.
+
+### Visible Outcome
+- **Terminal**: `SPOOF DETECTED icao=AABBCC divergence=5241m` for the mock spoofer aircraft
+- **Browser**: Spoofer aircraft marker turns red, alert feed shows divergence value; anomaly labels appear on sidebar cards
+
+### Estimated time: 4–6 hours
+
+---
+
+### Step 4.1 — Spoof Detector
+
+**File**: `Locus/rust-backend/src/spoof_detector.rs`
+
+```rust
+use geo::{point, HaversineDistance};
+
+const SPOOF_THRESHOLD_M: f64 = 2000.0; // 2km divergence triggers flag
+
+pub struct SpoofDetector {
+    // Last known ADS-B claimed position per ICAO24
+    claimed_positions: HashMap<String, (f64, f64, f64)>,  // lat, lon, alt_m
+}
+
+impl SpoofDetector {
+    pub fn new() -> Self { Self { claimed_positions: HashMap::new() } }
+
+    /// Record an ADS-B claimed position for an aircraft.
+    pub fn record_adsb(&mut self, icao24: &str, lat: f64, lon: f64, alt_m: f64) {
+        self.claimed_positions.insert(icao24.to_string(), (lat, lon, alt_m));
+    }
+
+    /// Compare MLAT-derived position against ADS-B claim.
+    pub fn check(&self, icao24: &str, mlat_lat: f64, mlat_lon: f64) -> (bool, f64) {
+        match self.claimed_positions.get(icao24) {
+            None => (false, 0.0),
+            Some(&(claimed_lat, claimed_lon, _)) => {
+                let p1 = point!(x: mlat_lon, y: mlat_lat);
+                let p2 = point!(x: claimed_lon, y: claimed_lat);
+                let divergence_m = p1.haversine_distance(&p2);
+                let flag = divergence_m > SPOOF_THRESHOLD_M;
+                if flag {
+                    tracing::warn!(
+                        "SPOOF DETECTED icao={icao24} divergence={divergence_m:.0}m"
+                    );
+                }
+                (flag, divergence_m)
+            }
+        }
+    }
+}
+```
+
+In **mock mode**, inject the spoof behavior: after 30 seconds of simulation time, the `AABBCC` aircraft's ADS-B-reported position (fed to `record_adsb`) starts deviating +0.05 degrees lat from its true MLAT-tracked position per second.
+
+---
+
+### Step 4.2 — Python ML Service: Full Implementation
+
+**File**: `Locus/ml-service/model.py`
+
+```python
+import torch
+import torch.nn as nn
+
+
+class AircraftLSTM(nn.Module):
+    """
+    LSTM anomaly classifier for aircraft tracks.
+    Input: sequence of 20 Kalman state vectors [lat, lon, alt, vel_lat, vel_lon, vel_alt]
+    Output: [p_normal, p_anomalous]
+    """
+    def __init__(self, input_size: int = 6, hidden_size: int = 128,
+                 num_layers: int = 2, dropout: float = 0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers,
+            batch_first=True, dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len=20, features=6)
+        out, _ = self.lstm(x)
+        out = self.dropout(out[:, -1, :])  # last timestep
+        return self.fc(out)   # (batch, 2) — raw logits
+```
+
+**File**: `Locus/ml-service/train.py`
+
+```python
+"""
+Train the LSTM anomaly classifier on OpenSky Network data.
+Fetches historical flight data, labels anomalies (spoofed/unusual trajectories),
+and trains the model.
+
+Usage:
+    python train.py --epochs 20 --output model.pt
+"""
+import argparse
+import logging
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from model import AircraftLSTM
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("skymesh-train")
+
+SEQ_LEN = 20
+FEATURES = 6   # lat, lon, alt, vel_lat, vel_lon, vel_alt
+
+
+def fetch_opensky_data(start_ts: int, end_ts: int):
+    """
+    Fetch flight state vectors from OpenSky REST API.
+    GET https://opensky-network.org/api/states/all?time=<ts>&lamin=45&lamax=55&lomin=-5&lomax=15
+    Returns list of state vectors as dicts.
+    """
+    import requests
+    url = "https://opensky-network.org/api/states/all"
+    params = {"time": start_ts, "lamin": 45, "lamax": 55, "lomin": -5, "lomax": 15}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("states", []) or []
+    except Exception as e:
+        logger.warning(f"OpenSky fetch error: {e}")
+        return []
+
+
+def generate_synthetic_dataset(n_normal: int = 800, n_anomalous: int = 200):
+    """
+    Generate synthetic training data when OpenSky is unavailable.
+    Normal: smooth velocity, realistic altitudes.
+    Anomalous: sudden position jumps (simulating spoofing).
+    """
+    def normal_track():
+        lat, lon, alt = np.random.uniform(48, 54), np.random.uniform(-2, 12), \
+                        np.random.uniform(5000, 12000)
+        vl, vlo, va = np.random.uniform(0.001, 0.005), np.random.uniform(0.002, 0.008), \
+                      np.random.uniform(-2, 2)
+        seq = []
+        for _ in range(SEQ_LEN):
+            seq.append([lat, lon, alt, vl, vlo, va])
+            lat += vl * 0.1; lon += vlo * 0.1; alt += va * 0.1
+        return np.array(seq)
+
+    def anomalous_track():
+        track = normal_track()
+        # Inject jump at random timestep
+        jump_idx = np.random.randint(5, 15)
+        track[jump_idx:, 0] += np.random.uniform(0.02, 0.08)  # lat jump (spoof)
+        track[jump_idx:, 1] += np.random.uniform(0.02, 0.08)
+        return track
+
+    X = np.array([normal_track() for _ in range(n_normal)] +
+                 [anomalous_track() for _ in range(n_anomalous)])
+    y = np.array([0] * n_normal + [1] * n_anomalous)
+    idx = np.random.permutation(len(X))
+    return X[idx], y[idx]
+
+
+def train(epochs: int, output_path: str):
+    logger.info("Generating training dataset...")
+    X, y = generate_synthetic_dataset()
+
+    # Normalize features
+    X_mean = X.mean(axis=(0, 1), keepdims=True)
+    X_std = X.std(axis=(0, 1), keepdims=True) + 1e-8
+    X_norm = (X - X_mean) / X_std
+
+    # Save normalization params alongside model
+    np.save(output_path.replace('.pt', '_mean.npy'), X_mean)
+    np.save(output_path.replace('.pt', '_std.npy'), X_std)
+
+    split = int(0.8 * len(X_norm))
+    X_train, X_val = X_norm[:split], X_norm[split:]
+    y_train, y_val = y[:split], y[split:]
+
+    ds_train = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
+    ds_val = TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
+    dl_train = DataLoader(ds_train, batch_size=32, shuffle=True)
+    dl_val = DataLoader(ds_val, batch_size=64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AircraftLSTM().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for xb, yb in dl_train:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        scheduler.step()
+
+        model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for xb, yb in dl_val:
+                xb, yb = xb.to(device), yb.to(device)
+                preds = model(xb).argmax(dim=1)
+                correct += (preds == yb).sum().item()
+                total += len(yb)
+        acc = correct / total
+        logger.info(f"Epoch {epoch}/{epochs} loss={total_loss/len(dl_train):.4f} val_acc={acc:.3f}")
+
+    torch.save(model.state_dict(), output_path)
+    logger.info(f"Model saved to {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--output", type=str, default="model.pt")
+    args = parser.parse_args()
+    train(args.epochs, args.output)
+```
+
+**File**: `Locus/ml-service/main.py` (Phase 4 full version)
+
+```python
+import logging
+import os
+from pathlib import Path
+from typing import List, Optional
+import numpy as np
+import torch
+import torch.nn.functional as F
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from model import AircraftLSTM
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("locus-ml")
+
+app = FastAPI(title="Locus ML Service", version="1.0.0")
+
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "model.pt"))
+MEAN_PATH = MODEL_PATH.parent / (MODEL_PATH.stem + "_mean.npy")
+STD_PATH = MODEL_PATH.parent / (MODEL_PATH.stem + "_std.npy")
+SEQ_LEN = 20
+FEATURES = 6
+
+device = torch.device("cpu")
+model: Optional[AircraftLSTM] = None
+X_mean: Optional[np.ndarray] = None
+X_std: Optional[np.ndarray] = None
+
+
+def load_model():
+    global model, X_mean, X_std
+    if not MODEL_PATH.exists():
+        logger.warning(f"Model file not found at {MODEL_PATH}. /classify will return 'unknown'.")
+        return
+    m = AircraftLSTM()
+    m.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    m.eval()
+    model = m
+    if MEAN_PATH.exists():
+        X_mean = np.load(MEAN_PATH)
+        X_std = np.load(STD_PATH)
+    logger.info("Model loaded successfully")
+
+
+@app.on_event("startup")
+async def startup():
+    load_model()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model_loaded": model is not None}
+
+
+class KalmanStatePoint(BaseModel):
+    lat: float
+    lon: float
+    alt_m: float
+    vel_lat: float
+    vel_lon: float
+    vel_alt: float
+
+
+class ClassifyRequest(BaseModel):
+    icao24: str
+    states: List[KalmanStatePoint]  # last 20 Kalman states
+
+
+class ClassifyResponse(BaseModel):
+    icao24: str
+    anomaly_label: str       # "normal" | "anomalous" | "unknown"
+    confidence: float
+
+
+@app.post("/classify", response_model=ClassifyResponse)
+async def classify(req: ClassifyRequest):
+    if model is None:
+        return ClassifyResponse(icao24=req.icao24, anomaly_label="unknown", confidence=0.0)
+
+    if len(req.states) < SEQ_LEN:
+        # Pad with zeros at the start if we have fewer than SEQ_LEN states
+        pad = SEQ_LEN - len(req.states)
+        seq = [[0.0] * FEATURES] * pad + [
+            [s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt]
+            for s in req.states
+        ]
+    else:
+        seq = [
+            [s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt]
+            for s in req.states[-SEQ_LEN:]
+        ]
+
+    x = np.array(seq, dtype=np.float32)[np.newaxis]  # (1, 20, 6)
+    if X_mean is not None:
+        x = (x - X_mean) / X_std
+
+    with torch.no_grad():
+        logits = model(torch.tensor(x))
+        probs = F.softmax(logits, dim=1).numpy()[0]
+
+    label = "anomalous" if probs[1] > 0.5 else "normal"
+    confidence = float(probs[1] if label == "anomalous" else probs[0])
+
+    logger.info(f"classify {req.icao24}: {label} ({confidence:.3f})")
+    return ClassifyResponse(icao24=req.icao24, anomaly_label=label, confidence=confidence)
+
+
+@app.post("/train")
+async def trigger_train(background_tasks: BackgroundTasks):
+    """Trigger model retraining in the background."""
+    def _train():
+        import subprocess
+        result = subprocess.run(["python", "train.py", "--epochs", "10", "--output", str(MODEL_PATH)],
+                                capture_output=True, text=True)
+        logger.info(f"Training stdout: {result.stdout}")
+        if result.returncode == 0:
+            load_model()
+            logger.info("Model reloaded after training")
+        else:
+            logger.error(f"Training failed: {result.stderr}")
+    background_tasks.add_task(_train)
+    return {"status": "training started"}
+```
+
+---
+
+### Step 4.3 — Rust Anomaly Client
+
+**File**: `Locus/rust-backend/src/anomaly_client.rs`
+
+```rust
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct KalmanStatePoint {
+    lat: f64, lon: f64, alt_m: f64,
+    vel_lat: f64, vel_lon: f64, vel_alt: f64,
+}
+
+#[derive(Serialize)]
+struct ClassifyRequest<'a> {
+    icao24: &'a str,
+    states: Vec<KalmanStatePoint>,
+}
+
+#[derive(Deserialize)]
+pub struct ClassifyResponse {
+    pub icao24: String,
+    pub anomaly_label: String,
+    pub confidence: f64,
+}
+
+pub struct AnomalyClient {
+    client: Client,
+    base_url: String,
+}
+
+impl AnomalyClient {
+    pub fn new(base_url: String) -> Self {
+        Self { client: Client::new(), base_url }
+    }
+
+    pub async fn classify(
+        &self,
+        icao24: &str,
+        history: &[(f64, f64, f64, f64, f64, f64)], // (lat,lon,alt,vlat,vlon,valt)
+    ) -> anyhow::Result<ClassifyResponse> {
+        let states: Vec<KalmanStatePoint> = history.iter().map(|&(lat, lon, alt_m, vel_lat, vel_lon, vel_alt)| {
+            KalmanStatePoint { lat, lon, alt_m, vel_lat, vel_lon, vel_alt }
+        }).collect();
+
+        let req = ClassifyRequest { icao24, states };
+        let resp = self.client
+            .post(format!("{}/classify", self.base_url))
+            .json(&req)
+            .timeout(std::time::Duration::from_millis(500))
+            .send()
+            .await?
+            .json::<ClassifyResponse>()
+            .await?;
+        Ok(resp)
+    }
+}
+```
+
+In `main.rs`, maintain a `VecDeque<(f64,f64,f64,f64,f64,f64)>` of length 20 per ICAO24 in the Kalman registry. After each Kalman update, call `anomaly_client.classify(...)` and attach the result to the `AircraftState` before broadcasting.
+
+Use `tokio::spawn` to avoid blocking the main loop on the HTTP call:
+```rust
+let client = anomaly_client.clone();
+let icao = icao24.clone();
+let hist = history_snapshot.clone();
+let ws_tx2 = ws_tx.clone();
+tokio::spawn(async move {
+    match client.classify(&icao, &hist).await {
+        Ok(resp) => {
+            // update the in-flight AircraftState with anomaly label
+            // re-broadcast updated state
+        }
+        Err(e) => tracing::warn!("anomaly classify error: {e}"),
+    }
+});
+```
+
+---
+
+### Phase 4 Verification Checklist
+
+```
+[ ] Mock spoofer (AABBCC) triggers spoof_flag=true after 30s simulation time
+[ ] spoof_flag=true appears in WebSocket JSON, marker turns red in browser
+[ ] Alert feed shows "SPOOF: AABBCC divergence Xm" with accurate value
+[ ] curl -X POST http://localhost:8000/classify -H 'Content-Type: application/json' \
+        -d '{"icao24":"TEST","states":[]}' returns {"anomaly_label":"unknown","confidence":0.0}
+[ ] After python train.py runs, model.pt exists and /classify returns normal/anomalous
+[ ] Anomaly labels appear on sidebar aircraft cards in browser
+[ ] ML HTTP calls do not block MLAT pipeline (verify with timing logs)
+```
+
+---
+
+### Phase 4 Docker Compose Update
+
+Train the model during image build by adding to `ml-service/Dockerfile`:
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+# Pre-train model at build time (uses synthetic data — fast, ~60s)
+RUN python train.py --epochs 15 --output model.pt
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Add `MODEL_PATH` environment variable to Compose:
+```yaml
+ml-service:
+  environment:
+    - MODEL_PATH=/app/model.pt
+  volumes:
+    - ml-models:/app/model.pt  # persist trained model across restarts
+```
+
+Add to bottom of `docker-compose.yml`:
+```yaml
+volumes:
+  ml-models:
+```
+
+---
+
+## Phase 5 — Full Polish + Production Docker Compose
+
+### Goal
+Complete the frontend UI, finalize all Docker Compose configuration, add confidence ellipses to the map, and verify the full system starts from a clean clone in under 5 minutes.
+
+### Visible Outcome
+- **Browser**: Full professional UI — dark theme map, sidebar with aircraft list, alert feed, sensor health charts, confidence ellipses drawn around aircraft positions
+- **Terminal**: `docker compose up --build` from clean clone completes and all services healthy within 5 minutes
+
+### Estimated time: 2–3 hours
+
+---
+
+### Step 5.1 — Confidence Ellipses on Map
+
+In `frontend/index.html`, when receiving an `AircraftState` with `confidence_ellipse_m` > 0, draw an ellipse:
+
+```javascript
+function updateAircraft(state) {
+  // ... existing marker update code ...
+
+  const ac = aircraft.get(state.icao24);
+
+  // Draw/update confidence ellipse
+  if (state.confidence_ellipse_m > 0) {
+    const radiusDeg = state.confidence_ellipse_m / 111320; // rough m -> degrees
+    if (ac.ellipse) map.removeLayer(ac.ellipse);
+    ac.ellipse = L.circle([state.lat, state.lon], {
+      radius: state.confidence_ellipse_m,
+      color: state.spoof_flag ? '#f85149' : '#58a6ff',
+      fillColor: state.spoof_flag ? '#f85149' : '#58a6ff',
+      fillOpacity: 0.05,
+      weight: 1,
+    }).addTo(map);
+  }
+}
+```
+
+---
+
+### Step 5.2 — Compute Confidence Ellipse Radius in Rust
+
+In `mlat_solver.rs`, extract the 2D horizontal standard deviation from the LM covariance matrix:
+
+```rust
+// After solver converges, covariance matrix is available from the Jacobian:
+// cov = (J^T J)^{-1} * sigma^2
+// confidence_ellipse_m = 2-sigma radius of horizontal position uncertainty
+// = 2 * sqrt(max eigenvalue of cov_xy)
+
+fn confidence_ellipse_m(covariance: &Matrix3<f64>) -> f64 {
+    let cov_xy = covariance.fixed_slice::<2, 2>(0, 0);
+    let trace = cov_xy[(0, 0)] + cov_xy[(1, 1)];
+    let det = cov_xy[(0, 0)] * cov_xy[(1, 1)] - cov_xy[(0, 1)].powi(2);
+    let lambda_max = trace / 2.0 + ((trace / 2.0).powi(2) - det).max(0.0).sqrt();
+    2.0 * lambda_max.sqrt()  // 2-sigma ellipse semi-major axis in meters
+}
+```
+
+---
+
+### Step 5.3 — Final docker-compose.yml
+
+**File**: `Locus/docker-compose.yml` (final version)
+
+```yaml
+version: "3.9"
+
+services:
+  rust-backend:
+    build:
+      context: ./rust-backend
+      dockerfile: Dockerfile
+    ports:
+      - "9001:9001"
+    environment:
+      - RUST_LOG=locus_backend=info
+      - MOCK_DATA=${MOCK_DATA:-true}
+    command: >
+      ./locus-backend
+      --ws-addr=0.0.0.0:9001
+      --ml-service-url=http://ml-service:8000
+      ${MOCK_DATA:+--mock}
+    volumes:
+      - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
+    depends_on:
+      ml-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/9001 2>/dev/null && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/app/model.pt
+    volumes:
+      - ml-models:/app/model.pt
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    depends_on:
+      - rust-backend
+
+  go-ingestor:
+    build:
+      context: ./go-ingestor
+      dockerfile: Dockerfile
+    ports:
+      - "61336:61336"
+    volumes:
+      - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
+    environment:
+      - GO_LOG=info
+    profiles:
+      - live
+    restart: unless-stopped
+
+volumes:
+  locus-ipc:
+    driver: local
+  ml-models:
+```
+
+**File**: `Locus/docker-compose.dev.yml`
+
+```yaml
+version: "3.9"
+
+services:
+  rust-backend:
+    build:
+      context: ./rust-backend
+    volumes:
+      - ./rust-backend/src:/app/src:rw
+      - rust-target:/app/target
+      - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
+    environment:
+      - RUST_LOG=locus_backend=trace
+    command: >
+      sh -c "cargo install cargo-watch 2>/dev/null;
+             cargo watch -x 'run -- --mock --ws-addr=0.0.0.0:9001
+             --ml-service-url=http://ml-service:8000'"
+
+  go-ingestor:
+    volumes:
+      - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
+
+  ml-service:
+    volumes:
+      - ./ml-service:/app:rw
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    volumes:
+      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
+
+volumes:
+  locus-ipc:
+    driver: local
+  rust-target:
+```
+
+---
+
+### Step 5.4 — .gitignore
+
+**File**: `Locus/.gitignore`
+```
+# Credentials
+go-ingestor/.buyer-env
+go-ingestor/.seller-env
+
+# Rust build artifacts
+rust-backend/target/
+
+# Python
+ml-service/.venv/
+ml-service/__pycache__/
+ml-service/*.pt
+ml-service/*_mean.npy
+ml-service/*_std.npy
+
+# Docker volumes
+.docker-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+```
+
+---
+
+### Step 5.5 — Environment and Quick-Start
+
+**File**: `Locus/.env.example`
+```env
+# Set to true for mock mode (no live 4DSky network required)
+MOCK_DATA=true
+
+# Rust log level
+RUST_LOG=locus_backend=info
+```
+
+**File**: `Locus/README.md` (minimal, not the focus of judging)
+```markdown
+# Locus
+
+Real-time MLAT aircraft positioning with GPS spoof detection and AI anomaly classification.
+
+## Quick Start (Mock Mode)
+
+    cp .env.example .env
+    docker compose up --build
+
+Open http://localhost:3000 — aircraft will appear within 10 seconds.
+
+## Live Mode (requires 4DSky credentials)
+
+    cp go-ingestor/.buyer-env.example go-ingestor/.buyer-env
+    # fill in your credentials
+    docker compose --profile live up --build
+
+## Development
+
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+```
+
+---
+
+### Phase 5 Verification Checklist
+
+```
+[ ] docker compose up --build completes without errors from clean directory
+[ ] All 3 services (rust-backend, ml-service, frontend) pass health checks
+[ ] Browser at http://localhost:3000 shows full UI within 10s of start
+[ ] Aircraft markers appear with confidence ellipses
+[ ] Spoofer aircraft (AABBCC) turns red and appears in alert feed after 30s
+[ ] Anomaly labels appear on sidebar after ML service classifies tracks
+[ ] Sensor health chart updates every 5 seconds
+[ ] docker compose down && docker compose up (no --build) starts in <60s
+[ ] .buyer-env is NOT committed (confirm with: git status Locus/go-ingestor/)
+```
+
+---
+
+## End-to-End Verification Guide
+
+After completing all phases, run this sequence to confirm the full system works:
+
+### 1. Start the stack (mock mode)
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus/Locus
+cp .env.example .env
+docker compose up --build -d
+docker compose logs -f
+```
+
+Expected within 30s:
+```
+ml-service    | INFO:     Application startup complete.
+rust-backend  | INFO Locus backend starting
+rust-backend  | INFO WebSocket server listening on 0.0.0.0:9001
+rust-backend  | INFO Received frame #100 from sensor 1001
+```
+
+### 2. Verify each service
+```bash
+# ML health
+curl http://localhost:8000/health
+# Expected: {"status":"ok","model_loaded":true}
+
+# WebSocket output (requires wscat or websocat)
+websocat ws://localhost:9001 | head -3
+# Expected: JSON AircraftState objects
+
+# Frontend
+curl -s http://localhost:3000 | grep -c 'Locus'
+# Expected: 1 (or more)
+```
+
+### 3. Verify MLAT accuracy (mock mode)
+In logs, look for:
+```
+INFO mlat_solver: icao=4840D6 lat=51.012 lon=1.048 alt=10001m gdop=1.82
+```
+
+Compare against `MOCK_AIRCRAFT[0]` expected position for the elapsed time. Error should be <500m with σ=50ns noise.
+
+### 4. Verify clock sync convergence
+After 60 seconds in logs:
+```
+DEBUG clock_sync: clock_offset[1001][1002] = -3.2ns (n=312)
+```
+
+Offset magnitude should decrease over time as EMA converges.
+
+### 5. Verify spoof detection
+After 30 seconds simulation time:
+```
+WARN spoof_detector: SPOOF DETECTED icao=AABBCC divergence=5241m
+```
+
+In browser: AABBCC marker is red, alert feed shows the event.
+
+### 6. Verify ML classification
+```bash
+curl -X POST http://localhost:8000/classify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "icao24": "TEST",
+    "states": [
+      {"lat":51.0,"lon":1.0,"alt_m":10000,"vel_lat":0.003,"vel_lon":0.005,"vel_alt":0.0}
+    ]
+  }'
+```
+
+Expected: `{"icao24":"TEST","anomaly_label":"normal","confidence":0.85}` (approximately)
+
+### 7. Live mode smoke test (if credentials available)
+```bash
+docker compose --profile live up --build
+# Watch for: "Stream established with peer QmXxx..."
+# Then: "Received frame #1 from sensor <real_sensor_id>"
+```
+
+---
+
+## Key Implementation Notes
+
+### TDOA Sign Convention
+Always compute TDOA as `t_sensor_i - t_sensor_ref`. The reference sensor (index 0 in the group) has TDOA = 0 by definition. Never pass the reference sensor's TDOA to the residual function.
+
+### Units Throughout
+- Timestamps: stored as nanoseconds (u64)
+- TDOA passed to solver: converted to meters (`tdoa_ns * 0.299792458`)
+- Solver state vector: ECEF meters
+- Final output: WGS84 degrees + meters altitude
+- Clock offsets: nanoseconds (f64)
+
+### Numerical Stability in LM Solver
+If the Jacobian condition number exceeds 1e10, the solver may diverge. Mitigate by:
+1. Centering sensor positions around their centroid before solving (translate origin)
+2. Using at least 4 sensors (3 independent TDOA equations for 3 unknowns + 1 redundant)
+3. Regularizing: add a small damping factor (argmin LM does this automatically)
+
+### Mock Mode Aircraft Coordinate Conversion
+The mock generator computes TDOA using ECEF distances. Do NOT use the Haversine approximation for TDOA generation — it introduces systematic errors that will confuse the clock sync engine.
+
+### CPR Decoding Note
+If full CPR decoding is too complex to implement within time constraints, accept a simplified fallback: use the last two consecutive DF17 frames from the same ICAO24 (even/odd pair) and apply the standard CPR global decode. OpenSky's `pyModeS` library has a reference Python implementation to cross-check against.
+
+### Logging Strategy
+```
+tracing::error! — unrecoverable errors (service will restart)
+tracing::warn!  — recoverable anomalies (spoof detected, solver diverged)
+tracing::info!  — one-line summary per MLAT solution (every 10th to avoid flood)
+tracing::debug! — per-frame events, clock offsets (normal operation detail)
+tracing::trace! — raw bytes, Jacobian values (debugging only)
+```
+
+Set `RUST_LOG=locus_backend=info` in production, `=debug` for development.
+
+---
+
+*End of Locus Implementation Plan — Version 1.0*
+*Lead Architect: Locus Team | Hackathon: 4DSky MLAT by Neuron Innovations / Hedera*
