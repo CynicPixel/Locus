@@ -19,7 +19,7 @@
          │ Unix socket client (Rust connects with retry)
          ▼
   rust-backend (tokio async runtime)
-    ├── ingestor.rs          ← connects to Go Unix socket OR generates mock frames
+    ├── ingestor.rs          ← connects to Go Unix socket
     │        │
     │        ▼
     ├── correlator.rs        ← groups frames by (ICAO24, content_hash) with time-based eviction
@@ -59,7 +59,7 @@
 | Phase | Description | Estimated Hours |
 |-------|-------------|-----------------|
 | 0 | Project scaffold + Docker foundation | 2–3 h |
-| 1 | Data pipeline (Go → Rust) + mock mode | 3–4 h |
+| 1 | Data pipeline (Go → Rust) | 3–4 h |
 | 2 | Core MLAT engine + live map dots | 5–7 h |
 | 3 | Self-calibrating clock sync + sensor health UI | 3–4 h |
 | 4 | Spoof detector + AI anomaly classifier | 4–6 h |
@@ -212,10 +212,6 @@ dashmap = "5"
 # CLI flags
 clap = { version = "4", features = ["derive"] }
 
-# Random number generation (mock mode)
-rand = "0.8"
-rand_distr = "0.4"
-
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -232,10 +228,6 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(name = "locus-backend", about = "Locus MLAT Engine")]
 pub struct Cli {
-    /// Run in mock data mode (skip Unix socket connection to Go ingestor)
-    #[arg(long, env = "MOCK_DATA")]
-    pub mock: bool,
-
     /// WebSocket bind address
     #[arg(long, default_value = "0.0.0.0:9001")]
     pub ws_addr: String,
@@ -257,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     info!("Locus backend starting");
-    info!(mock = cli.mock, ws_addr = %cli.ws_addr, "Configuration loaded");
+    info!(ws_addr = %cli.ws_addr, "Configuration loaded");
 
     // Phase 0: just confirm startup
     tokio::signal::ctrl_c().await?;
@@ -484,8 +476,7 @@ services:
       - "9001:9001"
     environment:
       - RUST_LOG=locus_backend=debug
-      - MOCK_DATA=true
-    command: ["./locus-backend", "--mock", "--ws-addr=0.0.0.0:9001",
+    command: ["./locus-backend", "--ws-addr=0.0.0.0:9001",
               "--ml-service-url=http://ml-service:8000"]
     volumes:
       - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
@@ -528,11 +519,6 @@ volumes:
     driver: local
 ```
 
-Note: `go-ingestor` is in the `live` profile. In mock mode you run:
-```bash
-docker compose up rust-backend ml-service frontend
-```
-
 For live mode with real network data (also applies `docker-compose.live.yml` override for `depends_on: go-ingestor`):
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.live.yml --profile live up
@@ -550,7 +536,7 @@ services:
     volumes:
       - ./rust-backend/src:/app/src
       - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
-    command: ["cargo", "watch", "-x", "run -- --mock"]
+    command: ["cargo", "watch", "-x", "run"]
     environment:
       - RUST_LOG=locus_backend=trace
 
@@ -588,19 +574,18 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 [ ] cargo build succeeds in rust-backend/
 [ ] curl http://localhost:8000/health returns {"status":"ok",...}  (after docker compose up)
 [ ] Browser at http://localhost:3000 shows "Locus — Connecting..."
-[ ] docker compose up (mock mode) starts 3 containers without restart loops
 [ ] go-ingestor container starts cleanly under --profile live (credentials not required to build)
 ```
 
 ---
 
-## Phase 1 — Data Pipeline (Go → Rust) + Mock Mode
+## Phase 1 — Data Pipeline (Go → Rust)
 
 ### Goal
-Wire the Go ingestor to emit structured JSON lines over a Unix domain socket, have Rust consume them by connecting to that socket, and implement mock mode as a full substitute.
+Wire the Go ingestor to emit structured JSON lines over a Unix domain socket, have Rust consume them by connecting to that socket.
 
 ### Visible Outcome
-- **Terminal**: `RUST_LOG=debug cargo run -- --mock` logs "Received frame from sensor X" at >10 fps
+- **Terminal**: `RUST_LOG=debug cargo run` logs "Received frame from sensor X" at >10 fps
 - **Browser**: The counter on the placeholder page increments ("Frames received: N") — this proves the WebSocket pipeline is alive end-to-end even before MLAT
 
 ### Estimated time: 3–4 hours
@@ -772,7 +757,9 @@ pub struct RawFrame {
 // Note: If the 4DSky SDK provides only seconds-since-midnight, add today's midnight Unix timestamp before writing to the socket.
 
 impl RawFrame {
-    /// Full timestamp as nanoseconds since midnight
+    /// Full timestamp as nanoseconds since Unix epoch (~1.7×10¹⁸ for current era).
+    /// Do NOT treat as time-of-day — seconds-since-midnight interpretation would
+    /// corrupt TDOA for cross-midnight frames and instantly evict all correlator groups.
     pub fn timestamp_ns(&self) -> u64 {
         self.timestamp_seconds * 1_000_000_000 + self.timestamp_nanoseconds
     }
@@ -790,7 +777,6 @@ The ingestor module exposes one public async function:
 
 ```rust
 pub async fn run_ingestor(
-    mock: bool,
     tx: tokio::sync::mpsc::Sender<RawFrame>,
 ) -> anyhow::Result<()>
 ```
@@ -859,100 +845,10 @@ loop {
 ```
 
 Add `tokio::net::UnixStream` to imports; `tokio` feature `"net"` is already enabled via `"full"`.
-The `run_ingestor(mock: bool, tx: Sender<RawFrame>)` signature is unchanged.
-The mock branch is unchanged.
 
 ---
 
-### Step 1.3 — Mock Mode Implementation
-
-Mock mode generates synthetic frames inside Rust. No Go process is needed and `connect_with_retry()` is never called.
-
-**Sensor positions** (6 European ground stations):
-
-```rust
-pub struct SensorPos {
-    pub id: i64,
-    pub lat: f64,
-    pub lon: f64,
-    pub alt: f64,   // meters
-}
-
-pub const MOCK_SENSORS: &[SensorPos] = &[
-    SensorPos { id: 1001, lat: 51.5074, lon: -0.1278, alt: 15.0 },  // London
-    SensorPos { id: 1002, lat: 52.3676, lon:  4.9041, alt:  5.0 },  // Amsterdam
-    SensorPos { id: 1003, lat: 48.8566, lon:  2.3522, alt: 35.0 },  // Paris
-    SensorPos { id: 1004, lat: 50.1109, lon:  8.6821, alt: 110.0 }, // Frankfurt
-    SensorPos { id: 1005, lat: 50.8503, lon:  4.3517, alt: 60.0 },  // Brussels
-    SensorPos { id: 1006, lat: 53.3498, lon: -6.2603, alt: 20.0 },  // Dublin
-    SensorPos { id: 1007, lat: 47.3769, lon:  8.5417, alt: 440.0 }, // Zurich
-    SensorPos { id: 1008, lat: 48.2082, lon: 16.3738, alt: 170.0 }, // Vienna
-];
-```
-
-**Aircraft motion** (three simulated aircraft):
-
-```rust
-pub struct MockAircraft {
-    pub icao24: &'static str,
-    pub is_spoofer: bool,      // ADS-B position diverges after 30s
-    pub is_beacon: bool,       // Transmits full ADS-B position for clock sync
-    // lat/lon/alt start and velocity (deg/s and m/s)
-    pub start_lat: f64,
-    pub start_lon: f64,
-    pub start_alt: f64,
-    pub vel_lat: f64,
-    pub vel_lon: f64,
-    pub vel_alt: f64,
-}
-
-pub const MOCK_AIRCRAFT: &[MockAircraft] = &[
-    MockAircraft {
-        icao24: "4840D6", is_spoofer: false, is_beacon: true,
-        start_lat: 51.0, start_lon: 1.0, start_alt: 10000.0,
-        vel_lat: 0.003, vel_lon: 0.005, vel_alt: 0.0,
-    },
-    MockAircraft {
-        icao24: "3C6444", is_spoofer: false, is_beacon: false,
-        start_lat: 50.5, start_lon: 3.0, start_alt: 9500.0,
-        vel_lat: 0.002, vel_lon: 0.004, vel_alt: -1.0,
-    },
-    MockAircraft {
-        icao24: "AABBCC", is_spoofer: true, is_beacon: false,
-        start_lat: 52.0, start_lon: 5.0, start_alt: 8000.0,
-        vel_lat: 0.001, vel_lon: 0.003, vel_alt: 0.5,
-    },
-];
-```
-
-**TDOA physics** (inside mock loop):
-```
-dist = sqrt((sensor_x - ac_x)^2 + (sensor_y - ac_y)^2 + (sensor_z - ac_z)^2)
-arrival_time_ns = true_timestamp_ns + (dist / c_m_per_ns)
-arrival_time_ns += Gaussian(mean=0, sigma=50)  // clock drift noise
-```
-
-Where `c_m_per_ns = 0.299792458` (meters per nanosecond).
-
-Convert lat/lon/alt to ECEF for distance calculation — use `coords::wgs84_to_ecef()` from `src/coords.rs` (see Step 2.3). Do **not** duplicate this function here; import it via `use crate::coords;`.
-
-The mock loop ticks at 20ms intervals (50 Hz) per aircraft, broadcasting to all sensors.
-
-```rust
-// Mock beacon aircraft bypass CPR decode entirely:
-// When is_beacon=true, inject AdsbPosition directly from the aircraft's
-// exact lat/lon/alt — skip parse_adsb_position() for mock frames.
-if aircraft.is_beacon {
-    Some(AdsbPosition { icao24: aircraft.icao24.to_string(),
-                        lat: current_lat, lon: current_lon, alt_m: current_alt })
-} else {
-    None
-}
-```
-
----
-
-### Step 1.4 — Wire WebSocket for Frame Counter
+### Step 1.3 — Wire WebSocket for Frame Counter
 
 In Phase 1, the WebSocket server is a minimal broadcast. The goal is to prove the UI counter increments.
 
@@ -1011,8 +907,7 @@ Update `src/main.rs` to:
 let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<RawFrame>(1024);
 let (ws_tx, ws_rx) = tokio::sync::broadcast::channel::<String>(1024);
 
-let mock = cli.mock;
-let ingestor_handle = tokio::spawn(ingestor::run_ingestor(mock, frame_tx));
+let ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
 let ws_handle = tokio::spawn(ws_server::run_ws_server(cli.ws_addr.clone(), ws_rx));
 
 // Forward raw frames directly to WebSocket (Phase 1 — no MLAT yet)
@@ -1038,7 +933,7 @@ tokio::select! {
 
 ---
 
-### Step 1.5 — Update Frontend Counter
+### Step 1.4 — Update Frontend Counter
 
 Update `Locus/frontend/index.html` — the WebSocket `onmessage` handler already increments `frameCount`. In Phase 1 we also log the sensor ID received:
 
@@ -1057,10 +952,9 @@ ws.onmessage = (evt) => {
 
 ```
 [ ] Go ingestor outputs valid JSON lines to stdout (manually verified with head -5)
-[ ] cargo run -- --mock logs frame receipts at >10 fps
+[ ] cargo run logs frame receipts at >10 fps
 [ ] Browser counter at localhost:3000 increments in real time
 [ ] No panic or unwrap failures in Rust logs
-[ ] docker compose up (mock) shows all 3 services healthy
 [ ] ECEF conversion unit test: London (51.5074, -0.1278, 15) → ~(3978553, -8837, 4968195) m
 ```
 
@@ -1068,7 +962,7 @@ ws.onmessage = (evt) => {
 
 ### Phase 1 Docker Compose Update
 
-No changes needed — Phase 0 `docker-compose.yml` already has `MOCK_DATA=true` set for the Rust backend and the `locus-ipc` volume already mounted on both services. In mock mode `MOCK_DATA=true`, `go-ingestor` is skipped (it's in the `live` profile) and Rust never calls `connect_with_retry()`, so the absence of a socket file causes no crash.
+No changes needed — Phase 0 `docker-compose.yml` already has the `locus-ipc` volume mounted on both services. The `go-ingestor` is in the `live` profile and Rust will retry connecting with `connect_with_retry()` until the socket is available.
 
 ---
 
@@ -1443,7 +1337,7 @@ pub fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
 ```
 
 Also add `touch Locus/rust-backend/src/coords.rs` to the Step 0.3 stub creation commands.
-The mock ingestor's `to_ecef()` function moves here as `pub fn wgs84_to_ecef(...)` — update all import sites accordingly.
+The existing `to_ecef()` moves to coords.rs as `pub fn wgs84_to_ecef(...)` — update all import sites accordingly.
 
 **State vector**: `[x, y, z, vx, vy, vz]` in ECEF meters and m/s — no unit mixing, no degree/meter ambiguity.
 
@@ -1784,7 +1678,7 @@ Replace the placeholder `index.html` with the Phase 2 version. Key additions:
 
 ```
 [ ] Correlator groups frames correctly in unit test (inject 5 frames same ICAO24 + hash)
-[ ] MLAT solver converges on mock data: solution within 500m of true position
+[ ] MLAT solver converges on real frames: GDOP < 5 and solution plausible for Cornwall/Scilly airspace
 [ ] GDOP values logged per solution; solutions with GDOP>5 discarded
 [ ] Kalman filter smooths position (no position jumps >2km between 100ms updates)
 [ ] Aircraft markers appear on Leaflet map and move continuously
@@ -2027,7 +1921,7 @@ impl ClockSyncEngine {
     /// Export current offsets for UI display — includes convergence status.
     pub fn export_offsets(&self) -> Vec<SensorOffsetReport> {
         self.samples.iter().map(|((si, sj), buf)| SensorOffsetReport {
-            sensor_pair: (*si, *sj),
+            sensor_i: *si, sensor_j: *sj,
             offset_ns: if buf.is_empty() { 0.0 } else { median_of_deque(buf) },
             sample_count: buf.len(),
             is_converged: buf.len() >= WINDOW_SIZE / 2,
@@ -2037,7 +1931,8 @@ impl ClockSyncEngine {
 
 #[derive(Serialize)]
 pub struct SensorOffsetReport {
-    pub sensor_pair: (i64, i64),
+    pub sensor_i: i64,
+    pub sensor_j: i64,
     pub offset_ns: f64,         // from median_of_deque
     pub sample_count: usize,    // from buf.len()
     pub is_converged: bool,     // from is_converged()
@@ -2161,7 +2056,7 @@ ws.onmessage = (evt) => {
 [ ] GDOP before correction vs after correction logged — improvement visible
 [ ] sensor_health WebSocket message emitted every 5 seconds
 [ ] Chart.js panel shows offset sparklines updating in real time
-[ ] Beacon aircraft (is_beacon=true in mock) drives clock sync, not the spoofer
+[ ] Clock sync converges on real beacon aircraft; offsets stabilise within 30 s
 ```
 
 ---
@@ -2178,7 +2073,7 @@ No additional Compose changes. Verify the 5-second health broadcast does not flo
 Flag aircraft whose ADS-B claimed position diverges from MLAT-derived position by >2km, and classify aircraft tracks as normal/anomalous using the LSTM model.
 
 ### Visible Outcome
-- **Terminal**: `SPOOF DETECTED icao=AABBCC divergence=5241m` for the mock spoofer aircraft
+- **Terminal**: `SPOOF DETECTED icao=<real_icao> divergence=Xm`
 - **Browser**: Spoofer aircraft marker turns red, alert feed shows divergence value; anomaly labels appear on sidebar cards
 
 ### Estimated time: 4–6 hours
@@ -2233,8 +2128,6 @@ impl SpoofDetector {
 ```
 
 Remove `use geo::{point, HaversineDistance};` import. Update call sites to pass `mlat.accuracy_m`.
-
-In **mock mode**, inject the spoof behavior: after 30 seconds of simulation time, the `AABBCC` aircraft's ADS-B-reported position (fed to `record_adsb`) starts deviating +0.05 degrees lat from its true MLAT-tracked position per second.
 
 ---
 
@@ -2691,9 +2584,9 @@ if now_ns.saturating_sub(history.last_classify_ns) > CLASSIFY_INTERVAL_NS {
 ### Phase 4 Verification Checklist
 
 ```
-[ ] Mock spoofer (AABBCC) triggers spoof_flag=true after 30s simulation time
+[ ] Spoof detector raises flag when ADS-B position diverges > 2 km from MLAT solution
 [ ] spoof_flag=true appears in WebSocket JSON, marker turns red in browser
-[ ] Alert feed shows "SPOOF: AABBCC divergence Xm" with accurate value
+[ ] Alert feed shows "SPOOF: <icao> divergence Xm" with accurate value
 [ ] curl -X POST http://localhost:8000/classify -H 'Content-Type: application/json' \
         -d '{"icao24":"TEST","states":[]}' returns {"anomaly_label":"unknown","confidence":0.0}
 [ ] After python train.py runs, model.pt exists and /classify returns normal/anomalous
@@ -2837,12 +2730,10 @@ services:
       - "9001:9001"
     environment:
       - RUST_LOG=locus_backend=info
-      - MOCK_DATA=${MOCK_DATA:-true}
     command: >
       ./locus-backend
       --ws-addr=0.0.0.0:9001
       --ml-service-url=http://ml-service:8000
-      ${MOCK_DATA:+--mock}
     volumes:
       - locus-ipc:/tmp/locus          # shared socket dir with go-ingestor
     depends_on:
@@ -2929,7 +2820,7 @@ services:
       - RUST_LOG=locus_backend=trace
     command: >
       sh -c "cargo install cargo-watch 2>/dev/null;
-             cargo watch -x 'run -- --mock --ws-addr=0.0.0.0:9001
+             cargo watch -x 'run -- --ws-addr=0.0.0.0:9001
              --ml-service-url=http://ml-service:8000'"
 
   go-ingestor:
@@ -2988,9 +2879,6 @@ ml-service/*_std.npy
 
 **File**: `Locus/.env.example`
 ```env
-# Set to true for mock mode (no live 4DSky network required)
-MOCK_DATA=true
-
 # Rust log level
 RUST_LOG=locus_backend=info
 ```
@@ -3001,7 +2889,7 @@ RUST_LOG=locus_backend=info
 
 Real-time MLAT aircraft positioning with GPS spoof detection and AI anomaly classification.
 
-## Quick Start (Mock Mode)
+## Quick Start
 
     cp .env.example .env
     docker compose up --build
@@ -3028,7 +2916,7 @@ Open http://localhost:3000 — aircraft will appear within 10 seconds.
 [ ] All 3 services (rust-backend, ml-service, frontend) pass health checks
 [ ] Browser at http://localhost:3000 shows full UI within 10s of start
 [ ] Aircraft markers appear with confidence ellipses
-[ ] Spoofer aircraft (AABBCC) turns red and appears in alert feed after 30s
+[ ] Spoofer aircraft turns red and appears in alert feed when detected
 [ ] Anomaly labels appear on sidebar after ML service classifies tracks
 [ ] Sensor health chart updates every 5 seconds
 [ ] docker compose down && docker compose up (no --build) starts in <60s
@@ -3041,7 +2929,7 @@ Open http://localhost:3000 — aircraft will appear within 10 seconds.
 
 After completing all phases, run this sequence to confirm the full system works:
 
-### 1. Start the stack (mock mode)
+### 1. Start the stack
 ```bash
 cd /home/psychopunk_sage/dev/tools/Locus/Locus
 cp .env.example .env
@@ -3072,7 +2960,7 @@ curl -s http://localhost:3000 | grep -c 'Locus'
 # Expected: 1 (or more)
 ```
 
-### 3. Verify MLAT accuracy (mock mode)
+### 3. Verify MLAT accuracy
 In logs, look for:
 ```
 INFO mlat_solver: icao=4840D6 lat=51.012 lon=1.048 alt=10001m gdop=1.82
@@ -3137,8 +3025,8 @@ If the Jacobian condition number exceeds 1e10, the solver may diverge. Mitigate 
 2. Using at least 4 sensors (3 independent TDOA equations for 3 unknowns + 1 redundant)
 3. Regularizing: add a small damping factor (argmin LM does this automatically)
 
-### Mock Mode Aircraft Coordinate Conversion
-The mock generator computes TDOA using ECEF distances. Do NOT use the Haversine approximation for TDOA generation — it introduces systematic errors that will confuse the clock sync engine.
+### TDOA Coordinate Conversion Note
+TDOA computation requires ECEF distances. Do NOT use the Haversine approximation for TDOA — it introduces systematic errors that will confuse the clock sync engine.
 
 ### CPR Decoding Note
 If full CPR decoding is too complex to implement within time constraints, accept a simplified fallback: use the last two consecutive DF17 frames from the same ICAO24 (even/odd pair) and apply the standard CPR global decode. OpenSky's `pyModeS` library has a reference Python implementation to cross-check against.
