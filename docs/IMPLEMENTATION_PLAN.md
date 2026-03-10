@@ -2516,23 +2516,82 @@ impl AnomalyClient {
 }
 ```
 
-In `main.rs`, maintain a `VecDeque<(f64,f64,f64,f64,f64,f64)>` of length 20 per ICAO24 in the Kalman registry. After each Kalman update, call `anomaly_client.classify(...)` and attach the result to the `AircraftState` before broadcasting.
+In `main.rs` (or `kalman.rs`), maintain an `AircraftHistory` per ICAO24 inside `KalmanRegistry`. The history VecDeque is filled on every Kalman update (20ms), but the ML HTTP call is rate-limited to once per 5 seconds — reducing load from 150 calls/sec to 0.6 calls/sec, well within single-worker FastAPI capacity.
 
-Use `tokio::spawn` to avoid blocking the main loop on the HTTP call:
 ```rust
-let client = anomaly_client.clone();
-let icao = icao24.clone();
-let hist = history_snapshot.clone();
-let ws_tx2 = ws_tx.clone();
-tokio::spawn(async move {
-    match client.classify(&icao, &hist).await {
-        Ok(resp) => {
-            // update the in-flight AircraftState with anomaly label
-            // re-broadcast updated state
-        }
-        Err(e) => tracing::warn!("anomaly classify error: {e}"),
+use std::collections::VecDeque;
+
+/// Per-aircraft ML classification history.
+/// Tuple units: (lat°, lon°, alt_m, vel_lat °/s, vel_lon °/s, vel_alt m/s)
+///
+/// IMPORTANT: vel_lat and vel_lon are in DEGREES/SECOND to match the training
+/// data in generate_synthetic_dataset(). Convert from ECEF m/s via full ENU
+/// rotation at push time — do NOT pass velocity_ms() ECEF components directly.
+pub struct AircraftHistory {
+    pub states: VecDeque<(f64, f64, f64, f64, f64, f64)>,
+    pub last_classify_ns: u64,   // gating field — limits classify to 5s cadence
+}
+
+impl AircraftHistory {
+    pub fn new() -> Self {
+        Self { states: VecDeque::new(), last_classify_ns: 0 }
     }
-});
+
+    /// Push a new state after each Kalman update.
+    /// Converts ECEF velocity to ENU degrees/s before storing.
+    pub fn push(&mut self, entry: &AircraftKalman) {
+        let (lat, lon, alt_m) = entry.position_wgs84();
+        let (vx, vy, vz)      = entry.velocity_ms();  // ECEF m/s
+        let (lat_r, lon_r)    = (lat.to_radians(), lon.to_radians());
+
+        // Full ECEF → ENU rotation (correct at all latitudes, including 50°N Europe)
+        let east  = -lon_r.sin() * vx + lon_r.cos() * vy;
+        let north = -lat_r.sin() * lon_r.cos() * vx
+                    - lat_r.sin() * lon_r.sin() * vy
+                    + lat_r.cos() * vz;
+        let up    =  lat_r.cos() * lon_r.cos() * vx
+                   + lat_r.cos() * lon_r.sin() * vy
+                   + lat_r.sin() * vz;
+
+        // Convert horizontal to deg/s (consistent with training data units)
+        let vel_lat = north / 111_320.0;
+        let vel_lon = east  / (111_320.0 * lat_r.cos());
+        let vel_alt = up;   // keep in m/s — training va is already in m/s
+
+        self.states.push_back((lat, lon, alt_m, vel_lat, vel_lon, vel_alt));
+        if self.states.len() > 20 {
+            self.states.pop_front();
+        }
+    }
+}
+
+// Rate-limit constant: classify at most once per 5 seconds per aircraft
+const CLASSIFY_INTERVAL_NS: u64 = 5_000_000_000;
+```
+
+**In `KalmanRegistry::update()`**, after calling `entry.update(...)`:
+
+```rust
+// Add AircraftHistory alongside each AircraftKalman filter
+history.push(&entry);   // fills every 20ms — always fresh
+
+// Rate-limited classify dispatch
+if now_ns.saturating_sub(history.last_classify_ns) > CLASSIFY_INTERVAL_NS {
+    history.last_classify_ns = now_ns;
+    let client  = anomaly_client.clone();
+    let icao    = icao24.to_string();
+    let hist_snap: Vec<_> = history.states.iter().copied().collect();
+    let ws_tx2  = ws_tx.clone();
+    tokio::spawn(async move {
+        match client.classify(&icao, &hist_snap).await {
+            Ok(resp) => {
+                // update the in-flight AircraftState with anomaly label
+                // re-broadcast updated state
+            }
+            Err(e) => tracing::warn!("anomaly classify error: {e}"),
+        }
+    });
+}
 ```
 
 ---
