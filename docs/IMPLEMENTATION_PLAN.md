@@ -10,7 +10,7 @@
 ## Dependency Graph
 
 ```
-4DSky SDK (Go binary @ port 61336)
+4DSky SDK (Go binary @ port 61339)
          │
          │ JSON lines → Unix socket (/tmp/locus/ingestor.sock)
          ▼
@@ -72,7 +72,7 @@
 
 | Service | Port | Protocol |
 |---------|------|----------|
-| Go ingestor (P2P buyer) | 61336 | TCP (libp2p) |
+| Go ingestor (P2P buyer) | 61339 | TCP (libp2p) |
 | Rust backend WebSocket | 9001 | WS |
 | Python ML service | 8000 | HTTP |
 | Frontend (nginx, Docker only) | 3000 | HTTP |
@@ -427,7 +427,7 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /app/ingestor .
 # .buyer-env must be mounted at runtime as /app/.buyer-env
-CMD ["./ingestor", "--port=61336", "--mode=peer", \
+CMD ["./ingestor", "--port=61339", "--mode=peer", \
      "--buyer-or-seller=buyer", \
      "--list-of-sellers-source=env", "--envFile=.buyer-env"]
 ```
@@ -514,9 +514,10 @@ services:
   go-ingestor:
     build: ./go-ingestor
     ports:
-      - "61336:61336"
+      - "61339:61339"
     volumes:
       - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - ./go-ingestor/location-override.json:/app/location-override.json:ro
       - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
     profiles:
       - live
@@ -656,7 +657,32 @@ type RawFrameOut struct {
     TimestampNanoseconds uint64  `json:"timestamp_nanoseconds"`
     RawModesHex          string  `json:"raw_modes_hex"`
 }
+```
 
+**Location override** — load `location-override.json` at startup:
+Some sellers report inaccurate GPS positions. The hackathon team provides exact coordinates
+in `location-override.json`, keyed by the seller's libp2p compressed public key (hex).
+
+Load at startup:
+```
+overrides = load_location_overrides("./location-override.json")  // map[pubkey_hex]→{lat,lon,alt}
+```
+
+When populating RawFrameOut per seller stream:
+```
+if override, ok := overrides[peerPubKeyHex]; ok {
+    frame.SensorLat = override.Lat
+    frame.SensorLon = override.Lon
+    frame.SensorAlt = override.Alt
+}
+```
+
+Note: Resolving peerPubKeyHex from a libp2p stream requires calling
+`stream.Conn().RemotePeer()` to get the `peer.ID`, then extracting the raw public key bytes.
+Verify during live testing that the SDK's `peer.ID` encodes the same 33-byte compressed
+public key format used in `location-override.json`.
+
+```go
 var (
     clientsMu sync.Mutex
     clients   = make(map[net.Conn]struct{})
@@ -698,8 +724,10 @@ frame := RawFrameOut{
     SensorLat:            sensorLatitude,
     SensorLon:            sensorLongitude,
     SensorAlt:            sensorAltitude,
-    TimestampSeconds:     secondsSinceMidnight,
-    TimestampNanoseconds: nanoseconds,
+    // TimestampSeconds must be Unix epoch seconds, NOT seconds since midnight.
+    // Seconds-since-midnight wraps to 0 at UTC midnight, corrupting TDOA for cross-midnight frames.
+    TimestampSeconds:     uint64(time.Now().Unix()),
+    TimestampNanoseconds: uint64(time.Now().UnixNano() % 1_000_000_000),
     RawModesHex:          fmt.Sprintf("%x", rawModeS),
 }
 jsonBytes, err := json.Marshal(frame)
@@ -737,10 +765,11 @@ pub struct RawFrame {
     pub sensor_lat: f64,
     pub sensor_lon: f64,
     pub sensor_alt: f64,          // meters above sea level
-    pub timestamp_seconds: u64,   // seconds since midnight UTC
+    pub timestamp_seconds: u64,   // Unix epoch seconds (NOT seconds since midnight)
     pub timestamp_nanoseconds: u64,
     pub raw_modes_hex: String,    // hex-encoded Mode-S bytes
 }
+// Note: If the 4DSky SDK provides only seconds-since-midnight, add today's midnight Unix timestamp before writing to the socket.
 
 impl RawFrame {
     /// Full timestamp as nanoseconds since midnight
@@ -908,6 +937,18 @@ Where `c_m_per_ns = 0.299792458` (meters per nanosecond).
 Convert lat/lon/alt to ECEF for distance calculation — use `coords::wgs84_to_ecef()` from `src/coords.rs` (see Step 2.3). Do **not** duplicate this function here; import it via `use crate::coords;`.
 
 The mock loop ticks at 20ms intervals (50 Hz) per aircraft, broadcasting to all sensors.
+
+```rust
+// Mock beacon aircraft bypass CPR decode entirely:
+// When is_beacon=true, inject AdsbPosition directly from the aircraft's
+// exact lat/lon/alt — skip parse_adsb_position() for mock frames.
+if aircraft.is_beacon {
+    Some(AdsbPosition { icao24: aircraft.icao24.to_string(),
+                        lat: current_lat, lon: current_lon, alt_m: current_alt })
+} else {
+    None
+}
+```
 
 ---
 
@@ -1105,16 +1146,6 @@ impl CorrelationKey {
 pub struct CorrelationGroup {
     pub key: CorrelationKey,
     pub frames: Vec<RawFrame>,   // one per sensor (deduplicated by sensor_id)
-    pub first_seen_ns: u64,
-}
-```
-
-**Correlation group** (updated with `first_seen_ns`):
-```rust
-#[derive(Debug, Clone)]
-pub struct CorrelationGroup {
-    pub key: CorrelationKey,
-    pub frames: Vec<RawFrame>,   // one per sensor (deduplicated by sensor_id)
     pub first_seen_ns: u64,      // timestamp of first frame received
 }
 ```
@@ -1141,11 +1172,15 @@ impl Correlator {
         }
     }
 
-    /// Feed a raw frame. Returns a completed group immediately when min_sensors reached.
-    pub fn ingest(&mut self, frame: RawFrame) -> Option<CorrelationGroup> {
-        let key = CorrelationKey::from_frame(&frame)?;
+    /// Feed a raw frame. Accumulates into the group — never emits early.
+    /// Emission happens only via evict_stale(), ensuring all sensors within
+    /// the 50ms window contribute to the solution.
+    pub fn ingest(&mut self, frame: RawFrame) {
+        let key = match CorrelationKey::from_frame(&frame) {
+            Some(k) => k,
+            None => return,
+        };
         let now_ns = frame.timestamp_ns();
-
         let group = self.groups.entry(key.clone()).or_insert_with(|| {
             CorrelationGroup {
                 key: key.clone(),
@@ -1153,20 +1188,10 @@ impl Correlator {
                 first_seen_ns: now_ns,
             }
         });
-
-        // Deduplicate by sensor_id — one observation per sensor per group
-        let already_seen = group.frames.iter()
-            .any(|f| f.sensor_id == frame.sensor_id);
-        if !already_seen {
+        if !group.frames.iter().any(|f| f.sensor_id == frame.sensor_id) {
             group.frames.push(frame);
         }
-
-        // Emit immediately when minimum sensor count reached
-        if group.frames.len() >= self.min_sensors {
-            return Some(self.groups.remove(&key).unwrap());
-        }
-
-        None
+        // No early emit — wait for full eviction window to collect all sensors
     }
 
     /// Call every 10ms from the main pipeline loop to evict timed-out groups.
@@ -1198,17 +1223,14 @@ impl Correlator {
 }
 ```
 
-**Main pipeline loop** — handle both immediate emission and timed-out eviction:
+**Main pipeline loop** — accumulate frames and emit only via timed eviction:
 ```rust
 // Every frame:
-if let Some(group) = correlator.ingest(frame) {
-    // send to solver immediately (min_sensors reached)
-    solver_tx.send(group).await?;
-}
+correlator.ingest(frame);   // () — accumulate only
 
 // Every 10ms tick:
 for group in correlator.evict_stale(now_ns) {
-    solver_tx.send(group).await?;  // timed-out groups with sufficient sensors
+    solver_tx.send(group).await?;  // emit all groups that timed out with >= min_sensors
 }
 ```
 
@@ -1480,6 +1502,15 @@ impl AircraftKalman {
             s.try_inverse().unwrap_or(nalgebra::Matrix3::zeros());
         self.x = &self.x + &k * y;
         self.p = (Matrix6::identity() - k * &h) * &self.p;
+
+        // Clamp velocity magnitude to physically plausible range
+        let v_mag = (self.x[3].powi(2) + self.x[4].powi(2) + self.x[5].powi(2)).sqrt();
+        const MAX_SPEED_MS: f64 = 350.0;  // well above any commercial aircraft (~Mach 1)
+        if v_mag > MAX_SPEED_MS {
+            let scale = MAX_SPEED_MS / v_mag;
+            self.x[3] *= scale; self.x[4] *= scale; self.x[5] *= scale;
+            tracing::debug!(icao24 = %self.icao24, v_mag, "velocity clamped to {MAX_SPEED_MS} m/s");
+        }
     }
 
     // Output conversion: call only when sending to WebSocket / frontend
@@ -1498,9 +1529,10 @@ impl AircraftKalman {
     }
 
     fn process_noise(dt: f64) -> Matrix6<f64> {
-        // sigma_a = 2.0 m/s^2 — realistic for commercial aircraft
-        // All components in meters — no unit ambiguity
-        let sigma_a2 = 4.0_f64;  // sigma_a^2
+        // sigma_a = 50 m/s^2 — deliberately high because velocity is inferred from noisy
+        // position-only updates (100–500m MLAT accuracy at 100ms → 1000–5000 m/s finite diff).
+        // High sigma_a reduces filter confidence in velocity predictions → stable tracks.
+        let sigma_a2 = 2500.0_f64;  // 50^2
         let dt2 = dt * dt / 2.0;
         let dt3 = dt * dt * dt / 3.0;
         let mut q = Matrix6::zeros();
@@ -1583,7 +1615,7 @@ Serialize to JSON and send over the broadcast channel from `main.rs` after each 
 
 Replace the placeholder `index.html` with the Phase 2 version. Key additions:
 
-- Leaflet.js map centered on Europe (lat=51, lon=5, zoom=5)
+- Leaflet.js map centered on Cornwall/Scilly sensor cluster (lat=50.1, lon=-5.8, zoom=9)
 - `aircraft` Map: `icao24 → { marker, track_polyline, last_seen }`
 - WebSocket `onmessage` updates marker position and extends polyline
 - Marker tooltip: ICAO24, alt, GDOP
@@ -1636,7 +1668,7 @@ Replace the placeholder `index.html` with the Phase 2 version. Key additions:
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     // Map setup
-    const map = L.map('map').setView([51.0, 5.0], 5);
+    const map = L.map('map').setView([50.1, -5.8], 9);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
       attribution: 'Locus | CartoDB'
     }).addTo(map);
@@ -1835,13 +1867,52 @@ pub struct CprDecoder {
 }
 
 impl CprDecoder {
-    pub fn feed(&mut self, lat_cpr: u32, lon_cpr: u32, f_flag: u8)
-        -> Option<(f64, f64)>
-    {
-        // Store even/odd frames
-        // When both available, apply the standard CPR global decode algorithm
-        // Reference: ICAO Doc 9684 §3.2.6 and OpenSky Network decoder
+    pub fn feed(&mut self, lat_cpr: u32, lon_cpr: u32, f_flag: u8) -> Option<(f64, f64)> {
+        if f_flag == 0 { self.even = Some((lat_cpr, lon_cpr)); }
+        else           { self.odd  = Some((lat_cpr, lon_cpr)); }
+
+        let (even_lat, even_lon) = self.even?;
+        let (odd_lat,  odd_lon)  = self.odd?;
+
+        let n_bits = (1u64 << 17) as f64;  // 2^17
+        let dlat_e = 360.0 / 60.0_f64;
+        let dlat_o = 360.0 / 59.0_f64;
+
+        let j = ((59.0 * even_lat as f64 - 60.0 * odd_lat as f64) / n_bits + 0.5).floor();
+        let lat_e = dlat_e * (j % 60.0 + even_lat as f64 / n_bits);
+        let lat_o = dlat_o * (j % 59.0 + odd_lat  as f64 / n_bits);
+
+        // Normalize to [-90, 90]
+        let lat_e = if lat_e >= 270.0 { lat_e - 360.0 } else { lat_e };
+        let lat_o = if lat_o >= 270.0 { lat_o - 360.0 } else { lat_o };
+
+        // Zone consistency check
+        if nl(lat_e) as u32 != nl(lat_o) as u32 { return None; }
+
+        // Use most-recent frame for longitude
+        let (lat, m, cpr_lon) = if f_flag == 1 {
+            (lat_o, (nl(lat_o) - 1.0).max(1.0), odd_lon)
+        } else {
+            (lat_e, nl(lat_e).max(1.0), even_lon)
+        };
+
+        let dlon = 360.0 / m;
+        let mi = ((even_lon as f64 * (nl(lat_e) - 1.0)
+                  - odd_lon as f64 * nl(lat_e)) / n_bits + 0.5).floor();
+        let lon = dlon * (mi % m + cpr_lon as f64 / n_bits);
+        let lon = if lon >= 180.0 { lon - 360.0 } else { lon };
+
+        Some((lat, lon))
     }
+}
+
+/// NL(lat) — number of longitude zones (ICAO Doc 9684 Table)
+fn nl(lat: f64) -> f64 {
+    let lat = lat.abs();
+    if lat >= 87.0 { return 1.0; }
+    let a = (1.0 - (std::f64::consts::PI / 60.0).cos().powi(2)
+             / lat.to_radians().cos().powi(2)).acos();
+    (2.0 * std::f64::consts::PI / a).floor()
 }
 ```
 
@@ -1942,6 +2013,16 @@ impl ClockSyncEngine {
             let _ = correction; // applied at TDOA computation site
         }
     }
+
+    // TDOA assembly (main pipeline, after apply_corrections):
+    // CRITICAL unit ordering: subtract correction in NANOSECONDS first, then multiply by c.
+    //
+    // WRONG:  corrected_tdoa_m = (raw_tdoa_ns * C_M_PER_NS) - correction_ns
+    //         ^^^ unit mismatch: subtracting nanoseconds from meters
+    //
+    // CORRECT:
+    // let corrected_tdoa_ns = raw_tdoa_ns - clock_sync.get_offset(sensor_i_id, ref_id);
+    // let observed_tdoa_m   = corrected_tdoa_ns * C_M_PER_NS;  // now convert to meters
 
     /// Export current offsets for UI display — includes convergence status.
     pub fn export_offsets(&self) -> Vec<SensorOffsetReport> {
@@ -2109,8 +2190,6 @@ Flag aircraft whose ADS-B claimed position diverges from MLAT-derived position b
 **File**: `Locus/rust-backend/src/spoof_detector.rs`
 
 ```rust
-use geo::{point, HaversineDistance};
-
 const SPOOF_THRESHOLD_M: f64 = 2000.0; // 2km divergence triggers flag
 
 pub struct SpoofDetector {
@@ -2126,18 +2205,24 @@ impl SpoofDetector {
         self.claimed_positions.insert(icao24.to_string(), (lat, lon, alt_m));
     }
 
-    /// Compare MLAT-derived position against ADS-B claim.
-    pub fn check(&self, icao24: &str, mlat_lat: f64, mlat_lon: f64) -> (bool, f64) {
+    /// Compare MLAT-derived 3D position against ADS-B claim using ECEF Euclidean distance.
+    /// Threshold is GDOP-adaptive: flag only when divergence exceeds MLAT's own uncertainty.
+    pub fn check(&self, icao24: &str,
+                 mlat_lat: f64, mlat_lon: f64, mlat_alt_m: f64,
+                 accuracy_m: f64) -> (bool, f64) {
         match self.claimed_positions.get(icao24) {
             None => (false, 0.0),
-            Some(&(claimed_lat, claimed_lon, _)) => {
-                let p1 = point!(x: mlat_lon, y: mlat_lat);
-                let p2 = point!(x: claimed_lon, y: claimed_lat);
-                let divergence_m = p1.haversine_distance(&p2);
-                let flag = divergence_m > SPOOF_THRESHOLD_M;
+            Some(&(claimed_lat, claimed_lon, claimed_alt)) => {
+                let (mx, my, mz) = crate::coords::wgs84_to_ecef(mlat_lat, mlat_lon, mlat_alt_m);
+                let (cx, cy, cz) = crate::coords::wgs84_to_ecef(claimed_lat, claimed_lon, claimed_alt);
+                let divergence_m = ((mx-cx).powi(2) + (my-cy).powi(2) + (mz-cz).powi(2)).sqrt();
+                // GDOP-adaptive: only flag when divergence exceeds MLAT uncertainty (3-sigma)
+                let threshold = SPOOF_THRESHOLD_M.max(3.0 * accuracy_m);
+                let flag = divergence_m > threshold;
                 if flag {
                     tracing::warn!(
-                        "SPOOF DETECTED icao={icao24} divergence={divergence_m:.0}m"
+                        "SPOOF DETECTED icao={icao24} divergence={divergence_m:.0}m \
+                         threshold={threshold:.0}m (accuracy={accuracy_m:.0}m)"
                     );
                 }
                 (flag, divergence_m)
@@ -2146,6 +2231,8 @@ impl SpoofDetector {
     }
 }
 ```
+
+Remove `use geo::{point, HaversineDistance};` import. Update call sites to pass `mlat.accuracy_m`.
 
 In **mock mode**, inject the spoof behavior: after 30 seconds of simulation time, the `AABBCC` aircraft's ADS-B-reported position (fed to `record_adsb`) starts deviating +0.05 degrees lat from its true MLAT-tracked position per second.
 
@@ -2360,6 +2447,9 @@ X_std: Optional[np.ndarray] = None
 
 
 def load_model():
+    # Note: model, X_mean, X_std are updated non-atomically.
+    # In production, protect with threading.Lock(). For demo, load_model() is called
+    # only at startup or after /train completes — never concurrently with classify.
     global model, X_mean, X_std
     if not MODEL_PATH.exists():
         logger.warning(f"Model file not found at {MODEL_PATH}. /classify will return 'unknown'.")
@@ -2409,18 +2499,20 @@ async def classify(req: ClassifyRequest):
     if model is None:
         return ClassifyResponse(icao24=req.icao24, anomaly_label="unknown", confidence=0.0)
 
+    if not req.states:
+        return ClassifyResponse(icao24=req.icao24, anomaly_label="unknown", confidence=0.0)
+
     if len(req.states) < SEQ_LEN:
-        # Pad with zeros at the start if we have fewer than SEQ_LEN states
+        # Pad with first known state (not zeros — lat=0,lon=0 is outside training distribution)
+        first = [req.states[0].lat, req.states[0].lon, req.states[0].alt_m,
+                 req.states[0].vel_lat, req.states[0].vel_lon, req.states[0].vel_alt]
         pad = SEQ_LEN - len(req.states)
-        seq = [[0.0] * FEATURES] * pad + [
+        seq = [first] * pad + [
             [s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt]
             for s in req.states
         ]
     else:
-        seq = [
-            [s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt]
-            for s in req.states[-SEQ_LEN:]
-        ]
+        seq = [[s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt] for s in req.states[-SEQ_LEN:]]
 
     x = np.array(seq, dtype=np.float32)[np.newaxis]  # (1, 20, 6)
     if X_mean is not None:
@@ -2715,6 +2807,10 @@ In `mlat_solver.rs`, extract the 2D horizontal standard deviation from the LM co
 // = 2 * sqrt(max eigenvalue of cov_xy)
 
 fn confidence_ellipse_m(covariance: &Matrix3<f64>) -> f64 {
+    // NOTE: Takes ECEF XY submatrix as proxy for horizontal uncertainty.
+    // Correct approach: rotate full 3×3 ECEF covariance into ENU, take EN 2×2 submatrix.
+    // This approximation underestimates horizontal uncertainty ~20–40% at European latitudes
+    // due to ECEF-Z coupling into local horizontal plane. Acceptable for visualization.
     let cov_xy = covariance.fixed_slice::<2, 2>(0, 0);
     let trace = cov_xy[(0, 0)] + cov_xy[(1, 1)];
     let det = cov_xy[(0, 0)] * cov_xy[(1, 1)] - cov_xy[(0, 1)].powi(2);
@@ -2790,9 +2886,10 @@ services:
       context: ./go-ingestor
       dockerfile: Dockerfile
     ports:
-      - "61336:61336"
+      - "61339:61339"
     volumes:
       - ./go-ingestor/.buyer-env:/app/.buyer-env:ro
+      - ./go-ingestor/location-override.json:/app/location-override.json:ro
       - locus-ipc:/tmp/locus          # exposes ingestor.sock to rust-backend
     environment:
       - GO_LOG=info

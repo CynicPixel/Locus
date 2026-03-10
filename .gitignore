@@ -1,0 +1,15 @@
+# Credential files
+buyer-env
+.buyer-env
+go-ingestor/.buyer-env
+
+# Build artifacts
+rust-backend/target/
+ml-service/.venv/
+__pycache__/
+*.pyc
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
