@@ -63,6 +63,13 @@ type locationEntry struct {
 	Alt float64 `json:"alt"`
 }
 
+type locationEntryRaw struct {
+	PublicKey string  `json:"public_key"`
+	Lat       float64 `json:"lat"`
+	Lon       float64 `json:"lon"`
+	Alt       float64 `json:"alt"`
+}
+
 func loadLocationOverrides(path string) map[string]locationEntry {
 	f, err := os.Open(path)
 	if err != nil {
@@ -71,10 +78,14 @@ func loadLocationOverrides(path string) map[string]locationEntry {
 	}
 	defer f.Close()
 
-	var m map[string]locationEntry
-	if err := json.NewDecoder(f).Decode(&m); err != nil {
+	var arr []locationEntryRaw
+	if err := json.NewDecoder(f).Decode(&arr); err != nil {
 		log.Printf("location-override: parse error: %v", err)
 		return nil
+	}
+	m := make(map[string]locationEntry, len(arr))
+	for _, e := range arr {
+		m[e.PublicKey] = locationEntry{Lat: e.Lat, Lon: e.Lon, Alt: e.Alt}
 	}
 	log.Printf("location-override: loaded %d entries", len(m))
 	return m
@@ -194,12 +205,11 @@ func main() {
 		"0.1",
 		NrnProtocol,
 		nil,
-		func(ctx context.Context, h host.Host, b *commonlib.NodeBuffers) {
+		func(ctx context.Context, h host.Host, _ *commonlib.NodeBuffers) {
 			h.SetStreamHandler(NrnProtocol, func(streamHandler network.Stream) {
 				defer streamHandler.Close()
 
 				peerID := streamHandler.Conn().RemotePeer()
-				b.SetStreamHandler(peerID, &streamHandler)
 
 				pubKeyHex, err := peerIDToCompressedPubKeyHex(peerID)
 				if err != nil {
