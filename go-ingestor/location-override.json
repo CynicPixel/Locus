@@ -1,0 +1,86 @@
+[
+    {
+        "public_key": "021a29e755951b0f0267c0357e8d01489ae41abbe54818e4975b33ca5553b7a902",
+        "lat": 50.09916,
+        "lon": -5.55674,
+        "alt": 153.8,
+        "name": "ne073 Penzance"
+    },
+    {
+        "public_key": "037ec65f987b30ee72e2f159d3d1cb1786f2368b35d4655d9beccd7803ab7e7c1f",
+        "lat": 50.12993,
+        "lon": -5.5137,
+        "alt": 56.3,
+        "name": "ne004 Penzance"
+    },
+    {
+        "public_key": "030a3c71b0833d5d8c62d9a4048c0a24d87d3767ac60b3024e825ea075952fc30d",
+        "lat": 50.10248,
+        "lon": -5.66817,
+        "alt": 184.5,
+        "name": "ne007 Lands End"
+    },
+    {
+        "public_key": "02388bdffad38859b6892baaa511a174fcb1dd84f3cb74cc8feb088e004ce5ddf4",
+        "lat": 50.10248,
+        "lon": -5.66817,
+        "alt": 184.5,
+        "name": "ne001 Lands End"
+    },
+    {
+        "public_key": "03f34b08f08471eb8049739d2e9c7fa09326e871a648d0b067bc5f517046dd4f15",
+        "lat": 50.15499,
+        "lon": -5.65337,
+        "alt": 177.7,
+        "name": "ne078 Bojevan"
+    },
+    {
+        "public_key": "02337999e8af64af2ce4bed8c0c9c933bba9e9b973182236610e9ac0f5a1151df9",
+        "lat": 50.07404,
+        "lon": -5.62037,
+        "alt": 172.7,
+        "name": "ne079 St Buryan"
+    },
+    {
+        "public_key": "0237ec14e56be526c011c6e6f3c23afead31fceabe2302822985a3c187fc6b72b8",
+        "lat": 49.95966,
+        "lon": -6.28429,
+        "alt": 72.0,
+        "name": "ne101 Isle 1300"
+    },
+    {
+        "public_key": "025d2f109933ce63bb998bc3cf41549e1557fcd1937c5349a9f6f586226ad72fc3",
+        "lat": 49.94662,
+        "lon": -6.33149,
+        "alt": 55.5,
+        "name": "ne108 Isle 1100"
+    },
+    {
+        "public_key": "02e2b54578b8861b5e57aee78bd2452a00d73d30d7706b35856af8b5d56f74d1df",
+        "lat": 49.89254,
+        "lon": -6.34475,
+        "alt": 73.0,
+        "name": "ne106 Isle 1900"
+    },
+    {
+        "public_key": "0359507a76239e5b7db5bd20b900225d72cdc6be4e11599e3e0b97c5c815a75d1a",
+        "lat": 49.91426,
+        "lon": -6.29487,
+        "alt": 94.0,
+        "name": "ne010 Isle 1600"
+    },
+    {
+        "public_key": "022b58a706abfd29d12011f7e08ad037aac80a9c3651ccd5d44679cfb6bfcd409a",
+        "lat": 50.20572,
+        "lon": -5.49844,
+        "alt": 168.8,
+        "name": "ne083 St Ives"
+    },
+    {
+        "public_key": "02b653be6eb5221555d12e87bfd63a9e85236b86ef9888727d82c6d5ddc165e0f6",
+        "lat": 50.399944,
+        "lon": -4.183016,
+        "alt": 136.5,
+        "name": "ne25 plymouth"
+    }
+]

@@ -1,0 +1,56 @@
+version: "3.9"
+
+x-socket-volume: &socket-vol
+  type: bind
+  source: /tmp/locus
+  target: /tmp/locus
+
+services:
+  go-ingestor:
+    build: ./go-ingestor
+    restart: unless-stopped
+    env_file: ./buyer-env
+    volumes:
+      - *socket-vol
+    networks:
+      - internal
+
+  rust-backend:
+    build: ./rust-backend
+    restart: unless-stopped
+    depends_on: [go-ingestor]
+    environment:
+      ML_SERVICE_URL: "http://ml-service:8080"
+    volumes:
+      - *socket-vol
+    ports:
+      - "9002:9002"
+    networks:
+      - internal
+      - external
+
+  ml-service:
+    build: ./ml-service
+    restart: unless-stopped
+    volumes:
+      - ml-models:/app
+    networks:
+      - internal
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    networks:
+      - external
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  external:
+    driver: bridge
+
+volumes:
+  ml-models:

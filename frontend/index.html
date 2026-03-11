@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Locus MLAT — Aircraft Tracker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: "Segoe UI", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
+  #layout { display: flex; height: 100vh; }
+  #map { flex: 1; }
+  #sidebar {
+    width: 340px; min-width: 260px; display: flex; flex-direction: column;
+    background: #161b22; border-left: 1px solid #30363d; overflow: hidden;
+  }
+  #sidebar header {
+    padding: 12px 16px; background: #1c2128; border-bottom: 1px solid #30363d;
+    font-size: 1rem; font-weight: 600; letter-spacing: .03em;
+  }
+  #sidebar header span.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+  .panel { border-bottom: 1px solid #30363d; padding: 10px 14px; }
+  .panel-title { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: #8b949e; margin-bottom: 6px; }
+  #aircraft-list { overflow-y: auto; flex: 1; }
+  .ac-row {
+    padding: 7px 14px; border-bottom: 1px solid #21262d; cursor: pointer;
+    display: flex; align-items: center; gap: 8px; font-size: .82rem;
+  }
+  .ac-row:hover { background: #1c2128; }
+  .ac-icao { font-weight: 700; font-family: monospace; min-width: 60px; }
+  .ac-pos { color: #8b949e; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge {
+    font-size: .68rem; padding: 2px 6px; border-radius: 10px; font-weight: 700; white-space: nowrap;
+  }
+  .badge-normal  { background: #1a7f37; color: #fff; }
+  .badge-anomaly { background: #b91c1c; color: #fff; }
+  .badge-unknown { background: #374151; color: #9ca3af; }
+  #alert-list { max-height: 120px; overflow-y: auto; }
+  .alert-entry { font-size: .75rem; padding: 3px 0; border-bottom: 1px solid #21262d; color: #f59e0b; }
+  #health-chart-wrap { padding: 10px 14px 14px; }
+  #health-chart-wrap canvas { max-height: 110px; }
+  #status-bar {
+    padding: 5px 14px; font-size: .72rem; color: #8b949e;
+    border-top: 1px solid #30363d; display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+<div id="layout">
+  <div id="map"></div>
+  <div id="sidebar">
+    <header>
+      <span class="dot" id="conn-dot" style="background:#8b949e"></span>
+      Locus MLAT
+    </header>
+
+    <div class="panel">
+      <div class="panel-title">Alerts</div>
+      <div id="alert-list"><em style="color:#555;font-size:.75rem">No alerts</em></div>
+    </div>
+
+    <div class="panel-title" style="padding:8px 14px 0">Aircraft (<span id="ac-count">0</span>)</div>
+    <div id="aircraft-list"></div>
+
+    <div class="panel" id="health-chart-wrap">
+      <div class="panel-title">Sensor Health (clock offset ms)</div>
+      <canvas id="health-chart"></canvas>
+    </div>
+
+    <div id="status-bar">
+      <span id="stat-count">0 aircraft</span>
+      <span id="stat-time">—</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Map setup ───────────────────────────────────────────────────────────────
+const map = L.map("map", { zoomControl: true, preferCanvas: true })
+  .setView([50.1, -5.8], 8);
+
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  maxZoom: 19,
+}).addTo(map);
+
+// ─── State ───────────────────────────────────────────────────────────────────
+const aircraft = {};          // icao24 → { marker, ellipse, state }
+const STALE_MS = 30_000;
+
+function markerColor(state) {
+  if (state.anomaly_label === 1) return "#ef4444";
+  if (state.spoof_flag)          return "#f59e0b";
+  return "#22c55e";
+}
+
+function makeIcon(color) {
+  return L.divIcon({
+    className: "",
+    html: `<svg width="14" height="14" viewBox="0 0 14 14">
+             <circle cx="7" cy="7" r="5" fill="${color}" stroke="#000" stroke-width="1.5"/>
+           </svg>`,
+    iconSize: [14, 14],
+    iconAnchor: [7, 7],
+  });
+}
+
+function updateAircraft(state) {
+  const { icao24, lat, lon, alt_m, gdop, accuracy_m, anomaly_label, spoof_flag } = state;
+  if (lat == null || lon == null) return;
+
+  const color = markerColor(state);
+  const pos = [lat, lon];
+
+  if (!aircraft[icao24]) {
+    const marker = L.marker(pos, { icon: makeIcon(color) })
+      .bindTooltip(icao24, { permanent: false, direction: "top" })
+      .addTo(map);
+    marker.on("click", () => focusAircraft(icao24));
+    const ellipse = L.circle(pos, { radius: Math.max(accuracy_m || 200, 100),
+      color, fillColor: color, fillOpacity: 0.08, weight: 1 }).addTo(map);
+    aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now() };
+  } else {
+    aircraft[icao24].marker.setLatLng(pos).setIcon(makeIcon(color));
+    aircraft[icao24].ellipse.setLatLng(pos)
+      .setRadius(Math.max(accuracy_m || 200, 100))
+      .setStyle({ color, fillColor: color });
+    aircraft[icao24].lastSeen = Date.now();
+    aircraft[icao24].state = state;
+  }
+
+  renderList();
+
+  if (anomaly_label === 1 || spoof_flag) addAlert(state);
+}
+
+function addAlert(state) {
+  const el = document.getElementById("alert-list");
+  const em = el.querySelector("em");
+  if (em) em.remove();
+  const row = document.createElement("div");
+  row.className = "alert-entry";
+  const flag = state.spoof_flag ? "GPS-SPOOF" : "ANOMALY";
+  row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24} — ${flag}`;
+  el.insertBefore(row, el.firstChild);
+  if (el.children.length > 40) el.removeChild(el.lastChild);
+}
+
+function focusAircraft(icao24) {
+  const ac = aircraft[icao24];
+  if (ac) map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
+}
+
+function renderList() {
+  const list = document.getElementById("aircraft-list");
+  const sorted = Object.entries(aircraft)
+    .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
+
+  list.innerHTML = "";
+  for (const [icao, ac] of sorted) {
+    const s = ac.state;
+    const row = document.createElement("div");
+    row.className = "ac-row";
+    row.onclick = () => focusAircraft(icao);
+
+    let badge;
+    if (s.anomaly_label === 1)     badge = `<span class="badge badge-anomaly">ANOMALY</span>`;
+    else if (s.anomaly_label === 0) badge = `<span class="badge badge-normal">NORMAL</span>`;
+    else                            badge = `<span class="badge badge-unknown">—</span>`;
+
+    const spoofBadge = s.spoof_flag
+      ? `<span class="badge" style="background:#92400e;color:#fef3c7">SPOOF</span>` : "";
+
+    row.innerHTML = `
+      <span class="ac-icao">${icao.toUpperCase()}</span>
+      <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
+      ${badge}${spoofBadge}`;
+    list.appendChild(row);
+  }
+  document.getElementById("ac-count").textContent = sorted.length;
+  document.getElementById("stat-count").textContent = `${sorted.length} aircraft`;
+}
+
+// ─── Stale cleanup ───────────────────────────────────────────────────────────
+setInterval(() => {
+  const now = Date.now();
+  for (const [icao, ac] of Object.entries(aircraft)) {
+    if (now - ac.lastSeen > STALE_MS) {
+      map.removeLayer(ac.marker);
+      map.removeLayer(ac.ellipse);
+      delete aircraft[icao];
+    }
+  }
+  renderList();
+}, 5000);
+
+// ─── Sensor health chart ─────────────────────────────────────────────────────
+const healthData = { labels: [], datasets: [] };
+const healthChart = new Chart(document.getElementById("health-chart"), {
+  type: "line",
+  data: healthData,
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { display: false },
+      y: { ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
+    },
+  },
+});
+
+function updateSensorHealth(offsets) {
+  // offsets: { "sensorA:sensorB": offset_ns, … }
+  const pairs = Object.keys(offsets);
+  const label = new Date().toLocaleTimeString();
+
+  if (healthData.labels.length > 30) {
+    healthData.labels.shift();
+    healthData.datasets.forEach(ds => ds.data.shift());
+  }
+  healthData.labels.push(label);
+
+  pairs.forEach((pair, i) => {
+    if (!healthData.datasets[i]) {
+      healthData.datasets.push({
+        label: pair, data: [], borderWidth: 1.5, pointRadius: 0,
+        borderColor: `hsl(${(i * 67) % 360},70%,60%)`,
+        backgroundColor: "transparent",
+      });
+    }
+    healthData.datasets[i].data.push((offsets[pair] / 1e6).toFixed(3)); // ns → ms
+  });
+
+  healthChart.update();
+}
+
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+const WS_URL = `ws://${location.hostname}:9002`;
+let ws;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    document.getElementById("conn-dot").style.background = "#22c55e";
+  };
+
+  ws.onclose = () => {
+    document.getElementById("conn-dot").style.background = "#8b949e";
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+
+    if (msg.type === "sensor_health") {
+      updateSensorHealth(msg.offsets || {});
+    } else {
+      // aircraft state update
+      updateAircraft(msg);
+      document.getElementById("stat-time").textContent = new Date().toLocaleTimeString();
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
