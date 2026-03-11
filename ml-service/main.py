@@ -6,6 +6,7 @@ Endpoints:
     POST /classify        — returns anomaly label + confidence for an aircraft track
     POST /train           — background retrain trigger
 """
+
 import asyncio
 import logging
 import os
@@ -14,10 +15,9 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from model import AircraftLSTM
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("locus-ml")
@@ -78,7 +78,7 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyResponse(BaseModel):
     icao24: str
-    anomaly_label: int   # 0 = normal, 1 = anomalous
+    anomaly_label: str  # "normal" or "anomalous"
     confidence: float
 
 
@@ -117,10 +117,13 @@ async def classify(req: ClassifyRequest):
     with torch.no_grad():
         logits = model(x)
         probs = torch.softmax(logits, dim=1)[0]
-        label = int(probs.argmax().item())
-        confidence = float(probs[label].item())
+        label_idx = int(probs.argmax().item())
+        confidence = float(probs[label_idx].item())
+        label = "anomalous" if label_idx == 1 else "normal"
 
-    return ClassifyResponse(icao24=req.icao24, anomaly_label=label, confidence=confidence)
+    return ClassifyResponse(
+        icao24=req.icao24, anomaly_label=label, confidence=confidence
+    )
 
 
 @app.post("/train")
