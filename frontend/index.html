@@ -79,19 +79,26 @@
 <script>
 // ─── Map setup ───────────────────────────────────────────────────────────────
 const map = L.map("map", { zoomControl: true, preferCanvas: true })
-  .setView([50.1, -5.8], 8);
+  .setView([50.1, -5.8], 6);
 
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
   attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
   maxZoom: 19,
 }).addTo(map);
 
+// 300 km region of interest around Cornwall sensors
+L.circle([50.1, -5.8], {
+  radius: 300000,
+  color: '#facc15', fillColor: '#facc15',
+  fillOpacity: 0.04, weight: 1.5, dashArray: '6 4'
+}).addTo(map).bindTooltip('300 km sensor coverage (Cornwall)', { permanent: false });
+
 // ─── State ───────────────────────────────────────────────────────────────────
 const aircraft = {};          // icao24 → { marker, ellipse, state }
 const STALE_MS = 30_000;
 
 function markerColor(state) {
-  if (state.anomaly_label === 1) return "#ef4444";
+  if (state.anomaly_label === "anomalous") return "#ef4444";
   if (state.spoof_flag)          return "#f59e0b";
   return "#22c55e";
 }
@@ -108,8 +115,11 @@ function makeIcon(color) {
 }
 
 function updateAircraft(state) {
-  const { icao24, lat, lon, alt_m, gdop, accuracy_m, anomaly_label, spoof_flag } = state;
+  const { icao24, lat, lon, alt_m, gdop, anomaly_label, spoof_flag } = state;
   if (lat == null || lon == null) return;
+  // Sanity bounds: reject obviously invalid positions
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
+  if (lat === 0 && lon === 0) return; // null island
 
   const color = markerColor(state);
   const pos = [lat, lon];
@@ -119,13 +129,13 @@ function updateAircraft(state) {
       .bindTooltip(icao24, { permanent: false, direction: "top" })
       .addTo(map);
     marker.on("click", () => focusAircraft(icao24));
-    const ellipse = L.circle(pos, { radius: Math.max(accuracy_m || 200, 100),
+    const ellipse = L.circle(pos, { radius: Math.max(state.confidence_ellipse_m || 200, 100),
       color, fillColor: color, fillOpacity: 0.08, weight: 1 }).addTo(map);
     aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now() };
   } else {
     aircraft[icao24].marker.setLatLng(pos).setIcon(makeIcon(color));
     aircraft[icao24].ellipse.setLatLng(pos)
-      .setRadius(Math.max(accuracy_m || 200, 100))
+      .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
       .setStyle({ color, fillColor: color });
     aircraft[icao24].lastSeen = Date.now();
     aircraft[icao24].state = state;
@@ -133,7 +143,7 @@ function updateAircraft(state) {
 
   renderList();
 
-  if (anomaly_label === 1 || spoof_flag) addAlert(state);
+  if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
 }
 
 function addAlert(state) {
@@ -166,8 +176,8 @@ function renderList() {
     row.onclick = () => focusAircraft(icao);
 
     let badge;
-    if (s.anomaly_label === 1)     badge = `<span class="badge badge-anomaly">ANOMALY</span>`;
-    else if (s.anomaly_label === 0) badge = `<span class="badge badge-normal">NORMAL</span>`;
+    if (s.anomaly_label === "anomalous") badge = `<span class="badge badge-anomaly">ANOMALY</span>`;
+    else if (s.anomaly_label === "normal") badge = `<span class="badge badge-normal">NORMAL</span>`;
     else                            badge = `<span class="badge badge-unknown">—</span>`;
 
     const spoofBadge = s.spoof_flag
@@ -214,32 +224,45 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
 });
 
 function updateSensorHealth(offsets) {
-  // offsets: { "sensorA:sensorB": offset_ns, … }
-  const pairs = Object.keys(offsets);
+  // offsets: array of { sensor_i, sensor_j, offset_ns, sample_count, is_converged }
   const label = new Date().toLocaleTimeString();
+  const maxPoints = 30;
 
-  if (healthData.labels.length > 30) {
-    healthData.labels.shift();
-    healthData.datasets.forEach(ds => ds.data.shift());
-  }
   healthData.labels.push(label);
+  if (healthData.labels.length > maxPoints) {
+    healthData.labels.shift();
+  }
 
-  pairs.forEach((pair, i) => {
-    if (!healthData.datasets[i]) {
+  for (const o of offsets) {
+    const pair = `${o.sensor_i}-${o.sensor_j}`;
+    let idx = healthData.datasets.findIndex(ds => ds.label === pair);
+    if (idx === -1) {
+      idx = healthData.datasets.length;
+      // Backfill nulls so this dataset aligns with existing label history
+      const backfill = new Array(healthData.labels.length - 1).fill(null);
       healthData.datasets.push({
-        label: pair, data: [], borderWidth: 1.5, pointRadius: 0,
-        borderColor: `hsl(${(i * 67) % 360},70%,60%)`,
+        label: pair,
+        data: backfill,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        borderColor: `hsl(${(idx * 67) % 360},70%,60%)`,
         backgroundColor: "transparent",
       });
     }
-    healthData.datasets[i].data.push((offsets[pair] / 1e6).toFixed(3)); // ns → ms
-  });
+    healthData.datasets[idx].data.push(
+      o.is_converged ? (o.offset_ns / 1e6).toFixed(3) : null  // ns → ms, null until converged
+    );
+    // Trim to window
+    if (healthData.datasets[idx].data.length > maxPoints) {
+      healthData.datasets[idx].data.shift();
+    }
+  }
 
   healthChart.update();
 }
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
-const WS_URL = `ws://${location.hostname}:9002`;
+const WS_URL = `ws://${location.hostname}:9001`;
 let ws;
 
 function connect() {
@@ -261,7 +284,7 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
 
     if (msg.type === "sensor_health") {
-      updateSensorHealth(msg.offsets || {});
+      updateSensorHealth(Array.isArray(msg.offsets) ? msg.offsets : []);
     } else {
       // aircraft state update
       updateAircraft(msg);
