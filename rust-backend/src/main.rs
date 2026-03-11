@@ -111,6 +111,23 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             Some(frame) = frame_rx.recv() => {
+                // Attempt ADS-B decode on every frame.  When a valid position
+                // is returned we broadcast it immediately as the primary track.
+                // MLAT (via the correlator/eviction path) remains active as a
+                // secondary, independent position source for spoofing detection.
+                if let Some(bytes) = frame.bytes() {
+                    if let Some(adsb) = adsb_parser.parse(bytes, frame.timestamp_ns()) {
+                        broadcast_adsb(
+                            &adsb,
+                            &mut kalman_registry,
+                            &mut spoof_detector,
+                            &anomaly_client,
+                            &ws_tx,
+                            frame.timestamp_ns(),
+                            1,
+                        ).await;
+                    }
+                }
                 process_frame(
                     frame,
                     &mut last_frame_ns,
@@ -234,9 +251,18 @@ async fn solve_and_broadcast(
     let mut sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
     sensor_ids.sort_unstable();
 
+    // 4b. Pre-parse ADS-B for altitude constraint and beacon use.
+    //     Parsing here (before the solve) lets us use ADS-B altitude to
+    //     constrain the 3D MLAT solve — critical when sensors are coplanar.
+    let adsb_parsed = group.frames[0].bytes().and_then(|bytes| {
+        adsb_parser.parse(bytes, group.frames[0].timestamp_ns())
+    });
+    let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
+
     let input = MlatInput {
         sensor_positions: sensor_vecs.clone(),
         observed_tdoa_m,
+        adsb_alt_m,
     };
 
     // 5. Solve — use Kalman prior if available, else sensor centroid
@@ -284,28 +310,27 @@ async fn solve_and_broadcast(
         solution.accuracy_m,
     );
 
-    // 9. ADS-B parsing — feed claimed position to spoof detector + clock sync beacons
-    if let Some(bytes) = group.frames[0].bytes() {
-        if let Some(adsb) = adsb_parser.parse(bytes, group.frames[0].timestamp_ns()) {
-            spoof_detector.record_adsb(&adsb.icao24, adsb.lat, adsb.lon, adsb.alt_m);
+    // 9. ADS-B — feed claimed position to spoof detector + clock sync beacons.
+    //    Re-use the already-parsed result from step 4b.
+    if let Some(adsb) = &adsb_parsed {
+        spoof_detector.record_adsb(&adsb.icao24, adsb.lat, adsb.lon, adsb.alt_m);
 
-            let beacon_ecef = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
-            for i in 0..group.frames.len() {
-                for j in (i + 1)..group.frames.len() {
-                    if let (Some(pos_i), Some(pos_j)) = (
-                        sensor_registry.get(group.frames[i].sensor_id),
-                        sensor_registry.get(group.frames[j].sensor_id),
-                    ) {
-                        clock_sync.update_from_beacon(
-                            group.frames[i].sensor_id,
-                            (pos_i[0], pos_i[1], pos_i[2]),
-                            group.frames[j].sensor_id,
-                            (pos_j[0], pos_j[1], pos_j[2]),
-                            group.frames[i].timestamp_ns(),
-                            group.frames[j].timestamp_ns(),
-                            beacon_ecef,
-                        );
-                    }
+        let beacon_ecef = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
+        for i in 0..group.frames.len() {
+            for j in (i + 1)..group.frames.len() {
+                if let (Some(pos_i), Some(pos_j)) = (
+                    sensor_registry.get(group.frames[i].sensor_id),
+                    sensor_registry.get(group.frames[j].sensor_id),
+                ) {
+                    clock_sync.update_from_beacon(
+                        group.frames[i].sensor_id,
+                        (pos_i[0], pos_i[1], pos_i[2]),
+                        group.frames[j].sensor_id,
+                        (pos_j[0], pos_j[1], pos_j[2]),
+                        group.frames[i].timestamp_ns(),
+                        group.frames[j].timestamp_ns(),
+                        beacon_ecef,
+                    );
                 }
             }
         }
@@ -346,6 +371,127 @@ async fn solve_and_broadcast(
     if let Some(hist_snap) = classify_data {
         // Mark timestamp now (immutable borrow is gone) to avoid double-fire.
         if let Some(h) = kalman_registry.histories.get_mut(&icao24) {
+            h.last_classify_ns = now_ns;
+        }
+        let client = anomaly_client.client.clone();
+        let base_url = anomaly_client.base_url.clone();
+        let icao_clone = icao24.clone();
+        let ws_tx2 = ws_tx.clone();
+        let state_clone = aircraft_state.clone();
+
+        tokio::spawn(async move {
+            let ac = AnomalyClient { client, base_url };
+            match ac.classify(&icao_clone, &hist_snap).await {
+                Ok(resp) => {
+                    let updated = AircraftState {
+                        anomaly_label: resp.anomaly_label,
+                        anomaly_confidence: resp.confidence,
+                        ..state_clone
+                    };
+                    let msg = serde_json::to_string(&updated)
+                        .expect("AircraftState serialization");
+                    let _ = ws_tx2.send(msg);
+                }
+                Err(e) => {
+                    tracing::debug!("anomaly classify error for {icao_clone}: {e}");
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADS-B primary track broadcast
+// ---------------------------------------------------------------------------
+// Called on every frame that yields a valid CPR-decoded position.
+// Produces a Kalman-smoothed AircraftState with gdop=0 (indicating ADS-B source).
+// MLAT-sourced updates (from solve_and_broadcast) will naturally override these
+// when MLAT solutions are available, since both share the same Kalman registry.
+
+#[allow(clippy::too_many_arguments)]
+async fn broadcast_adsb(
+    adsb: &adsb_parser::AdsbPosition,
+    kalman_registry: &mut KalmanRegistry,
+    spoof_detector: &mut SpoofDetector,
+    anomaly_client: &AnomalyClient,
+    ws_tx: &BroadcastTx,
+    now_ns: u64,
+    sensor_count: usize,
+) {
+    let icao24 = &adsb.icao24;
+
+    // Build a synthetic MlatSolution so we can reuse the Kalman registry.
+    let solution = mlat_solver::MlatSolution {
+        lat: adsb.lat,
+        lon: adsb.lon,
+        alt_m: adsb.alt_m,
+        ecef: {
+            let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
+            nalgebra::Vector3::new(x, y, z)
+        },
+        gdop: 0.0,          // 0.0 signals ADS-B source (not MLAT)
+        accuracy_m: 500.0,  // ADS-B typical horizontal accuracy (~500 m NUC=5)
+        covariance: nalgebra::Matrix3::identity() * (500.0_f64 * 500.0),
+    };
+
+    kalman_registry.update(icao24, &solution, now_ns);
+
+    let (lat, lon, alt_m) = kalman_registry
+        .get_wgs84(icao24)
+        .unwrap_or((adsb.lat, adsb.lon, adsb.alt_m));
+
+    let (east, north, up) = kalman_registry
+        .get_velocity_enu(icao24, lat, lon)
+        .unwrap_or((0.0, 0.0, 0.0));
+    let cos_lat = lat.to_radians().cos().abs().max(1e-9);
+    let vel_lat = north / 111_320.0;
+    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_alt = up;
+
+    let (spoof_flag, divergence_m) = spoof_detector.check(icao24, lat, lon, alt_m, 500.0);
+    // Record this ADS-B position as the "claimed" position for spoof detection.
+    spoof_detector.record_adsb(icao24, adsb.lat, adsb.lon, adsb.alt_m);
+
+    let aircraft_state = AircraftState {
+        icao24: icao24.clone(),
+        lat,
+        lon,
+        alt_m,
+        vel_lat,
+        vel_lon,
+        vel_alt,
+        gdop: 0.0,
+        confidence_ellipse_m: 500.0,
+        spoof_flag,
+        divergence_m,
+        anomaly_label: "unknown".to_string(),
+        anomaly_confidence: 0.0,
+        sensor_count,
+        timestamp_ms: now_ns / 1_000_000,
+    };
+
+    tracing::debug!(
+        icao24,
+        lat,
+        lon,
+        alt_m,
+        "ADS-B position broadcast"
+    );
+
+    let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
+    let _ = ws_tx.send(msg);
+
+    // Rate-limited anomaly classification
+    let classify_data = kalman_registry.histories.get(icao24).and_then(|hist| {
+        let elapsed = now_ns.saturating_sub(hist.last_classify_ns);
+        if elapsed > CLASSIFY_INTERVAL_NS && hist.states.len() >= 5 {
+            Some(hist.states.iter().copied().collect::<Vec<_>>())
+        } else {
+            None
+        }
+    });
+    if let Some(hist_snap) = classify_data {
+        if let Some(h) = kalman_registry.histories.get_mut(icao24) {
             h.last_classify_ns = now_ns;
         }
         let client = anomaly_client.client.clone();

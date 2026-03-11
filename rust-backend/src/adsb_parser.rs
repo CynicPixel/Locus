@@ -97,14 +97,25 @@ fn nl(lat: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 fn decode_altitude_m(raw: u16) -> Option<f64> {
-    // Q-bit (bit 4 of the 13-bit field) selects encoding.
+    // The 12-bit altitude field from DF17 ME bytes[5:6].
+    // Q-bit is bit 4 (0-indexed from LSB) of the 12-bit field.
     let q_bit = (raw >> 4) & 1;
     if q_bit == 1 {
-        // 25 ft increments, offset -1000 ft
-        let n = ((raw & !0x10) as i32) - 13;
-        Some((n as f64 * 25.0 - 1000.0) * 0.304_8)
+        // 25 ft increments, offset -1000 ft.  Valid N range: 0–2047.
+        // Clear Q-bit (bit 4) to get the 11-bit N value.
+        let n = ((raw & !0x10u16) as i32) - 13;
+        if !(0..=2047).contains(&n) {
+            // Invalid Q=1 value — likely a mis-identified Gillham frame.
+            return None;
+        }
+        let alt_ft = n as f64 * 25.0 - 1000.0;
+        // Reject physically impossible altitudes (below -1000 ft or above FL600)
+        if alt_ft < -1000.0 || alt_ft > 60_000.0 {
+            return None;
+        }
+        Some(alt_ft * 0.304_8) // feet to meters
     } else {
-        None // Gillham (Gray code) — skip for now
+        None // Gillham (Gray code) — not implemented, skip
     }
 }
 
