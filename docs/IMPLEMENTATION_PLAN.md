@@ -611,7 +611,7 @@ The output JSON schema per line:
 }
 ```
 
-Imports to add: `"encoding/json"`, `"net"`, `"os"`
+Imports to add: `"encoding/json"`, `"net"`, `"os"`, `"time"`
 
 **Before the stream handler loop**, set up the Unix socket listener:
 ```go
@@ -723,15 +723,25 @@ func broadcast(data []byte) {
 }
 
 // In the message loop, replace fmt.Fprintf with:
+//
+// CRITICAL: Use the SDK's hardware-stamped timestamps, NOT time.Now().
+// The SDK provides secondsSinceMidnight + nanoseconds with nanosecond
+// precision from the sensor hardware. Using time.Now() would replace
+// all sensor timestamps with the buyer's wall clock, making every
+// sensor's timestamp identical and TDOA = 0 for all pairs.
+// MLAT is mathematically impossible with identical timestamps.
+//
+// Convert secondsSinceMidnight to Unix epoch by adding today's UTC midnight.
+now := time.Now().UTC()
+midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
 frame := RawFrameOut{
     SensorID:             sensorID,
     SensorLat:            sensorLatitude,
     SensorLon:            sensorLongitude,
     SensorAlt:            sensorAltitude,
-    // TimestampSeconds must be Unix epoch seconds, NOT seconds since midnight.
-    // Seconds-since-midnight wraps to 0 at UTC midnight, corrupting TDOA for cross-midnight frames.
-    TimestampSeconds:     uint64(time.Now().Unix()),
-    TimestampNanoseconds: uint64(time.Now().UnixNano() % 1_000_000_000),
+    TimestampSeconds:     uint64(midnight.Unix()) + secondsSinceMidnight,
+    TimestampNanoseconds: nanoseconds,
     RawModesHex:          fmt.Sprintf("%x", rawModeS),
 }
 jsonBytes, err := json.Marshal(frame)
@@ -1164,6 +1174,124 @@ let mut correlator = Correlator::new(drop_counter.clone());
 
 ---
 
+### Step 2.1b — Complete Pipeline Wiring (TDOA Assembly → Solver → Kalman → Spoof → WS)
+
+This is the main processing loop in `main.rs` that connects all subsystems. This code
+runs after the correlator emits completed groups:
+
+```rust
+const C_M_PER_NS: f64 = 0.299_792_458;
+
+// === Processing loop: correlator group → MLAT → Kalman → broadcast ===
+for group in correlator.evict_stale(now_ns) {
+    let mut frames = group.frames.clone();
+    if frames.len() < 3 { continue; }  // need >= 3 sensors for TDOA
+
+    // --- 1. Apply clock corrections (Phase 3; no-op until clock sync has data) ---
+    clock_sync.apply_corrections(&mut frames);
+
+    // --- 2. Build sensor ECEF positions from registry (cached, no trig calls) ---
+    let sensor_vecs: Vec<nalgebra::Vector3<f64>> = frames.iter()
+        .filter_map(|f| sensor_registry.get(f.sensor_id).copied())
+        .collect();
+    if sensor_vecs.len() < 3 { continue; }
+
+    // --- 3. Assemble TDOAs relative to first sensor (reference) ---
+    let ref_ts_ns = frames[0].timestamp_ns() as i64;
+    let observed_tdoa_m: Vec<f64> = frames[1..].iter().map(|f| {
+        let tdoa_ns = f.timestamp_ns() as i64 - ref_ts_ns;
+        tdoa_ns as f64 * C_M_PER_NS
+    }).collect();
+
+    let input = MlatInput {
+        sensor_positions: sensor_vecs.iter()
+            .map(|v| (v[0], v[1], v[2]))
+            .collect(),
+        observed_tdoa_m: observed_tdoa_m,
+    };
+
+    // --- 4. Get ICAO24 from the correlation key ---
+    let icao24 = format!("{:02X}{:02X}{:02X}",
+        group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]);
+
+    // --- 5. Solve with Kalman prior (if available) or sensor centroid ---
+    let prior_ecef = kalman_registry.get_ecef(&icao24)
+        .or(sensor_registry.initial_guess_ecef);
+    let solution = match mlat_solver::solve(&input, prior_ecef) {
+        Some(s) => s,
+        None => continue,  // solver failed or GDOP too high
+    };
+
+    // --- 6. Kalman filter update (uses solution.ecef directly — no round-trip) ---
+    let now_ns = group.first_seen_ns;
+    kalman_registry.update(&icao24, &solution, now_ns);
+    // Get smoothed position and velocity from the filter
+    let kalman_pos = kalman_registry.get_wgs84(&icao24).unwrap_or((solution.lat, solution.lon, solution.alt_m));
+    let kalman_vel = kalman_registry.get_velocity_enu(&icao24, kalman_pos.0, kalman_pos.1)
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    // --- 7. Spoof detection (uses WGS84 — spoof detector converts to ECEF internally) ---
+    let (spoof_flag, divergence_m) = spoof_detector.check(
+        &icao24,
+        solution.lat, solution.lon, solution.alt_m,
+        solution.accuracy_m,
+    );
+
+    // --- 8. Build AircraftState and broadcast ---
+    let aircraft_state = AircraftState {
+        icao24: icao24.clone(),
+        lat: kalman_pos.0,
+        lon: kalman_pos.1,
+        alt_m: kalman_pos.2,
+        vel_lat: kalman_vel.1 / 111_320.0,   // north m/s → °/s
+        vel_lon: kalman_vel.0 / (111_320.0 * kalman_pos.0.to_radians().cos().abs().max(1e-9)),
+        vel_alt: kalman_vel.2,
+        gdop: solution.gdop,
+        confidence_ellipse_m: solution.accuracy_m,
+        spoof_flag,
+        divergence_m,
+        anomaly_label: "unknown".to_string(),  // filled async by ML service
+        anomaly_confidence: 0.0,
+        sensor_count: frames.len(),
+        timestamp_ms: (now_ns / 1_000_000) as u64,
+    };
+    let msg = serde_json::to_string(&aircraft_state).unwrap();
+    let _ = ws_tx.send(msg);
+
+    // --- 9. Feed ADS-B position to spoof detector (for next comparison) ---
+    // Parse ADS-B from the raw bytes (if this was a position message)
+    if let Some(adsb_pos) = parse_adsb_position(frames[0].bytes().unwrap_or(&[])) {
+        spoof_detector.record_adsb(&adsb_pos.icao24, adsb_pos.lat, adsb_pos.lon, adsb_pos.alt_m);
+        // Also feed to clock sync as potential beacon aircraft:
+        // For clock sync, we need at least 2 sensors that saw the same beacon.
+        // Use all pairwise combinations from the correlation group.
+        let beacon_ecef = coords::wgs84_to_ecef(adsb_pos.lat, adsb_pos.lon, adsb_pos.alt_m);
+        for i in 0..frames.len() {
+            for j in (i+1)..frames.len() {
+                if let (Some(pos_i), Some(pos_j)) = (
+                    sensor_registry.get(frames[i].sensor_id),
+                    sensor_registry.get(frames[j].sensor_id),
+                ) {
+                    clock_sync.update_from_beacon(
+                        frames[i].sensor_id, (pos_i[0], pos_i[1], pos_i[2]),
+                        frames[j].sensor_id, (pos_j[0], pos_j[1], pos_j[2]),
+                        frames[i].timestamp_ns(), frames[j].timestamp_ns(),
+                        beacon_ecef,
+                    );
+                }
+            }
+        }
+    }
+}
+```
+
+> **Note**: In this wiring, every aircraft that sends ADS-B position messages
+> automatically becomes a "beacon" for clock sync. This is the correct approach
+> for the hackathon — there is no separate beacon list. The clock sync engine's
+> windowed median and outlier gate handle noisy observations robustly.
+
+---
+
 ### Step 2.2 — MLAT Solver
 
 **File**: `Locus/rust-backend/src/mlat_solver.rs`
@@ -1174,61 +1302,78 @@ let mut correlator = Correlator::new(drop_counter.clone());
 ```rust
 pub struct MlatInput {
     pub sensor_positions: Vec<(f64, f64, f64)>,  // ECEF meters
-    pub tdoa_ns: Vec<Vec<f64>>,     // tdoa_ns[i][j] = t_i - t_j in nanoseconds
-                                    // reference sensor is index 0
+    pub observed_tdoa_m: Vec<f64>,  // TDOAs relative to sensor[0], converted to meters
+                                    // observed_tdoa_m[k] = (t_{k+1} - t_0) * c_m_per_ns
 }
 
 pub struct MlatSolution {
     pub lat: f64,
     pub lon: f64,
     pub alt_m: f64,
+    /// Native ECEF output from the LM solver. Use this directly in Kalman
+    /// and SpoofDetector to avoid redundant WGS84→ECEF round-trips.
+    pub ecef: nalgebra::Vector3<f64>,
     pub gdop: f64,
     pub accuracy_m: f64,         // confidence_ellipse_m() result
-    pub covariance: [[f64; 3]; 3],
+    pub covariance: nalgebra::Matrix3<f64>,
 }
 ```
 
-**Residual function** (implement `argmin::core::CostFunction`):
+**Residual function** — implement the `LeastSquaresProblem` trait from the `levenberg-marquardt` crate.
+This crate provides a dedicated LM solver, which natively handles damping (oscillating between Gauss-Newton and gradient descent)
+to ensure robust convergence even from poor initial guesses.
 
 ```rust
-struct MlatResiduals {
-    sensor_ecef: Vec<nalgebra::Vector3<f64>>,
+use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
+use nalgebra::storage::Owned;
+use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
+
+struct MlatProblem {
+    sensor_ecef: Vec<Vector3<f64>>,
     observed_tdoa_m: Vec<f64>,  // TDOAs converted to meters: tdoa_ns * c_m_per_ns
+    p: Vector3<f64>,            // Current parameter guess: [x, y, z] in ECEF meters
 }
 
-impl argmin::core::CostFunction for MlatResiduals {
-    type Param = nalgebra::Vector3<f64>;  // [x, y, z] in ECEF meters
-    type Output = nalgebra::DVector<f64>;
+impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U3> for MlatProblem {
+    type ParameterStorage = Owned<f64, nalgebra::U3>;
+    type ResidualStorage = Owned<f64, nalgebra::Dyn>;
+    type JacobianStorage = Owned<f64, nalgebra::Dyn, nalgebra::U3>;
 
-    fn cost(&self, p: &Self::Param) -> Result<Self::Output, argmin::core::Error> {
-        // residuals[k] = observed_tdoa_m[k] - theoretical_tdoa_m(p)
-        // theoretical_tdoa_m[k] = dist(p, sensor[k+1]) - dist(p, sensor[0])
-        let ref_dist = (p - &self.sensor_ecef[0]).norm();
+    fn set_params(&mut self, p: &Vector3<f64>) {
+        self.p = *p;
+    }
+
+    fn params(&self) -> Vector3<f64> {
+        self.p
+    }
+
+    fn residuals(&self) -> Option<DVector<f64>> {
+        let ref_dist = (&self.p - &self.sensor_ecef[0]).norm();
         let residuals: Vec<f64> = self.observed_tdoa_m.iter().enumerate().map(|(k, obs)| {
-            let dist_k = (p - &self.sensor_ecef[k + 1]).norm();
+            let dist_k = (&self.p - &self.sensor_ecef[k + 1]).norm();
             obs - (dist_k - ref_dist)
         }).collect();
-        Ok(nalgebra::DVector::from_vec(residuals))
+        Some(DVector::from_vec(residuals))
+    }
+
+    fn jacobian(&self) -> Option<nalgebra::Matrix<f64, nalgebra::Dyn, nalgebra::U3, Self::JacobianStorage>> {
+        let ref_dist = (&self.p - &self.sensor_ecef[0]).norm();
+        let ref_dir = (&self.p - &self.sensor_ecef[0]) / ref_dist;
+        let n_tdoa = self.sensor_ecef.len() - 1;
+        let mut j = DMatrix::<f64>::zeros(n_tdoa, 3);
+        // J[k][i] = (p_i - s_{k+1,i})/d_{k+1} - (p_i - s_{0,i})/d_0
+        for (k, s_k1) in self.sensor_ecef[1..].iter().enumerate() {
+            let d_k1 = (&self.p - s_k1).norm();
+            let dir_k1 = (&self.p - s_k1) / d_k1;
+            for i in 0..3 {
+                // Negate because residual = observed - predicted;
+                // Jacobian of predicted w.r.t. p is (dir_k1 - ref_dir)
+                j[(k, i)] = -(dir_k1[i] - ref_dir[i]);
+            }
+        }
+        Some(j)
     }
 }
-```
-
-Also implement `argmin::core::Jacobian` for the LM solver — compute the Jacobian analytically:
-```
-J[k][i] = d/dx_i (dist(p, sensor[k+1]) - dist(p, sensor[0]))
-         = (p_i - sensor[k+1][i]) / dist(p, sensor[k+1])
-           - (p_i - sensor[0][i]) / dist(p, sensor[0])
-```
-
-**Solver call**:
-```rust
-use argmin::solver::leastsquares::GaussNewton;
-// or: argmin::solver::levenbergmarquardt::LevenbergMarquardt
-
-let solver = LevenbergMarquardt::new();
-let result = Executor::new(problem, solver)
-    .configure(|state| state.param(initial_guess).max_iters(100).target_cost(1e-6))
-    .run()?;
 ```
 
 **GDOP computation** — uses the TDOA Jacobian matrix (N-1)×3, one row per TDOA pair with sensor 0 as reference. This is correct for MLAT; GPS-style direction-cosine rows would compute the wrong quantity because MLAT observes range *differences*, not ranges directly:
@@ -1280,9 +1425,19 @@ Returns `None` if solver fails to converge or GDOP > 5.
 > **Note**: Patch 3's Kalman prior is only physically meaningful after Patch 6 converts the
 > filter to ECEF state. Implementation order: Patch 6 (ECEF Kalman) first, then Patch 3.
 
-**Initial guess strategy** — LM is sensitive to initialization; always provide a physically meaningful starting point:
+**Initial guess strategy** — GN is sensitive to initialization; always provide a physically meaningful starting point:
 ```rust
 pub fn solve(input: &MlatInput, prior: Option<Vector3<f64>>) -> Option<MlatSolution> {
+    let sensor_vecs: Vec<Vector3<f64>> = input.sensor_positions.iter()
+        .map(|&(x, y, z)| Vector3::new(x, y, z))
+        .collect();
+
+    // --- Pre-solve geometry check (rejects degenerate sensor configurations) ---
+    if let Err(reason) = check_geometry(&sensor_vecs, 50_000.0, 1e6) {
+        tracing::debug!("geometry rejected: {reason}");
+        return None;
+    }
+
     let initial_guess = match prior {
         // Use last known ECEF position from Kalman filter if available
         Some(ecef) => ecef,
@@ -1290,10 +1445,8 @@ pub fn solve(input: &MlatInput, prior: Option<Vector3<f64>>) -> Option<MlatSolut
         // First observation: use centroid of all sensors + typical cruise altitude
         None => {
             let n = input.sensor_positions.len() as f64;
-            let centroid = input.sensor_positions.iter()
-                .fold(Vector3::zeros(), |acc, &(x, y, z)| {
-                    acc + Vector3::new(x, y, z)
-                }) / n;
+            let centroid = sensor_vecs.iter()
+                .fold(Vector3::zeros(), |acc, v| acc + v) / n;
 
             // Offset centroid outward from Earth center by ~10,000m
             // (typical cruise altitude above the sensor plane)
@@ -1304,45 +1457,113 @@ pub fn solve(input: &MlatInput, prior: Option<Vector3<f64>>) -> Option<MlatSolut
         }
     };
 
-    // Pass initial_guess to the argmin Executor:
-    let result = Executor::new(problem, solver)
-        .configure(|state| {
-            state
-                .param(initial_guess)
-                .max_iters(100)
-                .target_cost(1e-6)
-        })
-        .run()
-        .ok()?;
+    let problem = MlatProblem {
+        sensor_ecef: sensor_vecs.clone(),
+        observed_tdoa_m: input.observed_tdoa_m.clone(),
+        p: initial_guess,
+    };
 
-    let best_param: Vector3<f64> = result.state().best_param().copied()?;
+    // Levenberg-Marquardt solver from the crate
+    // (default params are usually sufficient for well-scaled problems)
+    let (result_problem, report) = LevenbergMarquardt::new()
+        .with_max_iter(100)
+        .minimize(problem);
+
+    if !report.termination.was_successful() {
+        tracing::debug!("LM solver failed to converge: {:?}", report.termination);
+        return None;
+    }
+
+    let best_param = result_problem.params();
 
     // Compute covariance from the Jacobian at the solution point.
-    // argmin does not expose (J^T J)^{-1} automatically; evaluate it explicitly.
     // cov = (J^T J)^{-1} * sigma^2, where sigma^2 is estimated from residual sum-of-squares.
-    let j = problem.jacobian(&best_param).ok()?;  // (N-1) × 3
-    let jtj = j.transpose() * &j;                  // 3 × 3
-    let rss = problem.cost(&best_param).ok()?.norm_squared();
-    let n_obs = problem.observed_tdoa_m.len() as f64;
+    let j = result_problem.jacobian().unwrap();      // (N-1) × 3
+    let jtj = j.transpose() * &j;                    // 3 × 3 (DMatrix)
+    let jtj_fixed: nalgebra::Matrix3<f64> = nalgebra::Matrix3::new(
+        jtj[(0,0)], jtj[(0,1)], jtj[(0,2)],
+        jtj[(1,0)], jtj[(1,1)], jtj[(1,2)],
+        jtj[(2,0)], jtj[(2,1)], jtj[(2,2)],
+    );
+    let rss = result_problem.residuals().unwrap().norm_squared();
+    let n_obs = input.observed_tdoa_m.len() as f64;
     let sigma2 = if n_obs > 3.0 { rss / (n_obs - 3.0) } else { rss };
-    let covariance: nalgebra::Matrix3<f64> = jtj
+    let covariance: nalgebra::Matrix3<f64> = jtj_fixed
         .try_inverse()
         .map(|inv| inv * sigma2)
         .unwrap_or(nalgebra::Matrix3::identity() * 1e6);  // fallback: very uncertain
 
-    let accuracy_m = confidence_ellipse_m(&covariance);
-    // ... build and return MlatSolution
+    // GDOP from the already-computed inverse — no separate compute_gdop() needed:
+    let jtj_inv = jtj_fixed.try_inverse()
+        .unwrap_or(nalgebra::Matrix3::identity() * 1e12);
+    let gdop = jtj_inv.trace().sqrt();
+    if gdop > 5.0 {
+        tracing::debug!(gdop, "MLAT solution discarded — GDOP exceeds threshold");
+        return None;
+    }
+
+    // Convert to WGS84 — needed for confidence ellipse ENU rotation and for display
+    let (lat, lon, alt_m) = coords::ecef_to_wgs84(best_param[0], best_param[1], best_param[2]);
+
+    let accuracy_m = confidence_ellipse_m(&covariance, lat, lon);
+
+    Some(MlatSolution {
+        lat,
+        lon,
+        alt_m,
+        ecef: best_param,  // native solver output — no round-trip needed
+        gdop,
+        accuracy_m,
+        covariance,
+    })
 }
 ```
 
-**Call site in main pipeline** — pass Kalman ECEF state as prior:
+**`check_geometry()`** — reject degenerate sensor configurations before running the solver (avoids wasting compute on ill-conditioned problems):
 ```rust
-let prior_ecef = kalman_registry
-    .get_ecef(&icao24)  // returns Option<Vector3<f64>>
-    .map(|state| Vector3::new(state[0], state[1], state[2]));
+pub fn check_geometry(
+    sensor_ecef: &[Vector3<f64>],
+    min_baseline_m: f64,       // e.g. 50_000.0  (50 km)
+    max_condition_number: f64, // e.g. 1e6
+) -> Result<(), &'static str> {
+    // 1. Minimum baseline: at least one sensor pair must be > min_baseline
+    let max_dist = sensor_ecef.iter()
+        .flat_map(|a| sensor_ecef.iter().map(move |b| (a - b).norm()))
+        .fold(0.0_f64, f64::max);
+    if max_dist < min_baseline_m {
+        return Err("sensors too clustered — baseline below minimum");
+    }
 
-let solution = mlat_solver::solve(&input, prior_ecef)?;
+    // 2. Collinearity / coplanarity: build centred matrix, check singular values
+    let n = sensor_ecef.len() as f64;
+    let centroid = sensor_ecef.iter().fold(Vector3::zeros(), |a, s| a + s) / n;
+    let mut mat = nalgebra::DMatrix::<f64>::zeros(sensor_ecef.len(), 3);
+    for (i, s) in sensor_ecef.iter().enumerate() {
+        let d = s - &centroid;
+        mat[(i,0)] = d[0]; mat[(i,1)] = d[1]; mat[(i,2)] = d[2];
+    }
+    let svd = mat.svd(false, false);
+    let sv = svd.singular_values;
+    if sv[sv.len()-1] < 1.0 {
+        return Err("sensors coplanar/collinear — TDOA system rank-deficient");
+    }
+    let condition = sv[0] / sv[sv.len()-1];
+    if condition > max_condition_number {
+        return Err("sensor geometry ill-conditioned");
+    }
+
+    // 3. Pre-solve GDOP estimate using sensor centroid as proxy solution
+    let proxy = centroid.normalize() * (6_371_000.0 + 10_000.0);
+    let gdop = compute_gdop(&proxy, sensor_ecef);
+    if gdop > 5.0 {
+        return Err("pre-solve GDOP estimate exceeds threshold");
+    }
+
+    Ok(())
+}
 ```
+
+**Call site in main pipeline** — handled in Step 2.1b above (pipeline wiring section).
 
 ---
 
@@ -1493,15 +1714,16 @@ impl AircraftKalman {
 }
 ```
 
-**Kalman registry** in main pipeline — converts WGS84 MLAT output to ECEF before updating, converts back for broadcast:
+**Kalman registry** in main pipeline — uses `MlatSolution.ecef` directly to avoid redundant WGS84→ECEF conversion:
 ```rust
 pub struct KalmanRegistry {
     filters: HashMap<String, AircraftKalman>,
 }
 
 impl KalmanRegistry {
-    pub fn update(&mut self, icao24: &str, mlat: &MlatSolution, now_ns: u64) -> AircraftState {
-        let (x_ecef, y_ecef, z_ecef) = coords::wgs84_to_ecef(mlat.lat, mlat.lon, mlat.alt_m);
+    pub fn update(&mut self, icao24: &str, mlat: &MlatSolution, now_ns: u64) {
+        // Use native ECEF from solver — no wgs84_to_ecef() round-trip
+        let (x_ecef, y_ecef, z_ecef) = (mlat.ecef[0], mlat.ecef[1], mlat.ecef[2]);
         let entry = self.filters.entry(icao24.to_string()).or_insert_with(|| {
             AircraftKalman::new(icao24.to_string(), x_ecef, y_ecef, z_ecef)
         });
@@ -1510,8 +1732,6 @@ impl KalmanRegistry {
         entry.predict(dt);
         entry.update(x_ecef, y_ecef, z_ecef, mlat.accuracy_m);
         entry.last_update_ns = now_ns;
-        let (lat, lon, alt_m) = entry.position_wgs84();
-        AircraftState::from_kalman(icao24, lat, lon, alt_m, entry, mlat)
     }
 
     /// Returns current ECEF position for use as LM solver prior (Patch 3).
@@ -2174,6 +2394,7 @@ impl SpoofDetector {
             None => (false, 0.0),
             Some(&(claimed_lat, claimed_lon, claimed_alt)) => {
                 let (mx, my, mz) = crate::coords::wgs84_to_ecef(mlat_lat, mlat_lon, mlat_alt_m);
+                // NOTE: claimed ECEF could be cached (see Performance Improvement 6)
                 let (cx, cy, cz) = crate::coords::wgs84_to_ecef(claimed_lat, claimed_lon, claimed_alt);
                 let divergence_m = ((mx-cx).powi(2) + (my-cy).powi(2) + (mz-cz).powi(2)).sqrt();
                 // GDOP-adaptive: only flag when divergence exceeds MLAT uncertainty (3-sigma).
@@ -2766,16 +2987,27 @@ In `mlat_solver.rs`, extract the 2D horizontal standard deviation from the LM co
 // After solver converges, covariance matrix is available from the Jacobian:
 // cov = (J^T J)^{-1} * sigma^2
 // confidence_ellipse_m = 2-sigma radius of horizontal position uncertainty
-// = 2 * sqrt(max eigenvalue of cov_xy)
+// = 2 * sqrt(max eigenvalue of ENU East-North 2×2 submatrix)
 
-fn confidence_ellipse_m(covariance: &Matrix3<f64>) -> f64 {
-    // NOTE: Takes ECEF XY submatrix as proxy for horizontal uncertainty.
-    // Correct approach: rotate full 3×3 ECEF covariance into ENU, take EN 2×2 submatrix.
-    // This approximation underestimates horizontal uncertainty ~20–40% at European latitudes
-    // due to ECEF-Z coupling into local horizontal plane. Acceptable for visualization.
-    let cov_xy = covariance.fixed_slice::<2, 2>(0, 0);
-    let trace = cov_xy[(0, 0)] + cov_xy[(1, 1)];
-    let det = cov_xy[(0, 0)] * cov_xy[(1, 1)] - cov_xy[(0, 1)].powi(2);
+fn confidence_ellipse_m(cov_ecef: &Matrix3<f64>, lat_deg: f64, lon_deg: f64) -> f64 {
+    // Rotate ECEF covariance into ENU coordinate frame.
+    // Taking the ECEF XY submatrix directly is WRONG at non-zero latitude:
+    // at 51°N the local horizontal plane cuts across all 3 ECEF axes.
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let (slat, clat) = (lat.sin(), lat.cos());
+    let (slon, clon) = (lon.sin(), lon.cos());
+    // R = rotation matrix ECEF → ENU
+    let r = nalgebra::Matrix3::new(
+        -slon,        clon,         0.0,
+        -slat * clon, -slat * slon, clat,
+         clat * clon,  clat * slon, slat,
+    );
+    let cov_enu = &r * cov_ecef * r.transpose();
+    // Extract East-North 2×2 submatrix (rows/cols 0,1 of ENU)
+    let cov_en = cov_enu.fixed_slice::<2, 2>(0, 0);
+    let trace = cov_en[(0, 0)] + cov_en[(1, 1)];
+    let det = cov_en[(0, 0)] * cov_en[(1, 1)] - cov_en[(0, 1)].powi(2);
     let lambda_max = trace / 2.0 + ((trace / 2.0).powi(2) - det).max(0.0).sqrt();
     2.0 * lambda_max.sqrt()  // 2-sigma ellipse semi-major axis in meters
 }
