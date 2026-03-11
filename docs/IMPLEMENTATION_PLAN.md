@@ -7,6 +7,153 @@
 
 ---
 
+## CURRENT STATUS (last verified 2026-03-12)
+
+### Build Status
+`cargo build` in `rust-backend/` — **PASSES CLEAN** (0 errors, 0 warnings blocking)
+
+### Phase Completion
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 0 — Scaffold + Docker | **DONE** | All dirs, Dockerfiles, docker-compose.yml exist |
+| Phase 1 — Data Pipeline (Go → Rust) | **DONE** | Go ingestor emits JSON to Unix socket; Rust ingestor connects with retry |
+| Phase 2 — Core MLAT Engine | **DONE** | Correlator, LM solver, GDOP filter, Kalman filter, WS server all implemented |
+| Phase 3 — Self-Calibrating Clock Sync | **DONE** | ClockSyncEngine with windowed median + MAD outlier gate; sensor health broadcast |
+| Phase 4 — Spoof Detector + AI | **DONE** | SpoofDetector, AnomalyClient (reqwest), LSTM model, train.py all present |
+| Phase 5 — Polish + Docker Compose | **PARTIAL** | docker-compose.yml exists but has port mismatches; frontend has type bugs |
+
+### What Is Fully Implemented
+
+**Go ingestor** (`go-ingestor/main.go`):
+- [x] Reads 4DSky binary wire format (length-prefixed packets)
+- [x] Converts seconds-since-midnight to Unix epoch (avoids TDOA corruption)
+- [x] Emits JSON lines to Unix domain socket `/tmp/locus/ingestor.sock`
+- [x] Mutex-protected multi-client broadcast; removes dead connections on write error
+- [x] Location override map (seller GPS correction via libp2p pubkey hex)
+- [x] Logs to stderr only (no stdout contamination)
+
+**Rust backend** (`rust-backend/src/`):
+- [x] `ingestor.rs` — Unix socket connect with 240-attempt retry; BufReader JSON line loop; `RawFrame::finalize()` pre-computes timestamp_ns_cache + decoded_bytes + content_hash
+- [x] `correlator.rs` — CorrelationKey by (ICAO24, FxHash); 50ms eviction window; sensor dedup; min_sensors=3; unit tests pass
+- [x] `coords.rs` — WGS84↔ECEF (Bowring iterative), `ecef_dist`; unit tests for London roundtrip
+- [x] `sensors.rs` — SensorRegistry caches ECEF per sensor_id; initial_guess_ecef (centroid at cruise alt)
+- [x] `clock_sync.rs` — PairState with VecDeque window 50; dirty-flag cached median/MAD; outlier gate 3×MAD; `apply_corrections()` mutates frame timestamps in-place; `export_offsets()`
+- [x] `mlat_solver.rs` — `levenberg-marquardt` crate (NOT `argmin`); LeastSquaresProblem trait impl; GeometryCache (SVD-based pre-solve check); GDOP from JTJ inverse; confidence_ellipse_m (ENU rotation); GDOP>5 discard
+- [x] `kalman.rs` — 6D ECEF EKF [x,y,z,vx,vy,vz]; static H matrix (OnceLock); dt clamped 0–30s; velocity clamped 350 m/s; AircraftHistory VecDeque(20); KalmanRegistry
+- [x] `adsb_parser.rs` — Full CPR decoder (even/odd pair accumulator per ICAO24); NL lookup table (binary search, 58 breakpoints); Gillham Q-bit altitude decode; per-ICAO24 CprDecoder state
+- [x] `spoof_detector.rs` — ECEF-cached ADS-B claimed positions; GDOP-adaptive threshold (max 2km, 3×accuracy_m); ECEF divergence distance
+- [x] `anomaly_client.rs` — reqwest POST /classify; 500ms timeout; rate-limited via `last_classify_ns`
+- [x] `ws_server.rs` — TcpListener broadcast server; per-client tokio spawn; lag warning
+- [x] `main.rs` — Full pipeline wired: frame ingestion → correlator → clock_sync → solver → Kalman → spoof → anomaly (async rate-limited) → WS broadcast; eviction tick 10ms; sensor health broadcast 5s
+
+**ML service** (`ml-service/`):
+- [x] `model.py` — AircraftLSTM (2-layer LSTM, hidden=128, dropout=0.3, input=6 features, output=2 classes)
+- [x] `train.py` — Synthetic normal/anomalous track generator; DataLoader; saves model.pt + _mean.npy + _std.npy
+- [x] `main.py` — FastAPI with /health, /classify (full pipeline: pad/trim to SEQ_LEN=20, normalise, softmax), /train (background subprocess trigger)
+
+**Frontend** (`frontend/index.html`):
+- [x] Leaflet.js map (dark CartoDB tiles, centered Cornwall)
+- [x] Aircraft markers with color coding (green/amber/red for normal/spoof/anomaly)
+- [x] Confidence ellipse (L.circle with accuracy_m radius)
+- [x] Aircraft sidebar list with ICAO24, position, altitude, badges
+- [x] Alert feed for spoof/anomaly events
+- [x] Sensor health Chart.js panel (clock offset ms over time)
+- [x] Stale aircraft cleanup every 5s
+- [x] WebSocket reconnect on close
+
+---
+
+### CRITICAL BUGS — FIX BEFORE DEMO
+
+#### BUG 1: WebSocket port mismatch (BREAKS LIVE MAP)
+**File**: `frontend/index.html` line 242
+**Problem**: Frontend connects to port `9002`, but the Rust backend listens on port `9001` (default in `main.rs`)
+```javascript
+// CURRENT (WRONG):
+const WS_URL = `ws://${location.hostname}:9002`;
+// SHOULD BE:
+const WS_URL = `ws://${location.hostname}:9001`;
+```
+Also verify `docker-compose.yml` exposes port 9001 (currently exposes 9002 in the live compose).
+
+#### BUG 2: anomaly_label type mismatch (BREAKS ANOMALY DISPLAY)
+**File**: `frontend/index.html` lines 94, 136, 169–170
+**Problem**: Frontend compares `anomaly_label === 1` (integer) but the Rust backend sends `anomaly_label` as a **string** (`"normal"` | `"anomalous"` | `"unknown"`). The comparisons will never match.
+```javascript
+// CURRENT (WRONG):
+if (state.anomaly_label === 1) return "#ef4444";
+if (s.anomaly_label === 1)  badge = `ANOMALY`;
+if (s.anomaly_label === 0) badge = `NORMAL`;
+
+// SHOULD BE:
+if (state.anomaly_label === "anomalous") return "#ef4444";
+if (s.anomaly_label === "anomalous") badge = `ANOMALY`;
+if (s.anomaly_label === "normal")    badge = `NORMAL`;
+
+// And the alert trigger:
+if (anomaly_label === 1 || spoof_flag)  // WRONG
+if (anomaly_label === "anomalous" || spoof_flag)  // CORRECT
+```
+
+#### BUG 3: ML service /classify response type mismatch
+**File**: `ml-service/main.py` line 81
+**Problem**: `ClassifyResponse.anomaly_label` is typed as `int` in main.py but the Rust `AnomalyClient` expects `anomaly_label: String` and the frontend expects `"normal"` | `"anomalous"`. The endpoint returns `0` or `1` (integer) but Rust deserializes into `String`.
+
+The plan at Step 4.2 correctly specifies `anomaly_label: str` — the current `main.py` regressed to `int`. Fix: change line 81 from `anomaly_label: int` to `anomaly_label: str`, and update the return at line 107 from numeric label to string.
+
+#### BUG 4: sensor_health offsets format mismatch
+**File**: `frontend/index.html` line 264 and `main.rs` lines 143–149
+**Problem**: The Rust backend broadcasts `offsets` as a JSON **array** of `SensorOffsetReport` objects: `[{sensor_i, sensor_j, offset_ns, ...}, ...]`. The frontend's `updateSensorHealth()` treats `offsets` as a **key-value object** (`msg.offsets[pair]`). The Chart.js update will produce no data.
+
+Fix in frontend: iterate the array instead of treating it as an object dict:
+```javascript
+function updateSensorHealth(offsets) {
+  // offsets is now an array: [{sensor_i, sensor_j, offset_ns, ...}, ...]
+  for (const o of offsets) {
+    const pair = `${o.sensor_i}-${o.sensor_j}`;
+    // ... same logic, use o.offset_ns
+  }
+}
+```
+
+---
+
+### WHAT'S LEFT TO DO (Ordered by Priority)
+
+#### Priority 1 — Fix the 4 bugs above (30 minutes total)
+1. `frontend/index.html`: Change WS port 9002 → 9001
+2. `frontend/index.html`: Fix `anomaly_label` string comparisons (3 locations)
+3. `ml-service/main.py`: Change `anomaly_label: int` → `anomaly_label: str`, update return value
+4. `frontend/index.html`: Fix `updateSensorHealth()` to iterate array not object
+
+#### Priority 2 — Train the ML model (15 minutes)
+The `ml-service/model.pt` does not exist yet. The `/classify` endpoint returns 503 until it is trained. Run:
+```bash
+cd /home/psychopunk_sage/dev/tools/Locus/ml-service
+python train.py --epochs 20 --output model.pt
+```
+Or call `POST /train` after the service starts.
+
+#### Priority 3 — Docker Compose port alignment
+The live `docker-compose.yml` exposes port `9002:9002` for `rust-backend`. It should be `9001:9001` to match the default `--ws-addr=0.0.0.0:9001`. Either change the compose to `9001:9001` or pass `--ws-addr=0.0.0.0:9002` on the command line.
+
+#### Priority 4 — End-to-end smoke test (once bugs fixed)
+1. Start Go ingestor (already running with playit tunnel)
+2. Start Rust backend: `cd rust-backend && cargo run`
+3. Verify log line "Connected to ingestor socket"
+4. Open `frontend/index.html` directly in browser (or serve via nginx)
+5. Verify aircraft markers appear within 30s
+6. Start ML service: `cd ml-service && uvicorn main:app`
+7. Verify anomaly labels appear after ~5s per aircraft
+
+#### Priority 5 — Optional improvements for judging score
+- Add track polylines to the Leaflet map (the aircraft sidebar exists but no trail is drawn in the current index.html implementation — the map shows dots only)
+- Add confidence ellipse tooltip showing meters value
+- Add aircraft count in the status bar (already wired to `stat-count` element)
+
+---
+
 ## Dependency Graph
 
 ```
