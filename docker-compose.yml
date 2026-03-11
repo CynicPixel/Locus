@@ -24,7 +24,7 @@ services:
     volumes:
       - *socket-vol
     ports:
-      - "9002:9002"
+      - "9001:9001"
     networks:
       - internal
       - external
