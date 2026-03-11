@@ -1,5 +1,11 @@
 // Extended Kalman Filter (EKF) per aircraft — 6D ECEF state [x, y, z, vx, vy, vz].
 // All computations in meters / meters-per-second; WGS84 only used for output.
+//
+// FIX-8: Process noise sigma_a reduced from 50 m/s² to 1 m/s² (commercial aviation).
+//   mlat-server uses accel_noise = 0.10 m/s² for 9-state CA model; 1 m/s² is appropriate
+//   for a 6-state CV model to handle typical manoeuvres.
+// FIX-8: Mahalanobis outlier gating rejects bad MLAT solves before they corrupt the filter.
+//   Threshold M = 15 matches mlat-server. Three consecutive outliers trigger a filter reset.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -35,24 +41,27 @@ pub struct AircraftKalman {
     pub x: Vector6<f64>,
     pub p: Matrix6<f64>,
     pub last_update_ns: u64,
+    /// Consecutive Mahalanobis outlier count; filter reset after 3 (FIX-8).
+    outlier_count: u32,
 }
 
 impl AircraftKalman {
     pub fn new(icao24: String, x_ecef: f64, y_ecef: f64, z_ecef: f64) -> Self {
         let x = Vector6::new(x_ecef, y_ecef, z_ecef, 0.0, 0.0, 0.0);
         let mut p = Matrix6::zeros();
-        // Initial uncertainty: 1000 m position, 50 m/s velocity
-        p[(0, 0)] = 1_000_000.0;
+        // Initial uncertainty: 1000 m position, 200 m/s velocity (matching mlat-server UKF init).
+        p[(0, 0)] = 1_000_000.0; // 1 km
         p[(1, 1)] = 1_000_000.0;
         p[(2, 2)] = 1_000_000.0;
-        p[(3, 3)] = 2_500.0;
-        p[(4, 4)] = 2_500.0;
-        p[(5, 5)] = 2_500.0;
+        p[(3, 3)] = 40_000.0; // 200 m/s
+        p[(4, 4)] = 40_000.0;
+        p[(5, 5)] = 40_000.0;
         Self {
             icao24,
             x,
             p,
             last_update_ns: 0,
+            outlier_count: 0,
         }
     }
 
@@ -65,7 +74,10 @@ impl AircraftKalman {
 
         // Covariance: P_new = F*P*F^T + Q, exploiting F = I + dt*B sparsity
         let dt2 = dt * dt;
-        let sigma_a2: f64 = 2500.0; // (50 m/s²)²
+        // FIX-8: 1 m/s² process noise — appropriate for commercial aviation.
+        // mlat-server uses 0.10 m/s² for a 9-state CA model; 1 m/s² is used here
+        // for the 6-state CV model to cover typical manoeuvres without over-smoothing.
+        let sigma_a2: f64 = 1.0; // (1 m/s²)²
         for i in 0..3 {
             let j = i + 3;
             for k in 0..6 {
@@ -91,6 +103,9 @@ impl AircraftKalman {
     }
 
     /// Update step with MLAT-derived ECEF position.
+    /// Includes Mahalanobis outlier gating (FIX-8): rejects observations with
+    /// innovation distance > 15 (mlat-server threshold). Three consecutive outliers
+    /// trigger a filter reset so the track can re-acquire.
     pub fn update(&mut self, x_m: f64, y_m: f64, z_m: f64, accuracy_m: f64) {
         let h = h_matrix();
         // Measurement noise: MLAT accuracy² (floor 10 000 m²); Z 4× larger (approx.)
@@ -98,8 +113,39 @@ impl AircraftKalman {
         let r = Matrix3::from_diagonal(&Vector3::new(r_val, r_val, r_val * 4.0));
 
         let z = Vector3::new(x_m, y_m, z_m);
-        let y = z - h * &self.x;
+        let y = z - h * &self.x; // innovation
         let s = h * &self.p * h.transpose() + r;
+
+        // Mahalanobis distance: y^T S^{-1} y (FIX-8).
+        if let Some(s_inv) = s.try_inverse() {
+            let maha2 = (y.transpose() * s_inv * y)[(0, 0)];
+            const MAHALANOBIS_GATE: f64 = 15.0 * 15.0; // mlat-server threshold = 15
+            if maha2 > MAHALANOBIS_GATE {
+                self.outlier_count += 1;
+                tracing::debug!(
+                    icao24 = %self.icao24,
+                    maha = maha2.sqrt(),
+                    outlier_count = self.outlier_count,
+                    "Kalman outlier rejected"
+                );
+                if self.outlier_count >= 3 {
+                    // Three consecutive outliers: reset position from measurement.
+                    self.x[0] = x_m;
+                    self.x[1] = y_m;
+                    self.x[2] = z_m;
+                    self.x[3] = 0.0;
+                    self.x[4] = 0.0;
+                    self.x[5] = 0.0;
+                    self.p = Matrix6::from_diagonal(&Vector6::new(
+                        r_val, r_val, r_val * 4.0, 40_000.0, 40_000.0, 40_000.0,
+                    ));
+                    self.outlier_count = 0;
+                }
+                return;
+            }
+        }
+        self.outlier_count = 0;
+
         let k = &self.p
             * h.transpose()
             * s.try_inverse().unwrap_or(Matrix3::zeros());

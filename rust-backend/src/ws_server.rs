@@ -37,6 +37,8 @@ pub struct AircraftState {
     pub anomaly_confidence: f64,
     pub sensor_count: usize,
     pub timestamp_ms: u64,
+    /// Degrees of freedom (n_receivers + 1_if_alt_constrained - 4). 0 for ADS-B source.
+    pub dof: i32,
 }
 
 // ---------------------------------------------------------------------------
