@@ -77,3 +77,37 @@ Rust Backend
           ├── Live map (tracks, ellipses, spoof alerts, anomaly flags)
           └── Sensor panel (clock drift, GDOP, signal quality)
 ```
+
+---
+
+## How to run 4dsky SDK and do port forwarding?
+
+### Reqirements:
+
+- playit: free tunnel service designed for games — supports UDP (which is what QUIC uses).
+
+### Installation:
+
+```bash
+curl -SsL https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 -o playit
+chmod +x ./playit
+```
+
+### how to run?
+
+```bash
+./playit
+
+# Visit link to claim agent: https://playit.gg/claim/XXXXXXXX
+
+# Claim Agent
+
+# Go to Main dashboard > Tunnels
+
+# Add UDP Tunnel
+
+# Run below with your own <public IP> and <public Port>
+cd 4dsky-mlat-challenge/
+go run main.go --port=61339 --mode=peer --buyer-or-seller=buyer --list-of-sellers-source=env --envFile=.env --my-public-ip=147.185.221.17 --my-public-port=25677
+
+```
