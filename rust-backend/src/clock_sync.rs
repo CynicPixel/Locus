@@ -286,15 +286,18 @@ impl ClockSyncEngine {
     }
 
     /// Snapshot of all pair offsets for WebSocket broadcast.
-    pub fn export_offsets(&self) -> Vec<SensorOffsetReport> {
+    pub fn export_offsets(&mut self) -> Vec<SensorOffsetReport> {
         self.pairs
-            .iter()
-            .map(|(&(si, sj), p)| SensorOffsetReport {
-                sensor_i: si,
-                sensor_j: sj,
-                offset_ns: p.intercept_ns, // intercept approximates current offset
-                sample_count: p.len(),
-                is_converged: p.len() >= WINDOW_SIZE / 2,
+            .iter_mut()
+            .map(|(&(si, sj), p)| {
+                let current_offset = p.estimate_at(p.last_update_ns);
+                SensorOffsetReport {
+                    sensor_i: si,
+                    sensor_j: sj,
+                    offset_ns: current_offset,
+                    sample_count: p.len(),
+                    is_converged: p.len() >= 5,
+                }
             })
             .collect()
     }
