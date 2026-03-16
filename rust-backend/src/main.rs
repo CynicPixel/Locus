@@ -167,9 +167,11 @@ async fn main() -> anyhow::Result<()> {
 
             _ = health_tick.tick() => {
                 let offsets = clock_sync.export_offsets();
+                let sensors = sensor_registry.export_wgs84();
                 let msg = serde_json::json!({
                     "type": "sensor_health",
                     "offsets": offsets,
+                    "sensors": sensors,
                     "frame_count": frame_count,
                     "live_groups": correlator.live_group_count(),
                 });
@@ -419,6 +421,7 @@ async fn solve_and_broadcast(
         sensor_count: group.frames.len(),
         timestamp_ms: now_ns / 1_000_000,
         dof: solution.dof,
+        sensor_ids: sensor_ids.clone(),
     };
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
@@ -536,6 +539,7 @@ async fn broadcast_adsb(
         sensor_count,
         timestamp_ms: now_ns / 1_000_000,
         dof: 0,
+        sensor_ids: vec![],
     };
 
     tracing::debug!(

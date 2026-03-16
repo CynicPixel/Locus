@@ -39,6 +39,8 @@ pub struct AircraftState {
     pub timestamp_ms: u64,
     /// Degrees of freedom (n_receivers + 1_if_alt_constrained - 4). 0 for ADS-B source.
     pub dof: i32,
+    /// IDs of sensors that contributed to this MLAT fix. Empty for ADS-B.
+    pub sensor_ids: Vec<i64>,
 }
 
 // ---------------------------------------------------------------------------
