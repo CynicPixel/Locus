@@ -1,47 +1,52 @@
-version: "3.9"
-
-x-socket-volume: &socket-vol
-  type: bind
-  source: /tmp/locus
-  target: /tmp/locus
-
 services:
   go-ingestor:
     build: ./go-ingestor
     restart: unless-stopped
-    env_file: ./buyer-env
+    network_mode: host
+    env_file: ./go-ingestor/.env
     volumes:
-      - *socket-vol
+      - socket-vol:/tmp/locus
+      - ./go-ingestor/.env:/app/buyer.env:ro
+      - ./go-ingestor/location-override.json:/app/location-override.json:ro
+    command:
+      - "--port=61339"
+      - "--mode=peer"
+      - "--buyer-or-seller=buyer"
+      - "--list-of-sellers-source=env"
+      - "--envFile=/app/buyer.env"
+      - "--my-public-ip=${MY_PUBLIC_IP:-147.185.221.17}"
+      - "--my-public-port=${MY_PUBLIC_PORT:-25677}"
+
+  ml-service:
+    build: ./ml-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
     networks:
       - internal
 
   rust-backend:
     build: ./rust-backend
     restart: unless-stopped
-    depends_on: [go-ingestor]
-    environment:
-      ML_SERVICE_URL: "http://ml-service:8080"
+    depends_on:
+      - go-ingestor
+      - ml-service
+    command:
+      - "--ws-addr=0.0.0.0:9001"
+      - "--ml-service-url=http://ml-service:8000"
     volumes:
-      - *socket-vol
+      - socket-vol:/tmp/locus
     ports:
       - "9001:9001"
     networks:
       - internal
       - external
 
-  ml-service:
-    build: ./ml-service
-    restart: unless-stopped
-    volumes:
-      - ml-models:/app
-    networks:
-      - internal
-
   frontend:
     build: ./frontend
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "3000:3000"
     networks:
       - external
 
@@ -53,4 +58,4 @@ networks:
     driver: bridge
 
 volumes:
-  ml-models:
+  socket-vol:
