@@ -123,7 +123,7 @@ L.circle([50.1, -5.8], {
 }).addTo(map).bindTooltip('300 km sensor coverage (Cornwall)', { permanent: false });
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const aircraft = {};          // icao24 → { marker, ellipse, state, lastSeen, idle }
+const aircraft = {};          // icao24 → { marker, ellipse, state, lastSeen, idle, trail[] }
 const IDLE_WARNING_MS = 60_000;   // show red triangle after 60 s idle
 const REMOVE_MS       = 300_000;  // hard-remove after 5 min
 let sensorsVisible    = false;
@@ -131,6 +131,10 @@ const sensorMarkers   = {};       // sensor_id → L.marker
 const sensorData      = {};       // sensor_id → { lat, lon, alt_m, offsets[] }
 let selectedIcao      = null;
 let attributionLines  = [];       // active L.polyline[] for sensor highlight
+
+const MAX_TRAIL_POINTS = 300;
+const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
+let trailPolylines = [];  // active L.polyline[] for the selected trail
 
 function markerColor(state) {
   if (state.anomaly_label === "anomalous") return "#ef4444";
@@ -172,6 +176,69 @@ function makeSensorIcon() {
   });
 }
 
+// ─── Trail functions ──────────────────────────────────────────────────────────
+function pushTrailPoint(icao24, state) {
+  const ac = aircraft[icao24];
+  if (!ac) return;
+  if (!ac.trail) ac.trail = [];
+
+  const point = {
+    lat: state.lat, lon: state.lon, alt_m: state.alt_m,
+    gdop: state.gdop, anomaly_label: state.anomaly_label,
+    anomaly_confidence: state.anomaly_confidence,
+    spoof_flag: state.spoof_flag, ts: Date.now()
+  };
+
+  // Skip stationary noise (~1m gate in degree space)
+  if (ac.trail.length > 0) {
+    const last = ac.trail[ac.trail.length - 1];
+    const dlat = point.lat - last.lat, dlon = point.lon - last.lon;
+    if (dlat * dlat + dlon * dlon < 1e-10) return;
+  }
+
+  ac.trail.push(point);
+  while (ac.trail.length > MAX_TRAIL_POINTS) ac.trail.shift();
+  const cutoff = Date.now() - MAX_TRAIL_AGE_MS;
+  while (ac.trail.length > 0 && ac.trail[0].ts < cutoff) ac.trail.shift();
+}
+
+function flushTrailSource(icao24) {
+  for (const pl of trailPolylines) map.removeLayer(pl);
+  trailPolylines = [];
+
+  const ac = aircraft[icao24];
+  if (!ac || !ac.trail || ac.trail.length < 2) return;
+
+  const trail = ac.trail;
+  const total = trail.length;
+
+  for (let i = 0; i < total - 1; i++) {
+    const p0 = trail[i], p1 = trail[i + 1];
+    const opacity = 0.1 + (i / (total - 1)) * 0.75;
+
+    let color, dashArray = null;
+    if (p1.spoof_flag || (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)) {
+      color = "#ef4444";
+    } else if (p1.gdop > 0) {
+      color = "#60a5fa";
+    } else {
+      color = "#94a3b8";
+      dashArray = "4 4";
+    }
+
+    trailPolylines.push(
+      L.polyline([[p0.lat, p0.lon], [p1.lat, p1.lon]], {
+        color, opacity, weight: 1.8, dashArray, interactive: false
+      }).addTo(map)
+    );
+  }
+}
+
+function clearTrailSource() {
+  for (const pl of trailPolylines) map.removeLayer(pl);
+  trailPolylines = [];
+}
+
 // ─── Aircraft update ──────────────────────────────────────────────────────────
 function updateAircraft(state) {
   const { icao24, lat, lon, alt_m, anomaly_label, spoof_flag } = state;
@@ -190,6 +257,8 @@ function updateAircraft(state) {
     const ellipse = L.circle(pos, { radius: Math.max(state.confidence_ellipse_m || 200, 100),
       color, fillColor: color, fillOpacity: 0.08, weight: 1 }).addTo(map);
     aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now(), idle: false };
+    pushTrailPoint(icao24, state);
+    if (selectedIcao === icao24) flushTrailSource(icao24);
   } else {
     const ac = aircraft[icao24];
     ac.marker.setLatLng(pos).setIcon(makeIcon(color));
@@ -203,6 +272,8 @@ function updateAircraft(state) {
       ac.idle = false;
       ac.marker.setIcon(makeIcon(color));
     }
+    pushTrailPoint(icao24, state);
+    if (selectedIcao === icao24) flushTrailSource(icao24);
   }
 
   renderList();
@@ -277,7 +348,10 @@ setInterval(() => {
     if (age > REMOVE_MS) {
       map.removeLayer(ac.marker);
       map.removeLayer(ac.ellipse);
-      if (selectedIcao === icao) closePopup();
+      if (selectedIcao === icao) {
+        clearTrailSource();
+        closePopup();
+      }
       delete aircraft[icao];
       continue;
     }
@@ -311,7 +385,7 @@ function createSensorMarker(id, sd) {
   const offsets = (sd.offsets || []).map(o => {
     const peer = o.sensor_i == id ? o.sensor_j : o.sensor_i;
     const converged = o.is_converged ? "&#10003;" : "&#8987;";
-    const ms = o.is_converged ? (o.offset_ns / 1e6).toFixed(3) + " ms" : "—";
+    const ms = (o.offset_ns / 1e6).toFixed(3) + " ms";
     return `<tr><td>${peer}</td><td>${ms}</td><td>${converged}</td></tr>`;
   }).join("");
 
@@ -386,7 +460,7 @@ function updateSensorHealth(offsets, sensors) {
       });
     }
     healthData.datasets[idx].data.push(
-      o.is_converged ? (o.offset_ns / 1e6).toFixed(3) : null
+      parseFloat((o.offset_ns / 1e6).toFixed(3))
     );
     if (healthData.datasets[idx].data.length > maxPoints) {
       healthData.datasets[idx].data.shift();
@@ -405,6 +479,7 @@ function openPopup(icao24) {
   refreshPopup();
   document.getElementById("ac-popup").style.display = "block";
   drawAttributionLines(icao24);
+  flushTrailSource(icao24);
 }
 
 function refreshPopup() {
@@ -419,9 +494,17 @@ function refreshPopup() {
   document.getElementById("popup-icao").innerHTML = `${s.icao24.toUpperCase()} ${srcBadge}`;
 
   const speedKts = Math.sqrt((s.vel_lat || 0) ** 2 + (s.vel_lon || 0) ** 2) * 111000 * 1.944;
+  const headingDeg = ((Math.atan2(s.vel_lon || 0, s.vel_lat || 0) * 180 / Math.PI) + 360) % 360;
+  const trail = ac.trail || [];
+  const trailStart = trail.length > 0 ? trail[0].ts : Date.now();
+  const durationMs = Date.now() - trailStart;
+  const durationStr = durationMs < 60000
+    ? `${Math.round(durationMs / 1000)}s`
+    : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
   const rows = [
     ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
     ["Speed", `${speedKts.toFixed(0)} kts`],
+    ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
     ["GDOP", s.gdop > 0 ? s.gdop.toFixed(2) : "N/A (ADS-B)"],
     ["Accuracy", `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
     ["Sensors", s.sensor_count],
@@ -429,6 +512,8 @@ function refreshPopup() {
     ["Spoof", s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m div` : "No"],
     ["DoF", s.dof],
     ["Last seen", `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`],
+    ["Tracked", durationStr],
+    ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
   ];
   document.getElementById("popup-table").innerHTML =
     rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
@@ -451,6 +536,7 @@ function closePopup() {
   selectedIcao = null;
   document.getElementById("ac-popup").style.display = "none";
   clearAttributionLines();
+  clearTrailSource();
 }
 
 map.on("click", closePopup);
