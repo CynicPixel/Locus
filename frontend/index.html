@@ -11,7 +11,7 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; font-family: "Segoe UI", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
   #layout { display: flex; height: 100vh; }
-  #map { flex: 1; }
+  #map { flex: 1; position: relative; }
   #sidebar {
     width: 340px; min-width: 260px; display: flex; flex-direction: column;
     background: #161b22; border-left: 1px solid #30363d; overflow: hidden;
@@ -37,6 +37,7 @@
   .badge-normal  { background: #1a7f37; color: #fff; }
   .badge-anomaly { background: #b91c1c; color: #fff; }
   .badge-unknown { background: #374151; color: #9ca3af; }
+  .badge-idle    { background: #7f1d1d; color: #fca5a5; }
   #alert-list { max-height: 120px; overflow-y: auto; }
   .alert-entry { font-size: .75rem; padding: 3px 0; border-bottom: 1px solid #21262d; color: #f59e0b; }
   #health-chart-wrap { padding: 10px 14px 14px; }
@@ -45,11 +46,39 @@
     padding: 5px 14px; font-size: .72rem; color: #8b949e;
     border-top: 1px solid #30363d; display: flex; justify-content: space-between;
   }
+  /* Sensor toggle button */
+  #sensor-toggle {
+    position: absolute; top: 80px; right: 10px; z-index: 1000;
+    background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
+  }
+  #sensor-toggle.active { background: #1a7f37; border-color: #22c55e; color: #fff; }
+  /* Aircraft popup panel */
+  #ac-popup {
+    display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 12px 14px; min-width: 260px; max-width: 320px; font-size: .82rem;
+  }
+  #ac-popup .popup-title { font-weight: 700; font-family: monospace; font-size: .95rem; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  #ac-popup table { width: 100%; border-collapse: collapse; }
+  #ac-popup td { padding: 2px 4px; color: #8b949e; }
+  #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
+  #ac-popup .idle-strip { margin-top: 8px; background: #7f1d1d; color: #fca5a5; border-radius: 4px; padding: 4px 8px; font-size: .75rem; display: none; }
 </style>
 </head>
 <body>
 <div id="layout">
-  <div id="map"></div>
+  <div id="map">
+    <button id="sensor-toggle" onclick="toggleSensors()">&#128225; Sensors</button>
+    <div id="ac-popup">
+      <div class="popup-title">
+        <span id="popup-icao">—</span>
+        <span style="cursor:pointer;color:#8b949e" onclick="closePopup()">&#x2715;</span>
+      </div>
+      <div class="idle-strip" id="popup-idle">&#9888; No signal for <span id="popup-idle-time"></span></div>
+      <table id="popup-table"></table>
+    </div>
+  </div>
   <div id="sidebar">
     <header>
       <span class="dot" id="conn-dot" style="background:#8b949e"></span>
@@ -94,8 +123,18 @@ L.circle([50.1, -5.8], {
 }).addTo(map).bindTooltip('300 km sensor coverage (Cornwall)', { permanent: false });
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const aircraft = {};          // icao24 → { marker, ellipse, state }
-const STALE_MS = 30_000;
+const aircraft = {};          // icao24 → { marker, ellipse, state, lastSeen, idle, trail[] }
+const IDLE_WARNING_MS = 60_000;   // show red triangle after 60 s idle
+const REMOVE_MS       = 300_000;  // hard-remove after 5 min
+let sensorsVisible    = false;
+const sensorMarkers   = {};       // sensor_id → L.marker
+const sensorData      = {};       // sensor_id → { lat, lon, alt_m, offsets[] }
+let selectedIcao      = null;
+let attributionLines  = [];       // active L.polyline[] for sensor highlight
+
+const MAX_TRAIL_POINTS = 300;
+const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
+let trailPolylines = [];  // active L.polyline[] for the selected trail
 
 function markerColor(state) {
   if (state.anomaly_label === "anomalous") return "#ef4444";
@@ -114,12 +153,98 @@ function makeIcon(color) {
   });
 }
 
+function makeIdleIcon(color) {
+  return L.divIcon({
+    className: "",
+    html: `<svg width="22" height="22" viewBox="0 0 22 22">
+             <circle cx="7" cy="15" r="5" fill="${color}" stroke="#000" stroke-width="1.5" opacity="0.5"/>
+             <polygon points="15,4 8,18 22,18" fill="none" stroke="#ef4444" stroke-width="1.8"/>
+             <text x="15" y="17" font-size="8" fill="#ef4444" text-anchor="middle">!</text>
+           </svg>`,
+    iconSize: [22, 22], iconAnchor: [7, 15],
+  });
+}
+
+function makeSensorIcon() {
+  return L.divIcon({
+    className: "",
+    html: `<svg width="20" height="24" viewBox="0 0 20 24">
+             <rect x="9" y="12" width="2" height="10" fill="#60a5fa"/>
+             <polygon points="10,2 4,13 16,13" fill="#60a5fa" stroke="#1e3a5f" stroke-width="1"/>
+           </svg>`,
+    iconSize: [20, 24], iconAnchor: [10, 22],
+  });
+}
+
+// ─── Trail functions ──────────────────────────────────────────────────────────
+function pushTrailPoint(icao24, state) {
+  const ac = aircraft[icao24];
+  if (!ac) return;
+  if (!ac.trail) ac.trail = [];
+
+  const point = {
+    lat: state.lat, lon: state.lon, alt_m: state.alt_m,
+    gdop: state.gdop, anomaly_label: state.anomaly_label,
+    anomaly_confidence: state.anomaly_confidence,
+    spoof_flag: state.spoof_flag, ts: Date.now()
+  };
+
+  // Skip stationary noise (~1m gate in degree space)
+  if (ac.trail.length > 0) {
+    const last = ac.trail[ac.trail.length - 1];
+    const dlat = point.lat - last.lat, dlon = point.lon - last.lon;
+    if (dlat * dlat + dlon * dlon < 1e-10) return;
+  }
+
+  ac.trail.push(point);
+  while (ac.trail.length > MAX_TRAIL_POINTS) ac.trail.shift();
+  const cutoff = Date.now() - MAX_TRAIL_AGE_MS;
+  while (ac.trail.length > 0 && ac.trail[0].ts < cutoff) ac.trail.shift();
+}
+
+function flushTrailSource(icao24) {
+  for (const pl of trailPolylines) map.removeLayer(pl);
+  trailPolylines = [];
+
+  const ac = aircraft[icao24];
+  if (!ac || !ac.trail || ac.trail.length < 2) return;
+
+  const trail = ac.trail;
+  const total = trail.length;
+
+  for (let i = 0; i < total - 1; i++) {
+    const p0 = trail[i], p1 = trail[i + 1];
+    const opacity = 0.1 + (i / (total - 1)) * 0.75;
+
+    let color, dashArray = null;
+    if (p1.spoof_flag || (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)) {
+      color = "#ef4444";
+    } else if (p1.gdop > 0) {
+      color = "#60a5fa";
+    } else {
+      color = "#94a3b8";
+      dashArray = "4 4";
+    }
+
+    trailPolylines.push(
+      L.polyline([[p0.lat, p0.lon], [p1.lat, p1.lon]], {
+        color, opacity, weight: 1.8, dashArray, interactive: false
+      }).addTo(map)
+    );
+  }
+}
+
+function clearTrailSource() {
+  for (const pl of trailPolylines) map.removeLayer(pl);
+  trailPolylines = [];
+}
+
+// ─── Aircraft update ──────────────────────────────────────────────────────────
 function updateAircraft(state) {
-  const { icao24, lat, lon, alt_m, gdop, anomaly_label, spoof_flag } = state;
+  const { icao24, lat, lon, alt_m, anomaly_label, spoof_flag } = state;
   if (lat == null || lon == null) return;
-  // Sanity bounds: reject obviously invalid positions
   if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
-  if (lat === 0 && lon === 0) return; // null island
+  if (lat === 0 && lon === 0) return;
 
   const color = markerColor(state);
   const pos = [lat, lon];
@@ -131,19 +256,35 @@ function updateAircraft(state) {
     marker.on("click", () => focusAircraft(icao24));
     const ellipse = L.circle(pos, { radius: Math.max(state.confidence_ellipse_m || 200, 100),
       color, fillColor: color, fillOpacity: 0.08, weight: 1 }).addTo(map);
-    aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now() };
+    aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now(), idle: false };
+    pushTrailPoint(icao24, state);
+    if (selectedIcao === icao24) flushTrailSource(icao24);
   } else {
-    aircraft[icao24].marker.setLatLng(pos).setIcon(makeIcon(color));
-    aircraft[icao24].ellipse.setLatLng(pos)
+    const ac = aircraft[icao24];
+    ac.marker.setLatLng(pos).setIcon(makeIcon(color));
+    ac.ellipse.setLatLng(pos)
       .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
       .setStyle({ color, fillColor: color });
-    aircraft[icao24].lastSeen = Date.now();
-    aircraft[icao24].state = state;
+    ac.lastSeen = Date.now();
+    ac.state = state;
+    // Clear idle state on fresh update
+    if (ac.idle) {
+      ac.idle = false;
+      ac.marker.setIcon(makeIcon(color));
+    }
+    pushTrailPoint(icao24, state);
+    if (selectedIcao === icao24) flushTrailSource(icao24);
   }
 
   renderList();
 
   if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
+
+  // Refresh popup if this is the selected aircraft
+  if (selectedIcao === icao24) {
+    refreshPopup();
+    drawAttributionLines(icao24);
+  }
 }
 
 function addAlert(state) {
@@ -160,7 +301,10 @@ function addAlert(state) {
 
 function focusAircraft(icao24) {
   const ac = aircraft[icao24];
-  if (ac) map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
+  if (ac) {
+    map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
+    openPopup(icao24);
+  }
 }
 
 function renderList() {
@@ -183,28 +327,82 @@ function renderList() {
     const spoofBadge = s.spoof_flag
       ? `<span class="badge" style="background:#92400e;color:#fef3c7">SPOOF</span>` : "";
 
+    const idleBadge = ac.idle
+      ? `<span class="badge badge-idle">IDLE</span>` : "";
+
     row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
       <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
-      ${badge}${spoofBadge}`;
+      ${badge}${spoofBadge}${idleBadge}`;
     list.appendChild(row);
   }
   document.getElementById("ac-count").textContent = sorted.length;
   document.getElementById("stat-count").textContent = `${sorted.length} aircraft`;
 }
 
-// ─── Stale cleanup ───────────────────────────────────────────────────────────
+// ─── Stale / idle cleanup ────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
   for (const [icao, ac] of Object.entries(aircraft)) {
-    if (now - ac.lastSeen > STALE_MS) {
+    const age = now - ac.lastSeen;
+    if (age > REMOVE_MS) {
       map.removeLayer(ac.marker);
       map.removeLayer(ac.ellipse);
+      if (selectedIcao === icao) {
+        clearTrailSource();
+        closePopup();
+      }
       delete aircraft[icao];
+      continue;
+    }
+    const shouldBeIdle = age > IDLE_WARNING_MS;
+    if (shouldBeIdle !== ac.idle) {
+      ac.idle = shouldBeIdle;
+      const color = markerColor(ac.state);
+      ac.marker.setIcon(shouldBeIdle ? makeIdleIcon(color) : makeIcon(color));
     }
   }
   renderList();
+  if (selectedIcao && aircraft[selectedIcao]) refreshPopupIdleStrip();
 }, 5000);
+
+// ─── Sensor toggle ────────────────────────────────────────────────────────────
+function toggleSensors() {
+  sensorsVisible = !sensorsVisible;
+  document.getElementById("sensor-toggle").classList.toggle("active", sensorsVisible);
+  if (sensorsVisible) {
+    for (const [id, sd] of Object.entries(sensorData)) {
+      if (!sensorMarkers[id]) createSensorMarker(id, sd);
+    }
+  } else {
+    for (const m of Object.values(sensorMarkers)) map.removeLayer(m);
+    for (const k of Object.keys(sensorMarkers)) delete sensorMarkers[k];
+  }
+}
+
+function createSensorMarker(id, sd) {
+  // Build offset table rows for pairs that include this sensor
+  const offsets = (sd.offsets || []).map(o => {
+    const peer = o.sensor_i == id ? o.sensor_j : o.sensor_i;
+    const converged = o.is_converged ? "&#10003;" : "&#8987;";
+    const ms = (o.offset_ns / 1e6).toFixed(3) + " ms";
+    return `<tr><td>${peer}</td><td>${ms}</td><td>${converged}</td></tr>`;
+  }).join("");
+
+  const popupHtml = `
+    <div style="font-family:monospace;font-size:.8rem;color:#c9d1d9;min-width:180px">
+      <b>Sensor ${id}</b><br>
+      ${sd.lat?.toFixed(5)}° ${sd.lon?.toFixed(5)}°<br>
+      Alt: ${Math.round(sd.alt_m ?? 0)} m<br>
+      ${offsets ? `<table style="width:100%;margin-top:4px;border-collapse:collapse">
+        <tr><th>Peer</th><th>Offset</th><th></th></tr>${offsets}</table>` : "<em>No clock pairs yet</em>"}
+    </div>`;
+
+  const marker = L.marker([sd.lat, sd.lon], { icon: makeSensorIcon() })
+    .bindPopup(popupHtml)
+    .addTo(map);
+  sensorMarkers[id] = marker;
+}
 
 // ─── Sensor health chart ─────────────────────────────────────────────────────
 const healthData = { labels: [], datasets: [] };
@@ -223,22 +421,34 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
   },
 });
 
-function updateSensorHealth(offsets) {
-  // offsets: array of { sensor_i, sensor_j, offset_ns, sample_count, is_converged }
+function updateSensorHealth(offsets, sensors) {
+  // Upsert sensorData from sensors array
+  if (sensors) {
+    for (const s of sensors) {
+      sensorData[s.sensor_id] = { ...sensorData[s.sensor_id], ...s, offsets: [] };
+    }
+  }
+  // Attach offset info to each sensor
+  for (const o of offsets) {
+    if (sensorData[o.sensor_i]) {
+      sensorData[o.sensor_i].offsets = [...(sensorData[o.sensor_i].offsets || []), o];
+    }
+    if (sensorData[o.sensor_j]) {
+      sensorData[o.sensor_j].offsets = [...(sensorData[o.sensor_j].offsets || []), o];
+    }
+  }
+
+  // Chart update
   const label = new Date().toLocaleTimeString();
   const maxPoints = 30;
-
   healthData.labels.push(label);
-  if (healthData.labels.length > maxPoints) {
-    healthData.labels.shift();
-  }
+  if (healthData.labels.length > maxPoints) healthData.labels.shift();
 
   for (const o of offsets) {
     const pair = `${o.sensor_i}-${o.sensor_j}`;
     let idx = healthData.datasets.findIndex(ds => ds.label === pair);
     if (idx === -1) {
       idx = healthData.datasets.length;
-      // Backfill nulls so this dataset aligns with existing label history
       const backfill = new Array(healthData.labels.length - 1).fill(null);
       healthData.datasets.push({
         label: pair,
@@ -250,15 +460,114 @@ function updateSensorHealth(offsets) {
       });
     }
     healthData.datasets[idx].data.push(
-      o.is_converged ? (o.offset_ns / 1e6).toFixed(3) : null  // ns → ms, null until converged
+      parseFloat((o.offset_ns / 1e6).toFixed(3))
     );
-    // Trim to window
     if (healthData.datasets[idx].data.length > maxPoints) {
       healthData.datasets[idx].data.shift();
     }
   }
 
   healthChart.update();
+
+  // Refresh popup idle strip if aircraft selected
+  if (selectedIcao) refreshPopupIdleStrip();
+}
+
+// ─── Aircraft click popup ─────────────────────────────────────────────────────
+function openPopup(icao24) {
+  selectedIcao = icao24;
+  refreshPopup();
+  document.getElementById("ac-popup").style.display = "block";
+  drawAttributionLines(icao24);
+  flushTrailSource(icao24);
+}
+
+function refreshPopup() {
+  if (!selectedIcao || !aircraft[selectedIcao]) return;
+  const ac = aircraft[selectedIcao];
+  const s = ac.state;
+  const age = Date.now() - ac.lastSeen;
+  const isAdsb = s.gdop === 0;
+  const srcBadge = isAdsb
+    ? `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`
+    : `<span class="badge" style="background:#6b21a8;color:#fff">MLAT</span>`;
+  document.getElementById("popup-icao").innerHTML = `${s.icao24.toUpperCase()} ${srcBadge}`;
+
+  const speedKts = Math.sqrt((s.vel_lat || 0) ** 2 + (s.vel_lon || 0) ** 2) * 111000 * 1.944;
+  const headingDeg = ((Math.atan2(s.vel_lon || 0, s.vel_lat || 0) * 180 / Math.PI) + 360) % 360;
+  const trail = ac.trail || [];
+  const trailStart = trail.length > 0 ? trail[0].ts : Date.now();
+  const durationMs = Date.now() - trailStart;
+  const durationStr = durationMs < 60000
+    ? `${Math.round(durationMs / 1000)}s`
+    : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
+  const rows = [
+    ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
+    ["Speed", `${speedKts.toFixed(0)} kts`],
+    ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
+    ["GDOP", s.gdop > 0 ? s.gdop.toFixed(2) : "N/A (ADS-B)"],
+    ["Accuracy", `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
+    ["Sensors", s.sensor_count],
+    ["Anomaly", `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`],
+    ["Spoof", s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m div` : "No"],
+    ["DoF", s.dof],
+    ["Last seen", `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`],
+    ["Tracked", durationStr],
+    ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
+  ];
+  document.getElementById("popup-table").innerHTML =
+    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+
+  refreshPopupIdleStrip(age);
+}
+
+function refreshPopupIdleStrip(age) {
+  age = age ?? (selectedIcao ? Date.now() - (aircraft[selectedIcao]?.lastSeen ?? Date.now()) : 0);
+  const strip = document.getElementById("popup-idle");
+  if (age > IDLE_WARNING_MS) {
+    strip.style.display = "block";
+    document.getElementById("popup-idle-time").textContent = `${Math.round(age / 1000)}s`;
+  } else {
+    strip.style.display = "none";
+  }
+}
+
+function closePopup() {
+  selectedIcao = null;
+  document.getElementById("ac-popup").style.display = "none";
+  clearAttributionLines();
+  clearTrailSource();
+}
+
+map.on("click", closePopup);
+
+// ─── Sensor attribution lines ─────────────────────────────────────────────────
+function drawAttributionLines(icao24) {
+  clearAttributionLines();
+  const ac = aircraft[icao24];
+  if (!ac || !ac.state.sensor_ids?.length || ac.state.gdop === 0) return;
+  for (const sid of ac.state.sensor_ids) {
+    const sd = sensorData[sid];
+    if (!sd) continue;
+    const line = L.polyline(
+      [[sd.lat, sd.lon], [ac.state.lat, ac.state.lon]],
+      { color: "#60a5fa", weight: 1.5, opacity: 0.7, dashArray: "5 4" }
+    ).addTo(map);
+    attributionLines.push(line);
+    // Highlight sensor marker to yellow if visible
+    if (sensorMarkers[sid]) {
+      sensorMarkers[sid].getElement()?.querySelector("polygon")?.setAttribute("fill", "#facc15");
+    }
+  }
+}
+
+function clearAttributionLines() {
+  for (const l of attributionLines) map.removeLayer(l);
+  attributionLines = [];
+  // Reset all sensor marker colors
+  for (const m of Object.values(sensorMarkers)) {
+    m.getElement()?.querySelector("polygon")?.setAttribute("fill", "#60a5fa");
+  }
 }
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
@@ -284,7 +593,7 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
 
     if (msg.type === "sensor_health") {
-      updateSensorHealth(Array.isArray(msg.offsets) ? msg.offsets : []);
+      updateSensorHealth(Array.isArray(msg.offsets) ? msg.offsets : [], msg.sensors);
     } else {
       // aircraft state update
       updateAircraft(msg);

@@ -5,12 +5,22 @@
 use std::collections::HashMap;
 
 use nalgebra::Vector3;
+use serde::Serialize;
 
 use crate::coords::wgs84_to_ecef;
 use crate::ingestor::RawFrame;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SensorInfo {
+    pub sensor_id: i64,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_m: f64,
+}
+
 pub struct SensorRegistry {
     ecef: HashMap<i64, Vector3<f64>>,
+    wgs84: HashMap<i64, (f64, f64, f64)>,  // sensor_id → (lat, lon, alt_m)
     /// Sensor centroid scaled to typical cruise altitude — stable after warmup.
     /// Used as the cold-start initial guess for the LM solver.
     pub initial_guess_ecef: Option<Vector3<f64>>,
@@ -20,6 +30,7 @@ impl SensorRegistry {
     pub fn new() -> Self {
         Self {
             ecef: HashMap::new(),
+            wgs84: HashMap::new(),
             initial_guess_ecef: None,
         }
     }
@@ -38,6 +49,7 @@ impl SensorRegistry {
             "sensor registered"
         );
         self.ecef.insert(frame.sensor_id, Vector3::new(x, y, z));
+        self.wgs84.insert(frame.sensor_id, (frame.sensor_lat, frame.sensor_lon, frame.sensor_alt));
         self.recompute_initial_guess();
     }
 
@@ -60,6 +72,13 @@ impl SensorRegistry {
     #[allow(dead_code)]
     pub fn all_ecef(&self) -> Vec<Vector3<f64>> {
         self.ecef.values().copied().collect()
+    }
+
+    pub fn export_wgs84(&self) -> Vec<SensorInfo> {
+        self.wgs84
+            .iter()
+            .map(|(&id, &(lat, lon, alt_m))| SensorInfo { sensor_id: id, lat, lon, alt_m })
+            .collect()
     }
 
     #[allow(dead_code)]

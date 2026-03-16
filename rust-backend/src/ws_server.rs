@@ -37,6 +37,15 @@ pub struct AircraftState {
     pub anomaly_confidence: f64,
     pub sensor_count: usize,
     pub timestamp_ms: u64,
+    /// Degrees of freedom (n_receivers + 1_if_alt_constrained - 4). 0 for ADS-B source.
+    pub dof: i32,
+    /// IDs of sensors that contributed to this MLAT fix. Empty for ADS-B.
+    pub sensor_ids: Vec<i64>,
+    /// True when this aircraft is a high-accuracy ADS-B source (NUC ≥ 6) actively
+    /// used to calibrate sensor pair clocks.
+    pub is_clock_beacon: bool,
+    /// How many clock-sync observations this aircraft has contributed so far.
+    pub beacon_obs_count: u32,
 }
 
 // ---------------------------------------------------------------------------

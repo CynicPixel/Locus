@@ -46,8 +46,9 @@ pub struct Cli {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Speed of light in meters per nanosecond.
-const C_M_PER_NS: f64 = 0.299_792_458;
+/// Speed of light **in air** (m/ns). c_vacuum/1.0003 — matches mlat-server Cair constant.
+/// Using vacuum speed introduces ~0.03% systematic TDOA error (~90 m at 300 km range).
+const C_M_PER_NS: f64 = 0.299_702_547;
 /// Rate-limit ML classify to once per 5 s per aircraft.
 const CLASSIFY_INTERVAL_NS: u64 = 5_000_000_000;
 /// Eviction tick — run correlator eviction every 10 ms.
@@ -100,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
     let mut geo_cache = GeometryCache::new();
     let anomaly_client = AnomalyClient::new(cli.ml_service_url.clone());
 
+    // FIX-14: Per-aircraft rate limiting — skip if last solve < 1 s ago.
+    let mut last_solve_ns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // FIX-16: Track when altitude was last observed per aircraft for degraded weighting.
+    let mut last_alt_time_ns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    // Clock beacon tracking: icao24 → cumulative obs count contributed to clock sync.
+    let mut beacon_obs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
     let mut last_frame_ns: u64 = 0;
     let mut eviction_tick =
         tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
@@ -125,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
                             &ws_tx,
                             frame.timestamp_ns(),
                             1,
+                            &mut beacon_obs,
                         ).await;
                     }
                 }
@@ -140,6 +149,8 @@ async fn main() -> anyhow::Result<()> {
             _ = eviction_tick.tick() => {
                 if last_frame_ns == 0 { continue; }
                 let groups = correlator.evict_stale(last_frame_ns);
+                // Evict stale clock sync pairs (FIX-11).
+                clock_sync.evict_stale_pairs(last_frame_ns);
                 for group in groups {
                     solve_and_broadcast(
                         group,
@@ -151,15 +162,20 @@ async fn main() -> anyhow::Result<()> {
                         &mut geo_cache,
                         &anomaly_client,
                         &ws_tx,
+                        &mut last_solve_ns,
+                        &mut last_alt_time_ns,
+                        &mut beacon_obs,
                     ).await;
                 }
             }
 
             _ = health_tick.tick() => {
                 let offsets = clock_sync.export_offsets();
+                let sensors = sensor_registry.export_wgs84();
                 let msg = serde_json::json!({
                     "type": "sensor_health",
                     "offsets": offsets,
+                    "sensors": sensors,
                     "frame_count": frame_count,
                     "live_groups": correlator.live_group_count(),
                 });
@@ -217,7 +233,45 @@ async fn solve_and_broadcast(
     geo_cache: &mut GeometryCache,
     anomaly_client: &AnomalyClient,
     ws_tx: &BroadcastTx,
+    last_solve_ns: &mut std::collections::HashMap<String, u64>,
+    last_alt_time_ns: &mut std::collections::HashMap<String, u64>,
+    beacon_obs: &mut std::collections::HashMap<String, u32>,
 ) {
+    // Step A: parse ADS-B from frame[0] early (shared by clock sync AND altitude constraint)
+    let adsb_parsed = group.frames[0].bytes().and_then(|bytes| {
+        adsb_parser.parse(bytes, group.frames[0].timestamp_ns())
+    });
+
+    // Step B: clock sync for ANY group >= 2 sensors (was previously gated by >= 3)
+    let mut used_as_beacon = false;
+    if group.frames.len() >= 2 {
+        if let Some(adsb) = &adsb_parsed {
+            if adsb.nuc >= 6 {
+                let beacon_ecef = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
+                for i in 0..group.frames.len() {
+                    for j in (i + 1)..group.frames.len() {
+                        if let (Some(pos_i), Some(pos_j)) = (
+                            sensor_registry.get(group.frames[i].sensor_id),
+                            sensor_registry.get(group.frames[j].sensor_id),
+                        ) {
+                            clock_sync.update_from_beacon(
+                                group.frames[i].sensor_id,
+                                (pos_i[0], pos_i[1], pos_i[2]),
+                                group.frames[j].sensor_id,
+                                (pos_j[0], pos_j[1], pos_j[2]),
+                                group.frames[i].timestamp_ns(),
+                                group.frames[j].timestamp_ns(),
+                                beacon_ecef,
+                            );
+                            used_as_beacon = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MLAT still requires >= 3
     if group.frames.len() < 3 {
         return;
     }
@@ -235,7 +289,26 @@ async fn solve_and_broadcast(
         return;
     }
 
-    // 3. Assemble TDOAs (meters) relative to sensor[0]
+    // 3. Timestamp feasibility check (FIX-13): reject groups where any pair's
+    //    TDOA exceeds the physical bound imposed by their separation distance.
+    //    |t_i - t_j| > d(i,j) * 1.05 / C_air + 1µs guard → impossible.
+    const TDOA_GUARD_NS: f64 = 1_000.0; // 1 µs guard
+    for (fi, pi) in group.frames.iter().zip(sensor_vecs.iter()) {
+        for (fj, pj) in group.frames.iter().zip(sensor_vecs.iter()) {
+            if fi.sensor_id >= fj.sensor_id { continue; }
+            let max_tdoa_ns = (pi - pj).norm() * 1.05 / C_M_PER_NS + TDOA_GUARD_NS;
+            let obs_ns = (fi.timestamp_ns() as i64 - fj.timestamp_ns() as i64).unsigned_abs() as f64;
+            if obs_ns > max_tdoa_ns {
+                tracing::debug!(
+                    "feasibility check failed: sensors {}/{} tdoa={:.0}ns max={:.0}ns",
+                    fi.sensor_id, fj.sensor_id, obs_ns, max_tdoa_ns
+                );
+                return;
+            }
+        }
+    }
+
+    // 4. Assemble TDOAs (meters) relative to sensor[0]
     let ref_ts_ns = group.frames[0].timestamp_ns() as i64;
     let observed_tdoa_m: Vec<f64> = group.frames[1..]
         .iter()
@@ -247,25 +320,56 @@ async fn solve_and_broadcast(
         group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
     );
 
-    // 4. Build sensor ID list for geometry cache key
+    // Track beacon obs count for UI display.
+    if used_as_beacon {
+        *beacon_obs.entry(icao24.clone()).or_insert(0) += 1;
+    }
+
+    // FIX-14: Per-aircraft rate limiting — skip if < 1 s since last solve.
+    let now_ns = group.first_seen_ns;
+    if let Some(&last) = last_solve_ns.get(&icao24) {
+        if now_ns.saturating_sub(last) < 1_000_000_000 {
+            return;
+        }
+    }
+
+    // 5. Build sensor ID list for geometry cache key
     let mut sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
     sensor_ids.sort_unstable();
 
-    // 4b. Pre-parse ADS-B for altitude constraint and beacon use.
-    //     Parsing here (before the solve) lets us use ADS-B altitude to
-    //     constrain the 3D MLAT solve — critical when sensors are coplanar.
-    let adsb_parsed = group.frames[0].bytes().and_then(|bytes| {
-        adsb_parser.parse(bytes, group.frames[0].timestamp_ns())
-    });
+    // 5b. ADS-B altitude constraint (adsb_parsed already computed above).
     let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
+
+    // FIX-16: Altitude age degradation — compute age of the altitude report.
+    let alt_age_seconds = if adsb_alt_m.is_some() {
+        // Fresh altitude in this frame — update tracking and report age = 0.
+        last_alt_time_ns.insert(icao24.clone(), now_ns);
+        0.0
+    } else {
+        last_alt_time_ns.get(&icao24)
+            .map(|&last| now_ns.saturating_sub(last) as f64 / 1e9)
+            .unwrap_or(999.0) // Unknown → very stale → altitude constraint disabled
+    };
+
+    // FIX-4: Per-measurement variance from clock sync (meters²).
+    // Reference sensor (index 0) uses a fixed 50 ns timing uncertainty.
+    let ref_id = group.frames[0].sensor_id;
+    let ref_sigma_m = 50.0 * C_M_PER_NS; // 50 ns * C_air ≈ 15 m
+    let mut tdoa_variance_m2 = vec![ref_sigma_m * ref_sigma_m]; // sensor 0
+    for f in &group.frames[1..] {
+        let var_ns2 = clock_sync.get_pair_variance_ns2(f.sensor_id, ref_id);
+        tdoa_variance_m2.push(var_ns2 * C_M_PER_NS * C_M_PER_NS);
+    }
 
     let input = MlatInput {
         sensor_positions: sensor_vecs.clone(),
         observed_tdoa_m,
+        tdoa_variance_m2,
         adsb_alt_m,
+        alt_age_seconds,
     };
 
-    // 5. Solve — use Kalman prior if available, else sensor centroid
+    // 6. Solve — use Kalman prior if available, else sensor centroid
     let prior_ecef = kalman_registry
         .get_ecef(&icao24)
         .or(sensor_registry.initial_guess_ecef);
@@ -275,24 +379,27 @@ async fn solve_and_broadcast(
         None => return,
     };
 
+    // Record this solve (FIX-14).
+    last_solve_ns.insert(icao24.clone(), now_ns);
+
     tracing::debug!(
         icao24,
         gdop = solution.gdop,
+        dof = solution.dof,
         lat = solution.lat,
         lon = solution.lon,
         alt_m = solution.alt_m,
         "MLAT solution"
     );
 
-    // 6. Kalman update
-    let now_ns = group.first_seen_ns;
+    // 7. Kalman update
     kalman_registry.update(&icao24, &solution, now_ns);
 
     let (lat, lon, alt_m) = kalman_registry
         .get_wgs84(&icao24)
         .unwrap_or((solution.lat, solution.lon, solution.alt_m));
 
-    // 7. Velocity (ENU → deg/s for frontend)
+    // 8. Velocity (ENU → deg/s for frontend)
     let (east, north, up) = kalman_registry
         .get_velocity_enu(&icao24, lat, lon)
         .unwrap_or((0.0, 0.0, 0.0));
@@ -301,7 +408,7 @@ async fn solve_and_broadcast(
     let vel_lon = east / (111_320.0 * cos_lat);
     let vel_alt = up;
 
-    // 8. Spoof detection
+    // 9. Spoof detection
     let (spoof_flag, divergence_m) = spoof_detector.check(
         &icao24,
         lat,
@@ -310,33 +417,12 @@ async fn solve_and_broadcast(
         solution.accuracy_m,
     );
 
-    // 9. ADS-B — feed claimed position to spoof detector + clock sync beacons.
-    //    Re-use the already-parsed result from step 4b.
+    // 10. Record ADS-B position for spoof detection.
     if let Some(adsb) = &adsb_parsed {
         spoof_detector.record_adsb(&adsb.icao24, adsb.lat, adsb.lon, adsb.alt_m);
-
-        let beacon_ecef = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
-        for i in 0..group.frames.len() {
-            for j in (i + 1)..group.frames.len() {
-                if let (Some(pos_i), Some(pos_j)) = (
-                    sensor_registry.get(group.frames[i].sensor_id),
-                    sensor_registry.get(group.frames[j].sensor_id),
-                ) {
-                    clock_sync.update_from_beacon(
-                        group.frames[i].sensor_id,
-                        (pos_i[0], pos_i[1], pos_i[2]),
-                        group.frames[j].sensor_id,
-                        (pos_j[0], pos_j[1], pos_j[2]),
-                        group.frames[i].timestamp_ns(),
-                        group.frames[j].timestamp_ns(),
-                        beacon_ecef,
-                    );
-                }
-            }
-        }
     }
 
-    // 10. Build AircraftState and broadcast
+    // 11. Build AircraftState and broadcast
     let aircraft_state = AircraftState {
         icao24: icao24.clone(),
         lat,
@@ -353,6 +439,10 @@ async fn solve_and_broadcast(
         anomaly_confidence: 0.0,
         sensor_count: group.frames.len(),
         timestamp_ms: now_ns / 1_000_000,
+        dof: solution.dof,
+        sensor_ids: sensor_ids.clone(),
+        is_clock_beacon: false, // MLAT track — beacon flag carried by ADS-B broadcast
+        beacon_obs_count: beacon_obs.get(&icao24).copied().unwrap_or(0),
     };
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
@@ -417,6 +507,7 @@ async fn broadcast_adsb(
     ws_tx: &BroadcastTx,
     now_ns: u64,
     sensor_count: usize,
+    beacon_obs: &mut std::collections::HashMap<String, u32>,
 ) {
     let icao24 = &adsb.icao24;
 
@@ -431,6 +522,7 @@ async fn broadcast_adsb(
         },
         gdop: 0.0,          // 0.0 signals ADS-B source (not MLAT)
         accuracy_m: 500.0,  // ADS-B typical horizontal accuracy (~500 m NUC=5)
+        dof: 0,             // not applicable for ADS-B
         covariance: nalgebra::Matrix3::identity() * (500.0_f64 * 500.0),
     };
 
@@ -468,6 +560,10 @@ async fn broadcast_adsb(
         anomaly_confidence: 0.0,
         sensor_count,
         timestamp_ms: now_ns / 1_000_000,
+        dof: 0,
+        sensor_ids: vec![],
+        is_clock_beacon: adsb.nuc >= 6 && beacon_obs.contains_key(icao24.as_str()),
+        beacon_obs_count: beacon_obs.get(icao24.as_str()).copied().unwrap_or(0),
     };
 
     tracing::debug!(

@@ -1,3 +1,5 @@
-FROM nginx:alpine
-COPY index.html /usr/share/nginx/html/index.html
-EXPOSE 80
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+EXPOSE 3000
+CMD ["python3", "-m", "http.server", "3000"]

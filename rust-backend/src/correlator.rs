@@ -1,8 +1,15 @@
-// Message correlator — groups RawFrames by (ICAO24, content_hash) within a 50 ms window.
+// Message correlator — groups RawFrames by (ICAO24, content_hash) within a 200 ms window.
 // Emits groups with >= min_sensors observations via timed eviction.
+//
+// FIX-9: Accepts all Mode S message types (DF 4/5/11/17/18/20/21) — not just DF17/18.
+//   Non-extended-squitter messages (DF4/5/20/21) don't carry position, but CAN be
+//   multilaterated to locate non-ADS-B aircraft (requires ≥4 receivers since no altitude).
+//   ICAO24 is extracted via CRC residual for surveillance replies.
+// FIX-19: Correlation window increased from 50 ms to 200 ms to capture late-arriving frames.
 
 use std::collections::HashMap;
 
+use crate::adsb_parser::crc24_residual;
 use crate::ingestor::RawFrame;
 
 // ---------------------------------------------------------------------------
@@ -17,21 +24,50 @@ pub struct CorrelationKey {
 }
 
 impl CorrelationKey {
-    /// Build from a finalized `RawFrame`.  Returns `None` for non-DF17/18 frames
-    /// or frames with invalid hex payloads (content_hash == 0).
+    /// Build a correlation key from a finalized `RawFrame`.
+    ///
+    /// Supported DF types (FIX-9):
+    /// - DF 17/18/11: CRC must be 0; ICAO24 in bytes[1:4].
+    /// - DF 4/5/20/21: CRC residual = ICAO24 (address/parity field).
+    /// - Other DFs and malformed frames return `None`.
     pub fn from_frame(frame: &RawFrame) -> Option<Self> {
         let bytes = frame.bytes()?;
         if bytes.len() < 7 {
             return None;
         }
         let df = (bytes[0] >> 3) & 0x1F;
-        if df != 17 && df != 18 {
-            return None;
+
+        match df {
+            // Extended squitters and all-call — ICAO in bytes 1:4, CRC must be 0.
+            11 if bytes.len() >= 7 => {
+                let icao24 = [bytes[1], bytes[2], bytes[3]];
+                Some(CorrelationKey { icao24, content_hash: frame.content_hash })
+            }
+            17 | 18 if bytes.len() >= 14 => {
+                let icao24 = [bytes[1], bytes[2], bytes[3]];
+                Some(CorrelationKey { icao24, content_hash: frame.content_hash })
+            }
+            // Surveillance replies — ICAO = CRC24 residual (address/parity).
+            4 | 5 if bytes.len() >= 7 => {
+                let icao_u32 = crc24_residual(bytes);
+                let icao24 = [
+                    ((icao_u32 >> 16) & 0xFF) as u8,
+                    ((icao_u32 >> 8) & 0xFF) as u8,
+                    (icao_u32 & 0xFF) as u8,
+                ];
+                Some(CorrelationKey { icao24, content_hash: frame.content_hash })
+            }
+            20 | 21 if bytes.len() >= 14 => {
+                let icao_u32 = crc24_residual(bytes);
+                let icao24 = [
+                    ((icao_u32 >> 16) & 0xFF) as u8,
+                    ((icao_u32 >> 8) & 0xFF) as u8,
+                    (icao_u32 & 0xFF) as u8,
+                ];
+                Some(CorrelationKey { icao24, content_hash: frame.content_hash })
+            }
+            _ => None,
         }
-        Some(CorrelationKey {
-            icao24: [bytes[1], bytes[2], bytes[3]],
-            content_hash: frame.content_hash,
-        })
     }
 }
 
@@ -71,7 +107,7 @@ impl Correlator {
         Self {
             groups: HashMap::new(),
             min_sensors: 3,
-            window_ns: 50_000_000,
+            window_ns: 200_000_000, // FIX-19: 200 ms (was 50 ms) — captures late-arriving frames
         }
     }
 
