@@ -64,6 +64,20 @@
   #ac-popup td { padding: 2px 4px; color: #8b949e; }
   #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
   #ac-popup .idle-strip { margin-top: 8px; background: #7f1d1d; color: #fca5a5; border-radius: 4px; padding: 4px 8px; font-size: .75rem; display: none; }
+  /* Stability alerts panel */
+  .alert-critical { color: #ef4444; font-weight: 600; }
+  .alert-warning { color: #f59e0b; }
+  .alert-info { color: #3b82f6; }
+  #stability-alerts {
+    max-height: 150px; overflow-y: auto; font-size: .72rem;
+    padding: 8px 14px; background: #0d1117; border-bottom: 1px solid #30363d;
+  }
+  .stability-alert-entry {
+    padding: 4px 0; border-bottom: 1px solid #21262d;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .stability-alert-entry:last-child { border-bottom: none; }
+  .alert-time { color: #6e7681; min-width: 60px; }
 </style>
 </head>
 <body>
@@ -88,6 +102,11 @@
     <div class="panel">
       <div class="panel-title">Alerts</div>
       <div id="alert-list"><em style="color:#555;font-size:.75rem">No alerts</em></div>
+    </div>
+
+    <div id="stability-alerts" style="display:none;">
+      <div class="panel-title">Clock Stability</div>
+      <div id="stability-alert-list"></div>
     </div>
 
     <div class="panel-title" style="padding:8px 14px 0">Aircraft (<span id="ac-count">0</span>)</div>
@@ -131,6 +150,14 @@ const sensorMarkers   = {};       // sensor_id → L.marker
 const sensorData      = {};       // sensor_id → { lat, lon, alt_m, offsets[] }
 let selectedIcao      = null;
 let attributionLines  = [];       // active L.polyline[] for sensor highlight
+
+// Topology visualization
+const topologyLayer = L.layerGroup();
+let topologyVisible = false;
+const sensorNodes = {};           // sensor_id → L.circleMarker
+const topologyEdges = [];         // Array of L.polyline
+let stabilityAlerts = [];         // Ring buffer of alerts (max 10)
+const MAX_STABILITY_ALERTS = 10;
 
 const MAX_TRAIL_POINTS = 300;
 const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
@@ -374,9 +401,19 @@ function toggleSensors() {
     for (const [id, sd] of Object.entries(sensorData)) {
       if (!sensorMarkers[id]) createSensorMarker(id, sd);
     }
+    // Show topology if available
+    if (!topologyVisible) {
+      topologyLayer.addTo(map);
+      topologyVisible = true;
+    }
   } else {
     for (const m of Object.values(sensorMarkers)) map.removeLayer(m);
     for (const k of Object.keys(sensorMarkers)) delete sensorMarkers[k];
+    // Hide topology
+    if (topologyVisible) {
+      map.removeLayer(topologyLayer);
+      topologyVisible = false;
+    }
   }
 }
 
@@ -407,19 +444,79 @@ function createSensorMarker(id, sd) {
 // ─── Sensor health chart ─────────────────────────────────────────────────────
 const healthData = { labels: [], datasets: [] };
 const healthChart = new Chart(document.getElementById("health-chart"), {
-  type: "line",
+  type: "bar",
   data: healthData,
   options: {
     animation: false,
     responsive: true,
     maintainAspectRatio: true,
-    plugins: { legend: { display: false } },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          label: (context) => {
+            const sensor = context.raw.sensor;
+            if (!sensor) return `${context.parsed.y.toFixed(3)} ms`;
+
+            let lines = [
+              `Offset: ${sensor.offset_ns.toFixed(1)} ns`,
+              `Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s`,
+              `Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns`,
+              `Status: ${sensor.status.toUpperCase()}`
+            ];
+
+            if (sensor.allan_deviation) {
+              const ad = sensor.allan_deviation;
+              lines.push(
+                `ADEV(60s): ${ad.adev_60s.toFixed(1)} ns`,
+                `Class: ${ad.oscillator_class.replace(/_/g, ' ')}`
+              );
+            }
+
+            return lines;
+          }
+        }
+      }
+    },
     scales: {
-      x: { display: false },
+      x: { display: true, ticks: { color: "#8b949e", font: { size: 9 } }, grid: { display: false } },
       y: { ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
     },
   },
 });
+
+function updateSensorHealthChart(clockData) {
+  if (!clockData || !clockData.sensors) return;
+
+  const labels = [];
+  const offsets = [];
+  const colors = [];
+
+  for (const sensor of clockData.sensors) {
+    labels.push(`S${sensor.sensor_id}`);
+    offsets.push({
+      x: `S${sensor.sensor_id}`,
+      y: sensor.offset_ns / 1e6, // Convert to ms
+      sensor: sensor
+    });
+
+    // Color by status
+    let color = "#6e7681"; // Disconnected
+    if (sensor.status === "stable") color = "#22c55e";
+    else if (sensor.status === "marginal") color = "#f59e0b";
+    else if (sensor.status === "unstable") color = "#ef4444";
+    colors.push(color);
+  }
+
+  healthChart.data.labels = labels;
+  healthChart.data.datasets = [{
+    data: offsets,
+    backgroundColor: colors,
+    borderColor: colors.map(c => c),
+    borderWidth: 1
+  }];
+  healthChart.update();
+}
 
 function updateSensorHealth(offsets, sensors) {
   // Upsert sensorData from sensors array
@@ -570,6 +667,174 @@ function clearAttributionLines() {
   }
 }
 
+// ─── Topology visualization ──────────────────────────────────────────────────
+function updateTopology(clockData) {
+  // Clear existing topology
+  topologyLayer.clearLayers();
+  for (const k of Object.keys(sensorNodes)) delete sensorNodes[k];
+
+  if (!clockData || !clockData.success) return;
+
+  // Draw edges first (so they're behind nodes)
+  if (clockData.edges) {
+    for (const edge of clockData.edges) {
+      const s_i = sensorData[edge.sensor_i];
+      const s_j = sensorData[edge.sensor_j];
+      if (!s_i || !s_j) continue;
+
+      // Edge color by MAD: Green (<50ns), Yellow (50-100ns), Red (>100ns)
+      let edgeColor = "#22c55e";
+      if (edge.mad_ns > 100) edgeColor = "#ef4444";
+      else if (edge.mad_ns > 50) edgeColor = "#f59e0b";
+
+      // Opacity proportional to weight (normalized, clamped to 0.3-0.9)
+      const opacity = Math.min(0.9, Math.max(0.3, edge.weight));
+
+      // Width proportional to obs_count (log scale)
+      const width = 1 + Math.log10(edge.obs_count + 1);
+
+      const polyline = L.polyline(
+        [[s_i.lat, s_i.lon], [s_j.lat, s_j.lon]],
+        { color: edgeColor, opacity, weight: width }
+      );
+
+      polyline.bindTooltip(
+        `Baseline: ${(edge.baseline_m / 1000).toFixed(1)} km<br>` +
+        `Obs: ${edge.obs_count}<br>` +
+        `MAD: ${edge.mad_ns.toFixed(1)} ns`,
+        { permanent: false }
+      );
+
+      polyline.addTo(topologyLayer);
+    }
+  }
+
+  // Draw sensor nodes
+  if (clockData.sensors) {
+    for (const sensor of clockData.sensors) {
+      const sd = sensorData[sensor.sensor_id];
+      if (!sd) continue;
+
+      // Node color by status
+      let nodeColor = "#6e7681"; // Disconnected
+      if (sensor.status === "stable") nodeColor = "#22c55e";
+      else if (sensor.status === "marginal") nodeColor = "#f59e0b";
+      else if (sensor.status === "unstable") nodeColor = "#ef4444";
+
+      // Radius proportional to uncertainty (capped)
+      const radius = 10 + Math.min(50, sensor.uncertainty_ns / 50);
+
+      const circle = L.circleMarker([sd.lat, sd.lon], {
+        radius,
+        fillColor: nodeColor,
+        color: "#fff",
+        weight: 2,
+        fillOpacity: 0.6
+      });
+
+      // Tooltip with full stats
+      let tooltipHtml = `<b>Sensor ${sensor.sensor_id}</b><br>` +
+        `Offset: ${sensor.offset_ns.toFixed(1)} ns<br>` +
+        `Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s<br>` +
+        `Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns<br>` +
+        `Status: ${sensor.status.toUpperCase()}`;
+
+      if (sensor.allan_deviation) {
+        const ad = sensor.allan_deviation;
+        tooltipHtml += `<br><br><b>Allan Deviation:</b><br>` +
+          `ADEV(1s): ${ad.adev_1s.toFixed(1)} ns<br>` +
+          `ADEV(60s): ${ad.adev_60s.toFixed(1)} ns<br>` +
+          `Class: ${ad.oscillator_class.replace(/_/g, ' ')}`;
+      }
+
+      circle.bindTooltip(tooltipHtml, { permanent: false });
+      circle.addTo(topologyLayer);
+      sensorNodes[sensor.sensor_id] = circle;
+    }
+  }
+}
+
+function addStabilityAlert(level, message) {
+  const timestamp = new Date().toLocaleTimeString();
+  stabilityAlerts.unshift({ level, message, timestamp });
+  if (stabilityAlerts.length > MAX_STABILITY_ALERTS) {
+    stabilityAlerts.pop();
+  }
+  renderStabilityAlerts();
+}
+
+function renderStabilityAlerts() {
+  const container = document.getElementById("stability-alert-list");
+  const panel = document.getElementById("stability-alerts");
+
+  if (stabilityAlerts.length === 0) {
+    panel.style.display = "none";
+    return;
+  }
+
+  panel.style.display = "block";
+  container.innerHTML = stabilityAlerts.map(alert => {
+    let icon = "";
+    let className = "";
+    if (alert.level === "critical") {
+      icon = "⚠";
+      className = "alert-critical";
+    } else if (alert.level === "warning") {
+      icon = "⚠";
+      className = "alert-warning";
+    } else {
+      icon = "ℹ";
+      className = "alert-info";
+    }
+
+    return `<div class="stability-alert-entry ${className}">
+      <span class="alert-time">${alert.timestamp}</span>
+      <span>${icon} ${alert.message}</span>
+    </div>`;
+  }).join("");
+}
+
+// Track previous sensor statuses for change detection
+let prevSensorStatuses = {};
+
+function processClockSyncGlobal(clockData) {
+  // Update topology visualization
+  updateTopology(clockData);
+
+  // Detect sensor status changes and generate alerts
+  if (clockData.sensors) {
+    for (const sensor of clockData.sensors) {
+      const prevStatus = prevSensorStatuses[sensor.sensor_id];
+      const newStatus = sensor.status;
+
+      if (prevStatus !== newStatus) {
+        if (newStatus === "unstable") {
+          const reason = sensor.allan_deviation && sensor.allan_deviation.adev_60s > 1000
+            ? `σ=${sensor.uncertainty_ns.toFixed(0)}ns, ADEV(60s)=${sensor.allan_deviation.adev_60s.toFixed(0)}ns`
+            : `σ=${sensor.uncertainty_ns.toFixed(0)}ns`;
+          addStabilityAlert("critical", `Sensor ${sensor.sensor_id} → UNSTABLE (${reason})`);
+        } else if (newStatus === "disconnected") {
+          addStabilityAlert("critical", `Sensor ${sensor.sensor_id} → DISCONNECTED`);
+        } else if (newStatus === "marginal" && prevStatus === "stable") {
+          addStabilityAlert("warning", `Sensor ${sensor.sensor_id} → MARGINAL`);
+        } else if (newStatus === "stable" && prevStatus && prevStatus !== "stable") {
+          addStabilityAlert("info", `Sensor ${sensor.sensor_id} → STABLE`);
+        }
+      }
+
+      prevSensorStatuses[sensor.sensor_id] = newStatus;
+    }
+  }
+
+  // System-level health alert
+  if (clockData.condition_number > 1e7) {
+    addStabilityAlert("warning", `System ill-conditioned (κ=${clockData.condition_number.toExponential(1)})`);
+  }
+
+  // Update chart with enhanced tooltips
+  updateSensorHealthChart(clockData);
+}
+
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 const WS_URL = `ws://${location.hostname}:9001`;
 let ws;
@@ -594,6 +859,9 @@ function connect() {
 
     if (msg.type === "sensor_health") {
       updateSensorHealth(Array.isArray(msg.offsets) ? msg.offsets : [], msg.sensors);
+    } else if (msg.type === "clock_sync_global") {
+      // Phase 4: Process global clock sync with topology + analytics
+      processClockSyncGlobal(msg);
     } else {
       // aircraft state update
       updateAircraft(msg);

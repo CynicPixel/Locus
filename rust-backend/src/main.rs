@@ -3,6 +3,7 @@ mod anomaly_client;
 mod clock_sync;
 mod coords;
 mod correlator;
+mod global_clock_solver;
 mod ingestor;
 mod kalman;
 mod mlat_solver;
@@ -55,6 +56,28 @@ const CLASSIFY_INTERVAL_NS: u64 = 5_000_000_000;
 const EVICTION_TICK_MS: u64 = 10;
 /// Sensor health broadcast every 5 s.
 const HEALTH_BROADCAST_SECS: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Classify topology health based on global metrics.
+///
+/// Returns: "excellent" | "good" | "marginal" | "poor"
+fn classify_topology_health(global_rms_ns: f64, connectivity: f64, condition_number: f64) -> &'static str {
+    if condition_number > 1e8 {
+        return "poor"; // Ill-conditioned system
+    }
+    if global_rms_ns < 50.0 && connectivity > 0.7 {
+        "excellent"
+    } else if global_rms_ns < 100.0 && connectivity > 0.5 {
+        "good"
+    } else if global_rms_ns < 300.0 && connectivity > 0.3 {
+        "marginal"
+    } else {
+        "poor"
+    }
+}
 
 // ---------------------------------------------------------------------------
 // main
@@ -170,8 +193,21 @@ async fn main() -> anyhow::Result<()> {
             }
 
             _ = health_tick.tick() => {
+                // Trigger global clock solve (async, non-blocking).
+                clock_sync.trigger_global_solve(last_frame_ns);
+
+                // Update cached global result.
+                clock_sync.update_cached_result().await;
+
+                // Export legacy pairwise offsets.
                 let offsets = clock_sync.export_offsets();
+
+                // Export global solver result (if available).
+                let global_result = clock_sync.export_global_result();
+
                 let sensors = sensor_registry.export_wgs84();
+
+                // Legacy sensor_health message.
                 let msg = serde_json::json!({
                     "type": "sensor_health",
                     "offsets": offsets,
@@ -180,6 +216,45 @@ async fn main() -> anyhow::Result<()> {
                     "live_groups": correlator.live_group_count(),
                 });
                 let _ = ws_tx.send(msg.to_string());
+
+                // New global clock sync message (with Phase 3 analytics).
+                if let Some(result) = global_result {
+                    let global_msg = serde_json::json!({
+                        "type": "clock_sync_global",
+                        "success": result.success,
+                        "num_sensors": result.topology.num_sensors,
+                        "num_edges": result.topology.num_edges,
+                        "global_rms_ns": result.topology.global_rms_ns,
+                        "connectivity": result.topology.connectivity,
+                        "condition_number": result.topology.condition_number,
+                        "health": classify_topology_health(
+                            result.topology.global_rms_ns,
+                            result.topology.connectivity,
+                            result.topology.condition_number
+                        ),
+                        "sensors": result.offsets.iter().map(|(&sid, &offset)| {
+                            serde_json::json!({
+                                "sensor_id": sid,
+                                "offset_ns": offset,
+                                "uncertainty_ns": result.uncertainties.get(&sid).copied().unwrap_or(0.0),
+                                "drift_ns_per_s": result.drift_rates.get(&sid).copied().unwrap_or(0.0),
+                                "status": result.statuses.get(&sid).copied().unwrap_or(crate::global_clock_solver::SensorStatus::Disconnected),
+                                "allan_deviation": result.allan_deviations.get(&sid).cloned(),
+                            })
+                        }).collect::<Vec<_>>(),
+                        "edges": result.edges.iter().map(|edge| {
+                            serde_json::json!({
+                                "sensor_i": edge.sensor_i,
+                                "sensor_j": edge.sensor_j,
+                                "weight": edge.weight,
+                                "obs_count": edge.obs_count,
+                                "mad_ns": edge.mad_ns,
+                                "baseline_m": edge.baseline_m,
+                            })
+                        }).collect::<Vec<_>>(),
+                    });
+                    let _ = ws_tx.send(global_msg.to_string());
+                }
             }
 
             _ = tokio::signal::ctrl_c() => {
