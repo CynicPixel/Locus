@@ -20,11 +20,12 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
 # HTTP client (for Python ML service)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Math / MLAT
 nalgebra = "0.33"
 levenberg-marquardt = "0.14"
+sprs = "0.11"  # Sparse linear algebra for global clock synchronization
 
 # Geographic utilities (ENU rotation, NL table)
 # (pure Rust, no external dep needed — implemented in coords.rs)
