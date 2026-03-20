@@ -23,7 +23,7 @@
   #sidebar header span.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
   .panel { border-bottom: 1px solid #30363d; padding: 10px 14px; }
   .panel-title { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: #8b949e; margin-bottom: 6px; }
-  #aircraft-list { overflow-y: auto; flex: 1; }
+  #aircraft-list { overflow-y: auto; flex: 1; min-height: 0; }
   .ac-row {
     padding: 7px 14px; border-bottom: 1px solid #21262d; cursor: pointer;
     display: flex; align-items: center; gap: 8px; font-size: .82rem;
@@ -40,11 +40,12 @@
   .badge-idle    { background: #7f1d1d; color: #fca5a5; }
   #alert-list { max-height: 120px; overflow-y: auto; }
   .alert-entry { font-size: .75rem; padding: 3px 0; border-bottom: 1px solid #21262d; color: #f59e0b; }
-  #health-chart-wrap { padding: 10px 14px 14px; }
-  #health-chart-wrap canvas { max-height: 110px; }
+  #health-chart-wrap { padding: 10px 14px 14px; flex-shrink: 0; }
+  #health-chart-wrap canvas { max-height: 110px;}
   #status-bar {
     padding: 5px 14px; font-size: .72rem; color: #8b949e;
     border-top: 1px solid #30363d; display: flex; justify-content: space-between;
+    flex-shrink: 0;
   }
   /* Sensor toggle button */
   #sensor-toggle {
@@ -113,7 +114,7 @@
     <div id="aircraft-list"></div>
 
     <div class="panel" id="health-chart-wrap">
-      <div class="panel-title">Sensor Health (clock offset ms)</div>
+      <div class="panel-title">Sensor Health (clock offset ns)</div>
       <canvas id="health-chart"></canvas>
     </div>
 
@@ -422,8 +423,8 @@ function createSensorMarker(id, sd) {
   const offsets = (sd.offsets || []).map(o => {
     const peer = o.sensor_i == id ? o.sensor_j : o.sensor_i;
     const converged = o.is_converged ? "&#10003;" : "&#8987;";
-    const ms = (o.offset_ns / 1e6).toFixed(3) + " ms";
-    return `<tr><td>${peer}</td><td>${ms}</td><td>${converged}</td></tr>`;
+    const ns = o.offset_ns.toFixed(1) + " ns";
+    return `<tr><td>${peer}</td><td>${ns}</td><td>${converged}</td></tr>`;
   }).join("");
 
   const popupHtml = `
@@ -441,36 +442,51 @@ function createSensorMarker(id, sd) {
   sensorMarkers[id] = marker;
 }
 
-// ─── Sensor health chart ─────────────────────────────────────────────────────
+// ─── Sensor health chart (time-series) ───────────────────────────────────────
 const healthData = { labels: [], datasets: [] };
+const MAX_CHART_POINTS = 60; // 60 data points at 5s intervals = 5 minutes
+
 const healthChart = new Chart(document.getElementById("health-chart"), {
-  type: "bar",
+  type: "line",
   data: healthData,
   options: {
     animation: false,
     responsive: true,
     maintainAspectRatio: true,
+    interaction: { mode: 'index', intersect: false },
     plugins: {
-      legend: { display: false },
+      legend: {
+        display: true,
+        position: 'bottom',
+        labels: {
+          color: "#8b949e",
+          font: { size: 9 },
+          boxWidth: 12,
+          usePointStyle: true
+        }
+      },
       tooltip: {
+        mode: 'index',
+        intersect: false,
         callbacks: {
           label: (context) => {
-            const sensor = context.raw.sensor;
-            if (!sensor) return `${context.parsed.y.toFixed(3)} ms`;
+            const sensorId = context.dataset.sensorId;
+            const offset = context.parsed.y;
+            if (!sensorId) return `${offset.toFixed(1)} ns`;
+
+            const sensor = context.dataset.latestSensor;
+            if (!sensor) return `S${sensorId}: ${offset.toFixed(1)} ns`;
 
             let lines = [
-              `Offset: ${sensor.offset_ns.toFixed(1)} ns`,
-              `Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s`,
-              `Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns`,
-              `Status: ${sensor.status.toUpperCase()}`
+              `S${sensorId}: ${offset.toFixed(1)} ns`,
+              `  Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s`,
+              `  Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns`,
+              `  Status: ${sensor.status.toUpperCase()}`
             ];
 
             if (sensor.allan_deviation) {
               const ad = sensor.allan_deviation;
-              lines.push(
-                `ADEV(60s): ${ad.adev_60s.toFixed(1)} ns`,
-                `Class: ${ad.oscillator_class.replace(/_/g, ' ')}`
-              );
+              lines.push(`  ADEV(60s): ${ad.adev_60s.toFixed(1)} ns`);
             }
 
             return lines;
@@ -479,8 +495,25 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
       }
     },
     scales: {
-      x: { display: true, ticks: { color: "#8b949e", font: { size: 9 } }, grid: { display: false } },
-      y: { ticks: { color: "#8b949e", font: { size: 10 } }, grid: { color: "#21262d" } },
+      x: {
+        display: true,
+        title: { display: true, text: 'Time', color: "#8b949e" },
+        ticks: {
+          color: "#8b949e",
+          font: { size: 9 },
+          maxRotation: 0,
+          autoSkip: true,
+          maxTicksLimit: 8
+        },
+        grid: { display: false }
+      },
+      y: {
+        display: true,
+        title: { display: true, text: 'Clock Offset (ns)', color: "#8b949e" },
+        ticks: { color: "#8b949e", font: { size: 10 } },
+        grid: { color: "#21262d" }
+        
+      },
     },
   },
 });
@@ -488,33 +521,79 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
 function updateSensorHealthChart(clockData) {
   if (!clockData || !clockData.sensors) return;
 
-  const labels = [];
-  const offsets = [];
-  const colors = [];
-
-  for (const sensor of clockData.sensors) {
-    labels.push(`S${sensor.sensor_id}`);
-    offsets.push({
-      x: `S${sensor.sensor_id}`,
-      y: sensor.offset_ns / 1e6, // Convert to ms
-      sensor: sensor
-    });
-
-    // Color by status
-    let color = "#6e7681"; // Disconnected
-    if (sensor.status === "stable") color = "#22c55e";
-    else if (sensor.status === "marginal") color = "#f59e0b";
-    else if (sensor.status === "unstable") color = "#ef4444";
-    colors.push(color);
+  // Add new timestamp to labels
+  const timestamp = new Date().toLocaleTimeString();
+  healthData.labels.push(timestamp);
+  if (healthData.labels.length > MAX_CHART_POINTS) {
+    healthData.labels.shift();
   }
 
-  healthChart.data.labels = labels;
-  healthChart.data.datasets = [{
-    data: offsets,
-    backgroundColor: colors,
-    borderColor: colors.map(c => c),
-    borderWidth: 1
-  }];
+  // Track which sensors we've seen in this update
+  const seenSensors = new Set();
+
+  // Update or create dataset for each sensor
+  for (const sensor of clockData.sensors) {
+    seenSensors.add(sensor.sensor_id);
+
+    // Find existing dataset for this sensor
+    let dataset = healthData.datasets.find(ds => ds.sensorId === sensor.sensor_id);
+
+    if (!dataset) {
+      // Create new dataset for this sensor
+      // Color by status
+      let color = "#6e7681"; // Disconnected
+      if (sensor.status === "stable") color = "#22c55e";
+      else if (sensor.status === "marginal") color = "#f59e0b";
+      else if (sensor.status === "unstable") color = "#ef4444";
+
+      // Backfill with nulls for previous time points
+      const backfill = new Array(healthData.labels.length - 1).fill(null);
+
+      dataset = {
+        label: `S${sensor.sensor_id}`,
+        sensorId: sensor.sensor_id,
+        data: backfill,
+        borderColor: color,
+        backgroundColor: color,
+        borderWidth: 2,
+        pointRadius: 2,
+        pointHoverRadius: 4,
+        tension: 0.1,
+        latestSensor: sensor
+      };
+      healthData.datasets.push(dataset);
+    } else {
+      // Update existing dataset
+      dataset.latestSensor = sensor;
+
+      // Update color based on current status
+      let color = "#6e7681";
+      if (sensor.status === "stable") color = "#22c55e";
+      else if (sensor.status === "marginal") color = "#f59e0b";
+      else if (sensor.status === "unstable") color = "#ef4444";
+      dataset.borderColor = color;
+      dataset.backgroundColor = color;
+    }
+
+    // Add new data point (raw nanoseconds)
+    dataset.data.push(sensor.offset_ns);
+
+    // Trim old data points
+    if (dataset.data.length > MAX_CHART_POINTS) {
+      dataset.data.shift();
+    }
+  }
+
+  // For sensors not in this update, add null to maintain alignment
+  for (const dataset of healthData.datasets) {
+    if (!seenSensors.has(dataset.sensorId)) {
+      dataset.data.push(null);
+      if (dataset.data.length > MAX_CHART_POINTS) {
+        dataset.data.shift();
+      }
+    }
+  }
+
   healthChart.update();
 }
 
@@ -557,7 +636,7 @@ function updateSensorHealth(offsets, sensors) {
       });
     }
     healthData.datasets[idx].data.push(
-      parseFloat((o.offset_ns / 1e6).toFixed(3))
+      o.offset_ns
     );
     if (healthData.datasets[idx].data.length > maxPoints) {
       healthData.datasets[idx].data.shift();

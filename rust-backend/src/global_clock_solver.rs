@@ -39,7 +39,8 @@ const MIN_EDGES_PER_SENSOR: usize = 2;
 const UNSTABLE_SENSOR_THRESHOLD_NS: f64 = 500.0;
 
 /// IRLS outlier threshold (MAD multiplier).
-const OUTLIER_MAD_THRESHOLD: f64 = 3.0;
+/// FIX-4: Reduced from 3.0 to 2.0 after detrending makes MAD represent true noise.
+const OUTLIER_MAD_THRESHOLD: f64 = 2.0;
 
 /// Maximum IRLS iterations.
 const MAX_IRLS_ITERATIONS: usize = 5;
@@ -294,16 +295,64 @@ fn aggregate_edges(
             .map(|o| o.residual_ns * o.weight)
             .sum::<f64>() / total_weight;
 
-        // MAD of residuals.
-        let mut residuals: Vec<f64> = obs_list.iter()
-            .map(|o| (o.residual_ns - mean_residual_ns).abs())
+        // FIX-1: Detrend residuals before MAD calculation to remove drift component.
+        // Fit linear trend: residual(t) = a + b·t using OLS regression.
+        let base_ts = obs_list[0].timestamp_ns;
+        let n = obs_list.len() as f64;
+
+        // Convert to relative timestamps (seconds) and compute regression sums.
+        let (sum_t, sum_r, sum_tr, sum_tt) = obs_list.iter().fold(
+            (0.0, 0.0, 0.0, 0.0),
+            |(st, sr, str, stt), o| {
+                let t_s = (o.timestamp_ns.saturating_sub(base_ts) as f64) / 1e9;
+                let r = o.residual_ns;
+                (st + t_s, sr + r, str + t_s * r, stt + t_s * t_s)
+            },
+        );
+
+        let mean_t = sum_t / n;
+        let mean_r = sum_r / n;
+        let slope = if sum_tt - n * mean_t * mean_t > 1e-9 {
+            (sum_tr - n * mean_t * mean_r) / (sum_tt - n * mean_t * mean_t)
+        } else {
+            0.0 // Insufficient temporal spread, no trend.
+        };
+        let intercept = mean_r - slope * mean_t;
+
+        // Detrend residuals and compute MAD from detrended values.
+        let mut detrended_residuals: Vec<f64> = obs_list.iter()
+            .map(|o| {
+                let t_s = (o.timestamp_ns.saturating_sub(base_ts) as f64) / 1e9;
+                let trend = intercept + slope * t_s;
+                (o.residual_ns - trend).abs()
+            })
             .collect();
-        residuals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let mad_ns = if residuals.is_empty() {
+
+        detrended_residuals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad_ns = if detrended_residuals.is_empty() {
             0.0
         } else {
-            residuals[residuals.len() / 2]
+            detrended_residuals[detrended_residuals.len() / 2]
         };
+
+        // Diagnostic logging: compare raw vs detrended MAD.
+        if obs_list.len() > 10 {
+            // Compute raw MAD for comparison.
+            let mut raw_residuals: Vec<f64> = obs_list.iter()
+                .map(|o| (o.residual_ns - mean_residual_ns).abs())
+                .collect();
+            raw_residuals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let mad_raw_ns = raw_residuals[raw_residuals.len() / 2];
+
+            tracing::debug!(
+                "edge[({}, {})]: n={}, mad_raw={:.1}ns, mad_detrended={:.1}ns, drift={:.1}ns/s",
+                si, sj,
+                obs_list.len(),
+                mad_raw_ns,
+                mad_ns,
+                slope
+            );
+        }
 
         // Baseline distance: query sensor ECEF positions from registry.
         let baseline_m = if let Some(registry) = sensor_registry {
@@ -815,7 +864,15 @@ impl GlobalClockSolver {
         }
 
         // Aggregate edges (with sensor registry for baseline computation).
+        let buffer_size = self.buffer.len();
         let mut edges = aggregate_edges(self.buffer.get_valid(now_ns).cloned(), sensor_registry);
+
+        tracing::debug!(
+            "Global clock solve starting: buffer_size={}, num_edges={}, valid_obs={}",
+            buffer_size,
+            edges.len(),
+            self.buffer.get_valid(now_ns).count()
+        );
 
         // Collect sensor IDs.
         let mut sensor_ids: Vec<i64> = edges.keys()
@@ -823,6 +880,12 @@ impl GlobalClockSolver {
             .collect();
         sensor_ids.sort_unstable();
         sensor_ids.dedup();
+
+        tracing::debug!(
+            "Global clock solve: num_sensors={}, num_edges={}",
+            sensor_ids.len(),
+            edges.len()
+        );
 
         // Solve with IRLS.
         let (offsets, uncertainties, condition_number) = match solve_with_irls(&mut edges, &sensor_ids) {

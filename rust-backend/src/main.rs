@@ -11,11 +11,12 @@ mod sensors;
 mod spoof_detector;
 mod ws_server;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use nalgebra::Vector3;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::info;
 
 use adsb_parser::AdsbParser;
@@ -117,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- pipeline state --------------------------------------------------
     let mut correlator = Correlator::new();
     let mut clock_sync = ClockSyncEngine::new();
-    let mut sensor_registry = SensorRegistry::new();
+    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
     let mut adsb_parser = AdsbParser::new();
@@ -160,13 +161,16 @@ async fn main() -> anyhow::Result<()> {
                         ).await;
                     }
                 }
-                process_frame(
-                    frame,
-                    &mut last_frame_ns,
-                    &mut frame_count,
-                    &mut sensor_registry,
-                    &mut correlator,
-                );
+                {
+                    let mut registry = sensor_registry.write().await;
+                    process_frame(
+                        frame,
+                        &mut last_frame_ns,
+                        &mut frame_count,
+                        &mut *registry,
+                        &mut correlator,
+                    );
+                }
             }
 
             _ = eviction_tick.tick() => {
@@ -174,11 +178,12 @@ async fn main() -> anyhow::Result<()> {
                 let groups = correlator.evict_stale(last_frame_ns);
                 // Evict stale clock sync pairs (FIX-11).
                 clock_sync.evict_stale_pairs(last_frame_ns);
+                let registry_read = sensor_registry.read().await;
                 for group in groups {
                     solve_and_broadcast(
                         group,
                         &mut clock_sync,
-                        &sensor_registry,
+                        &*registry_read,
                         &mut kalman_registry,
                         &mut spoof_detector,
                         &mut adsb_parser,
@@ -194,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
 
             _ = health_tick.tick() => {
                 // Trigger global clock solve (async, non-blocking).
-                clock_sync.trigger_global_solve(last_frame_ns);
+                clock_sync.trigger_global_solve(last_frame_ns, sensor_registry.clone());
 
                 // Update cached global result.
                 clock_sync.update_cached_result().await;
@@ -205,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 // Export global solver result (if available).
                 let global_result = clock_sync.export_global_result();
 
-                let sensors = sensor_registry.export_wgs84();
+                let sensors = sensor_registry.read().await.export_wgs84();
 
                 // Legacy sensor_health message.
                 let msg = serde_json::json!({
@@ -337,6 +342,7 @@ async fn solve_and_broadcast(
                                 group.frames[i].timestamp_ns(),
                                 group.frames[j].timestamp_ns(),
                                 beacon_ecef,
+                                adsb.nuc, // FIX-2: Pass NUC for quality filtering/weighting.
                             );
                             used_as_beacon = true;
                         }
@@ -353,6 +359,16 @@ async fn solve_and_broadcast(
 
     // 1. Apply clock corrections (no-op until clock sync warms up)
     clock_sync.apply_corrections(&mut group.frames);
+
+    // Diagnostic: Log corrected timestamps for debugging
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let timestamps: Vec<u64> = group.frames.iter().map(|f| f.timestamp_ns()).collect();
+        tracing::trace!(
+            "MLAT timestamps after correction: ref={}, others={:?}",
+            timestamps[0],
+            &timestamps[1..]
+        );
+    }
 
     // 2. Collect sensor ECEF positions from registry
     let sensor_vecs: Vec<Vector3<f64>> = group
@@ -394,6 +410,20 @@ async fn solve_and_broadcast(
         "{:02X}{:02X}{:02X}",
         group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
     );
+
+    // Diagnostic: Log TDOA values
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let tdoa_ns: Vec<i64> = group.frames[1..]
+            .iter()
+            .map(|f| f.timestamp_ns() as i64 - ref_ts_ns)
+            .collect();
+        tracing::trace!(
+            "ICAO={} TDOA: ns={:?}, m={:?}",
+            icao24,
+            tdoa_ns,
+            observed_tdoa_m
+        );
+    }
 
     // Track beacon obs count for UI display.
     if used_as_beacon {

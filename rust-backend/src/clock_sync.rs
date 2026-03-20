@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::coords::ecef_dist;
 use crate::global_clock_solver::{ClockObservation, GlobalClockSolver, SolveResult};
 use crate::ingestor::RawFrame;
+use crate::sensors::SensorRegistry;
 
 const WINDOW_SIZE: usize = 50; // ~5 s at 10 beacon obs/s
 /// Speed of light in air (m/ns). c_vacuum/1.0003 — matches mlat-server Cair.
@@ -170,7 +171,7 @@ pub struct SensorOffsetReport {
 
 /// Message to trigger a global solve.
 pub enum SolveRequest {
-    Solve(u64), // Solve at this timestamp (ns)
+    Solve(u64, Arc<RwLock<SensorRegistry>>), // Solve at this timestamp (ns) with sensor registry
 }
 
 pub struct ClockSyncEngine {
@@ -198,11 +199,14 @@ impl ClockSyncEngine {
         tokio::spawn(async move {
             while let Some(req) = solve_rx.recv().await {
                 match req {
-                    SolveRequest::Solve(now_ns) => {
+                    SolveRequest::Solve(now_ns, sensor_registry) => {
                         let mut solver = solver_clone.write().await;
-                        // TODO: Pass sensor registry for baseline computation.
-                        let result = solver.solve(now_ns, None);
-                        drop(solver); // Release lock.
+
+                        // Read sensor registry (acquires read lock).
+                        let registry_read = sensor_registry.read().await;
+                        let result = solver.solve(now_ns, Some(&*registry_read));
+                        drop(registry_read); // Release registry read lock.
+                        drop(solver); // Release solver write lock.
 
                         if result.success {
                             tracing::debug!(
@@ -234,9 +238,9 @@ impl ClockSyncEngine {
     }
 
     /// Trigger a global solve (non-blocking).
-    pub fn trigger_global_solve(&self, now_ns: u64) {
+    pub fn trigger_global_solve(&self, now_ns: u64, sensor_registry: Arc<RwLock<SensorRegistry>>) {
         if self.use_global_solver {
-            let _ = self.solve_tx.try_send(SolveRequest::Solve(now_ns));
+            let _ = self.solve_tx.try_send(SolveRequest::Solve(now_ns, sensor_registry));
         }
     }
 
@@ -267,6 +271,7 @@ impl ClockSyncEngine {
         t_i_ns: u64,
         t_j_ns: u64,
         beacon_ecef: (f64, f64, f64),
+        beacon_nuc: u8,
     ) {
         let dist_i = ecef_dist(pos_i, beacon_ecef);
         let dist_j = ecef_dist(pos_j, beacon_ecef);
@@ -274,13 +279,34 @@ impl ClockSyncEngine {
         let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
         let error_ns = observed_tdoa_ns - expected_tdoa_ns;
 
+        // FIX-2: Quality gate - only accept high-accuracy beacons (NUC ≥ 6).
+        // NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
+        if beacon_nuc < 6 {
+            tracing::trace!(
+                "beacon rejected: NUC={} (threshold=6)",
+                beacon_nuc
+            );
+            return;
+        }
+
+        // Weight observations by NUC and baseline distance.
+        let baseline_m = ecef_dist(pos_i, pos_j);
+        let nuc_weight = match beacon_nuc {
+            6 => 1.0,
+            7 => 2.0,
+            8..=9 => 4.0,
+            _ => 0.5, // Fallback (should not reach here due to NUC < 6 gate).
+        };
+        let baseline_weight = (baseline_m / 100_000.0).min(2.0); // Favor long baselines.
+        let weight = nuc_weight * baseline_weight;
+
         // Push to global solver (synchronous, O(1) - just a VecDeque push).
         if self.use_global_solver {
             let obs = ClockObservation {
                 sensor_i,
                 sensor_j,
                 residual_ns: error_ns,
-                weight: 1.0, // TODO: Weight by baseline distance or beacon accuracy.
+                weight,
                 timestamp_ns: t_i_ns,
                 beacon_ecef,
             };
@@ -312,7 +338,8 @@ impl ClockSyncEngine {
             }
         } else if pair.len() >= 2 {
             let mean = pair.mean();
-            if (error_ns - mean).abs() > 3000.0 { // 3 µs gross outlier gate during warmup
+            // FIX-3: Tightened from 3000ns (3µs) to 1000ns (1µs) to prevent bad warm-up data.
+            if (error_ns - mean).abs() > 1000.0 {
                 return;
             }
         }
@@ -415,6 +442,23 @@ impl ClockSyncEngine {
             .iter()
             .map(|f| self.get_offset_at(f.sensor_id, ref_id, ref_ts_ns))
             .collect();
+
+        // Diagnostic: Log corrections if any are non-zero (trace level only)
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let has_corrections = corrections.iter().any(|&c| c.abs() > 1.0);
+            if has_corrections {
+                let sensor_corrections: Vec<(i64, f64)> = frames[1..]
+                    .iter()
+                    .zip(corrections.iter())
+                    .map(|(f, &c)| (f.sensor_id, c))
+                    .collect();
+                tracing::trace!(
+                    "Clock corrections applied (ref={}): {:?}",
+                    ref_id,
+                    sensor_corrections
+                );
+            }
+        }
 
         for (frame, correction_ns) in frames[1..].iter_mut().zip(corrections) {
             let raw_ns = frame.timestamp_ns() as i64;
