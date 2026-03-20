@@ -472,6 +472,63 @@ function qualityColor(quality) {
   return colors[quality] || "#6b7280";
 }
 
+// Helper function: Group GDOP points by quality category for z-index ordering
+function groupPointsByQuality(points) {
+  const groups = {
+    excellent: [],
+    good: [],
+    moderate: [],
+    poor: [],
+    unacceptable: [],
+    degenerate: []
+  };
+  points.forEach(p => {
+    if (groups[p.quality]) {
+      groups[p.quality].push(p);
+    }
+  });
+  return groups;
+}
+
+// Helper function: Render quality points as grid rectangles
+function renderQualityRectangles(points, quality, color, resolutionDeg) {
+  // Calculate half-resolution for rectangle bounds
+  const halfRes = resolutionDeg / 2;
+
+  points.forEach(point => {
+    const gdopStr = Number.isFinite(point.gdop)
+      ? point.gdop.toFixed(2)
+      : "∞";
+
+    const condStr = (point.condition_number != null && Number.isFinite(point.condition_number))
+      ? point.condition_number.toFixed(1)
+      : "—";
+
+    // Create rectangle bounds: [[south, west], [north, east]]
+    const bounds = [
+      [point.lat - halfRes, point.lon - halfRes],
+      [point.lat + halfRes, point.lon + halfRes]
+    ];
+
+    L.rectangle(bounds, {
+      fillColor: color,
+      fillOpacity: 0.5,
+      color: color,
+      weight: 0,
+      stroke: false,
+      interactive: true
+    })
+    .bindTooltip(
+      `<b>GDOP: ${gdopStr}</b><br>` +
+      `Quality: ${point.quality}<br>` +
+      `Sensors: ${point.num_sensors}<br>` +
+      `Condition: ${condStr}`,
+      { sticky: true }
+    )
+    .addTo(gdopLayer);
+  });
+}
+
 function updateGdopHeatmap(data) {
   console.log("GDOP heatmap message received:", {
     points: data.points?.length,
@@ -504,38 +561,31 @@ function updateGdopHeatmap(data) {
     return;
   }
 
-  // Calculate radius in meters from resolution (degrees to meters at equator)
-  const radiusMeters = data.resolution_deg * 111000 / 2;
-
   console.log(`Rendering GDOP heatmap: ${data.points.length} points, resolution ${data.resolution_deg}°, altitude ${data.altitude_m}m`);
 
-  data.points.forEach(point => {
-    const color = qualityColor(point.quality);
+  // Group points by quality for proper z-index layering (worst to best)
+  const groups = groupPointsByQuality(data.points);
 
-    const gdopStr = Number.isFinite(point.gdop)
-      ? point.gdop.toFixed(2)
-      : "∞";
+  // Define rendering order (worst to best quality, back-to-front z-index)
+  const qualityOrder = [
+    { name: 'degenerate', color: '#18181b' },
+    { name: 'unacceptable', color: '#ef4444' },
+    { name: 'poor', color: '#f97316' },
+    { name: 'moderate', color: '#eab308' },
+    { name: 'good', color: '#84cc16' },
+    { name: 'excellent', color: '#22c55e' }
+  ];
 
-    const condStr = (point.condition_number != null && Number.isFinite(point.condition_number))
-      ? point.condition_number.toFixed(1)
-      : "—";
+  // Render each quality group as grid rectangles
+  qualityOrder.forEach(({ name, color }) => {
+    const points = groups[name];
+    if (!points || points.length === 0) return;
 
-    L.circle([point.lat, point.lon], {
-      radius: radiusMeters,
-      fillColor: color,
-      fillOpacity: 0.4,
-      stroke: false,
-      interactive: true
-    })
-    .bindTooltip(
-      `<b>GDOP: ${gdopStr}</b><br>` +
-      `Quality: ${point.quality}<br>` +
-      `Sensors: ${point.num_sensors}<br>` +
-      `Condition: ${condStr}`,
-      { sticky: true }
-    )
-    .addTo(gdopLayer);
+    renderQualityRectangles(points, name, color, data.resolution_deg);
+    console.log(`  ✓ ${name}: ${points.length} rectangles`);
   });
+
+  console.log(`✅ GDOP heatmap rendered: ${data.points.length} grid rectangles`);
 
   // Store statistics
   gdopStats = data.stats;
