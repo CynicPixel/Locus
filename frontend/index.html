@@ -54,6 +54,13 @@
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
   }
   #sensor-toggle.active { background: #1a7f37; border-color: #22c55e; color: #fff; }
+  /* GDOP heatmap toggle button */
+  #gdop-toggle {
+    position: absolute; top: 120px; right: 10px; z-index: 1000;
+    background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
+  }
+  #gdop-toggle.active { background: #7c3aed; border-color: #a78bfa; color: #fff; }
   /* Aircraft popup panel */
   #ac-popup {
     display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
@@ -85,6 +92,7 @@
 <div id="layout">
   <div id="map">
     <button id="sensor-toggle" onclick="toggleSensors()">&#128225; Sensors</button>
+    <button id="gdop-toggle" onclick="toggleGdopHeatmap()">&#127758; GDOP</button>
     <div id="ac-popup">
       <div class="popup-title">
         <span id="popup-icao">—</span>
@@ -116,6 +124,10 @@
     <div class="panel" id="health-chart-wrap">
       <div class="panel-title">Sensor Health (clock offset ns)</div>
       <canvas id="health-chart"></canvas>
+    </div>
+
+    <div class="panel" id="coverage-stats" style="display:none;">
+      <!-- GDOP coverage statistics populated by updateCoverageStats() -->
     </div>
 
     <div id="status-bar">
@@ -159,6 +171,11 @@ const sensorNodes = {};           // sensor_id → L.circleMarker
 const topologyEdges = [];         // Array of L.polyline
 let stabilityAlerts = [];         // Ring buffer of alerts (max 10)
 const MAX_STABILITY_ALERTS = 10;
+
+// GDOP heatmap visualization
+const gdopLayer = L.layerGroup();
+let gdopVisible = false;
+let gdopStats = null;             // Latest coverage statistics
 
 const MAX_TRAIL_POINTS = 300;
 const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
@@ -440,6 +457,219 @@ function createSensorMarker(id, sd) {
     .bindPopup(popupHtml)
     .addTo(map);
   sensorMarkers[id] = marker;
+}
+
+// ─── GDOP Heatmap ─────────────────────────────────────────────────────────────
+function qualityColor(quality) {
+  const colors = {
+    excellent: "#22c55e",     // Green
+    good: "#84cc16",          // Chartreuse
+    moderate: "#eab308",      // Yellow
+    poor: "#f97316",          // Orange
+    unacceptable: "#ef4444",  // Red
+    degenerate: "#18181b"     // Black
+  };
+  return colors[quality] || "#6b7280";
+}
+
+// Helper function: Group GDOP points by quality category for z-index ordering
+function groupPointsByQuality(points) {
+  const groups = {
+    excellent: [],
+    good: [],
+    moderate: [],
+    poor: [],
+    unacceptable: [],
+    degenerate: []
+  };
+  points.forEach(p => {
+    if (groups[p.quality]) {
+      groups[p.quality].push(p);
+    }
+  });
+  return groups;
+}
+
+// Helper function: Render quality points as grid rectangles
+function renderQualityRectangles(points, quality, color, resolutionDeg) {
+  // Calculate half-resolution for rectangle bounds
+  const halfRes = resolutionDeg / 2;
+
+  points.forEach(point => {
+    const gdopStr = Number.isFinite(point.gdop)
+      ? point.gdop.toFixed(2)
+      : "∞";
+
+    const condStr = (point.condition_number != null && Number.isFinite(point.condition_number))
+      ? point.condition_number.toFixed(1)
+      : "—";
+
+    // Create rectangle bounds: [[south, west], [north, east]]
+    const bounds = [
+      [point.lat - halfRes, point.lon - halfRes],
+      [point.lat + halfRes, point.lon + halfRes]
+    ];
+
+    L.rectangle(bounds, {
+      fillColor: color,
+      fillOpacity: 0.5,
+      color: color,
+      weight: 0,
+      stroke: false,
+      interactive: true
+    })
+    .bindTooltip(
+      `<b>GDOP: ${gdopStr}</b><br>` +
+      `Quality: ${point.quality}<br>` +
+      `Sensors: ${point.num_sensors}<br>` +
+      `Condition: ${condStr}`,
+      { sticky: true }
+    )
+    .addTo(gdopLayer);
+  });
+}
+
+function updateGdopHeatmap(data) {
+  console.log("GDOP heatmap message received:", {
+    points: data.points?.length,
+    resolution: data.resolution_deg,
+    altitude: data.altitude_m,
+    timestamp: new Date(data.timestamp_ms).toLocaleTimeString()
+  });
+
+  gdopLayer.clearLayers();
+
+  if (!data.points || data.points.length === 0) {
+    console.warn("GDOP heatmap: no points received");
+
+    // Show "no coverage" message if layer is visible
+    if (gdopVisible) {
+      const statsPanel = document.getElementById("coverage-stats");
+      if (statsPanel) {
+        statsPanel.style.display = "block";
+        statsPanel.innerHTML = `
+          <div class="panel-title">GDOP Coverage</div>
+          <div style="font-size:.72rem;color:#f59e0b;padding:10px 0;text-align:center">
+            ⚠️ No coverage data<br>
+            <span style="font-size:.65rem;color:#6e7681">
+              Requires ≥3 active sensors
+            </span>
+          </div>
+        `;
+      }
+    }
+    return;
+  }
+
+  console.log(`Rendering GDOP heatmap: ${data.points.length} points, resolution ${data.resolution_deg}°, altitude ${data.altitude_m}m`);
+
+  // Group points by quality for proper z-index layering (worst to best)
+  const groups = groupPointsByQuality(data.points);
+
+  // Define rendering order (worst to best quality, back-to-front z-index)
+  const qualityOrder = [
+    { name: 'degenerate', color: '#18181b' },
+    { name: 'unacceptable', color: '#ef4444' },
+    { name: 'poor', color: '#f97316' },
+    { name: 'moderate', color: '#eab308' },
+    { name: 'good', color: '#84cc16' },
+    { name: 'excellent', color: '#22c55e' }
+  ];
+
+  // Render each quality group as grid rectangles
+  qualityOrder.forEach(({ name, color }) => {
+    const points = groups[name];
+    if (!points || points.length === 0) return;
+
+    renderQualityRectangles(points, name, color, data.resolution_deg);
+    console.log(`  ✓ ${name}: ${points.length} rectangles`);
+  });
+
+  console.log(`✅ GDOP heatmap rendered: ${data.points.length} grid rectangles`);
+
+  // Store statistics
+  gdopStats = data.stats;
+  updateCoverageStats();
+
+  console.log(`GDOP heatmap stats: mean=${data.stats.mean_gdop.toFixed(2)}, ` +
+              `excellent=${data.stats.excellent}, good=${data.stats.good}, ` +
+              `moderate=${data.stats.moderate}, poor=${data.stats.poor}`);
+  console.log("✅ GDOP heatmap rendered successfully");
+}
+
+function toggleGdopHeatmap() {
+  gdopVisible = !gdopVisible;
+  const btn = document.getElementById("gdop-toggle");
+  const statsPanel = document.getElementById("coverage-stats");
+  btn.classList.toggle("active", gdopVisible);
+
+  if (gdopVisible) {
+    gdopLayer.addTo(map);
+
+    if (gdopStats) {
+      // Data already loaded
+      if (statsPanel) statsPanel.style.display = "block";
+    } else {
+      // Show loading message
+      if (statsPanel) {
+        statsPanel.style.display = "block";
+        statsPanel.innerHTML = `
+          <div class="panel-title">GDOP Coverage</div>
+          <div style="font-size:.72rem;color:#8b949e;padding:10px 0;text-align:center">
+            ⏳ Computing heatmap...<br>
+            <span style="font-size:.65rem;color:#6e7681">
+              Requires ≥3 sensors<br>
+              Updates every 60s
+            </span>
+          </div>
+        `;
+      }
+      console.log("GDOP heatmap: waiting for first data (updates every 60s)");
+    }
+  } else {
+    map.removeLayer(gdopLayer);
+    if (statsPanel) statsPanel.style.display = "none";
+  }
+}
+
+function updateCoverageStats() {
+  const panel = document.getElementById("coverage-stats");
+  if (!panel || !gdopStats) return;
+
+  const total = gdopStats.total_points;
+  if (total === 0) return;
+
+  const pct = (count) => ((count / total) * 100).toFixed(1);
+
+  panel.innerHTML = `
+    <div class="panel-title">GDOP Coverage</div>
+    <div style="font-size:.72rem;line-height:1.6;color:#8b949e">
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="color:#22c55e">● Excellent (&lt;2.0)</span>
+        <span style="color:#c9d1d9">${pct(gdopStats.excellent)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="color:#84cc16">● Good (2.0-5.0)</span>
+        <span style="color:#c9d1d9">${pct(gdopStats.good)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="color:#eab308">● Moderate (5.0-10.0)</span>
+        <span style="color:#c9d1d9">${pct(gdopStats.moderate)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="color:#f97316">● Poor (10.0-20.0)</span>
+        <span style="color:#c9d1d9">${pct(gdopStats.poor)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="color:#ef4444">● Unacceptable (≥20.0)</span>
+        <span style="color:#c9d1d9">${pct(gdopStats.unacceptable)}%</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px;padding-top:4px;border-top:1px solid #30363d">
+        <span>Mean GDOP</span>
+        <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
+      </div>
+    </div>
+  `;
 }
 
 // ─── Sensor health chart (time-series) ───────────────────────────────────────
@@ -812,18 +1042,36 @@ function updateTopology(clockData) {
       });
 
       // Tooltip with full stats
+      const offsetStr = (sensor.offset_ns != null) ? sensor.offset_ns.toFixed(1) : "—";
+      const driftStr = (sensor.drift_ns_per_s != null) ? sensor.drift_ns_per_s.toFixed(3) : "—";
+      const uncertaintyStr = (sensor.uncertainty_ns != null) ? sensor.uncertainty_ns.toFixed(1) : "—";
+
       let tooltipHtml = `<b>Sensor ${sensor.sensor_id}</b><br>` +
-        `Offset: ${sensor.offset_ns.toFixed(1)} ns<br>` +
-        `Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s<br>` +
-        `Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns<br>` +
-        `Status: ${sensor.status.toUpperCase()}`;
+        `Offset: ${offsetStr} ns<br>` +
+        `Drift: ${driftStr} ns/s<br>` +
+        `Uncertainty: ±${uncertaintyStr} ns<br>` +
+        `Status: ${sensor.status ? sensor.status.toUpperCase() : 'UNKNOWN'}`;
 
       if (sensor.allan_deviation) {
         const ad = sensor.allan_deviation;
+
+        // Null-safe formatting matching updateGdopHeatmap pattern
+        const adev1sStr = (ad.adev_1s != null && Number.isFinite(ad.adev_1s))
+          ? ad.adev_1s.toFixed(1)
+          : "—";
+
+        const adev60sStr = (ad.adev_60s != null && Number.isFinite(ad.adev_60s))
+          ? ad.adev_60s.toFixed(1)
+          : "—";
+
+        const classStr = ad.oscillator_class
+          ? ad.oscillator_class.replace(/_/g, ' ')
+          : "Unknown";
+
         tooltipHtml += `<br><br><b>Allan Deviation:</b><br>` +
-          `ADEV(1s): ${ad.adev_1s.toFixed(1)} ns<br>` +
-          `ADEV(60s): ${ad.adev_60s.toFixed(1)} ns<br>` +
-          `Class: ${ad.oscillator_class.replace(/_/g, ' ')}`;
+          `ADEV(1s): ${adev1sStr} ns<br>` +
+          `ADEV(60s): ${adev60sStr} ns<br>` +
+          `Class: ${classStr}`;
       }
 
       circle.bindTooltip(tooltipHtml, { permanent: false });
@@ -941,6 +1189,10 @@ function connect() {
     } else if (msg.type === "clock_sync_global") {
       // Phase 4: Process global clock sync with topology + analytics
       processClockSyncGlobal(msg);
+    } else if (msg.type === "gdop_heatmap") {
+      // GDOP airspace coverage heatmap
+      console.log("WebSocket message: gdop_heatmap received");
+      updateGdopHeatmap(msg);
     } else {
       // aircraft state update
       updateAircraft(msg);

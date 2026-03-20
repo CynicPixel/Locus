@@ -779,6 +779,7 @@ dependencies = [
  "hex",
  "levenberg-marquardt",
  "nalgebra",
+ "rayon",
  "reqwest",
  "rustc-hash",
  "serde",

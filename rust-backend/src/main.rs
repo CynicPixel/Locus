@@ -3,6 +3,7 @@ mod anomaly_client;
 mod clock_sync;
 mod coords;
 mod correlator;
+mod gdop_heatmap;
 mod global_clock_solver;
 mod ingestor;
 mod kalman;
@@ -115,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---- spawn GDOP heatmap background task -------------------------------
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
+
     // ---- pipeline state --------------------------------------------------
     let mut correlator = Correlator::new();
     let mut clock_sync = ClockSyncEngine::new();
@@ -137,7 +141,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
     let mut health_tick =
         tokio::time::interval(Duration::from_secs(HEALTH_BROADCAST_SECS));
+    let mut heatmap_tick =
+        tokio::time::interval(Duration::from_secs(60));
     let mut frame_count: u64 = 0;
+    let mut last_sensor_count: usize = 0;
+    let mut first_heatmap_triggered = false;
 
     // ---- main event loop -------------------------------------------------
     loop {
@@ -259,6 +267,60 @@ async fn main() -> anyhow::Result<()> {
                         }).collect::<Vec<_>>(),
                     });
                     let _ = ws_tx.send(global_msg.to_string());
+                }
+            }
+
+            _ = heatmap_tick.tick() => {
+                // GDOP heatmap: compute theoretical coverage quality field.
+                // Triggers every 60s OR on significant sensor topology change.
+                tracing::debug!("GDOP heatmap tick fired");
+
+                let sensors_lock = sensor_registry.read().await;
+                let sensor_ecef: Vec<Vector3<f64>> = sensors_lock
+                    .export_wgs84()
+                    .iter()
+                    .map(|s| {
+                        let (x, y, z) = crate::coords::wgs84_to_ecef(s.lat, s.lon, s.alt_m);
+                        Vector3::new(x, y, z)
+                    })
+                    .collect();
+                let count = sensor_ecef.len();
+                drop(sensors_lock);
+
+                tracing::debug!(count, last_sensor_count, "checking sensor count");
+
+                // Only recompute if significant topology change (>20% sensor count change)
+                let change_ratio = if last_sensor_count > 0 {
+                    (count as f64 - last_sensor_count as f64).abs() / last_sensor_count as f64
+                } else {
+                    1.0
+                };
+
+                let should_compute = count >= 3 && (
+                    change_ratio > 0.2
+                    || last_sensor_count == 0
+                    || (!first_heatmap_triggered && count >= 3)  // Immediate first computation
+                );
+
+                if should_compute {
+                    tracing::info!(
+                        num_sensors = count,
+                        change_ratio,
+                        first_run = !first_heatmap_triggered,
+                        "triggering GDOP heatmap computation"
+                    );
+
+                    let _ = heatmap_tx.try_send(gdop_heatmap::HeatmapRequest::Compute {
+                        sensor_ecef,
+                        bounds: None,  // Auto-compute from sensors
+                        resolution_deg: 0.1,
+                        altitude_m: 9144.0,  // FL300
+                    });
+
+                    last_sensor_count = count;
+                    first_heatmap_triggered = true;  // Mark as triggered
+                } else {
+                    tracing::debug!(count, change_ratio, "GDOP heatmap skipped");
                 }
             }
 
