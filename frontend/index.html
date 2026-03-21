@@ -78,16 +78,26 @@
   #clock-panel-header .clock-title { flex: 1; }
   #clock-panel-rms { font-size: .72rem; font-weight: 700; }
   #clock-panel-body { padding: 8px 10px 10px; }
-  #clock-panel-body canvas { width: 100% !important; height: 150px !important; }
-  #clock-sensor-dots {
-    display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
-    margin-top: 8px; padding-top: 6px; border-top: 1px solid #21262d;
+  #clock-chart-row { display: flex; gap: 8px; align-items: flex-start; }
+  #clock-chart-row canvas { flex: 1; min-width: 0; height: 150px !important; }
+  #clock-legend-panel {
+    width: 72px; flex-shrink: 0; display: flex; flex-direction: column;
+    justify-content: flex-start; gap: 1px;
   }
   #status-bar {
     padding: 5px 14px; font-size: .72rem; color: #8b949e;
     border-top: 1px solid #30363d; display: flex; justify-content: space-between;
     flex-shrink: 0;
   }
+  /* ─── Network health indicator ─────────────────────────────────────────── */
+  #net-status {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 16px 6px; font-size: .72rem;
+    background: #1c2128; border-bottom: 1px solid #30363d; flex-shrink: 0;
+  }
+  #net-status .net-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  #net-status .net-label { font-weight: 700; letter-spacing: .05em; }
+  #net-status .net-count { color: #8b949e; margin-left: auto; font-size: .68rem; }
   /* Sensor toggle button */
   #sensor-toggle {
     position: absolute; top: 80px; right: 10px; z-index: 1000;
@@ -102,15 +112,6 @@
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
     font-weight: 600;
   }
-  /* GDOP quality legend */
-  #gdop-legend {
-    position: absolute; top: 202px; right: 10px; z-index: 1000;
-    background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 6px;
-    padding: 8px 10px; font-size: .72rem; color: #c9d1d9; min-width: 136px;
-  }
-  #gdop-legend .legend-dot {
-    display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
-  }
   /* GDOP heatmap toggle button */
   #gdop-toggle {
     position: absolute; top: 160px; right: 10px; z-index: 1000;
@@ -118,6 +119,24 @@
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
   }
   #gdop-toggle.active { background: #7c3aed; border-color: #a78bfa; color: #fff; }
+  /* ─── Floating aircraft color legend ───────────────────────────────────── */
+  #marker-legend {
+    position: absolute; top: 202px; right: 10px; z-index: 1000;
+    background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 6px;
+    font-size: .72rem; color: #c9d1d9; min-width: 156px;
+  }
+  #marker-legend-header {
+    display: flex; align-items: center; gap: 4px;
+    padding: 5px 8px 5px 10px; cursor: default;
+  }
+  #marker-legend-title {
+    flex: 1; font-weight: 600; font-size: .68rem;
+    letter-spacing: .06em; color: #8b949e; text-transform: uppercase;
+  }
+  #marker-legend-body { padding: 6px 10px 8px; }
+  .mlgd-row { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+  .mlgd-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .mlgd-sep { border-top: 1px solid #30363d; margin: 5px 0; }
   /* Aircraft popup panel */
   #ac-popup {
     display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
@@ -149,15 +168,25 @@
   <div id="map">
     <button id="sensor-toggle" onclick="toggleSensors()">&#128225; Sensors</button>
     <button id="mode-toggle" onclick="toggleDisplayMode()">&#128994; MLAT</button>
-    <div id="gdop-legend">
-      <div style="font-weight:600;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e">GDOP Quality</div>
-      <div><span class="legend-dot" style="background:#22c55e"></span>&lt; 2 &nbsp;Excellent</div>
-      <div><span class="legend-dot" style="background:#14b8a6"></span>2 – 5 &nbsp;Good</div>
-      <div><span class="legend-dot" style="background:#eab308"></span>5 – 10 Fair</div>
-      <div><span class="legend-dot" style="background:#f97316"></span>&gt; 10 Poor</div>
-      <div style="margin-top:5px;color:#6b7280;font-size:.64rem;line-height:1.3">Lower GDOP = better sensor geometry = more accurate fix</div>
-    </div>
     <button id="gdop-toggle" onclick="toggleGdopHeatmap()">&#127758; GDOP</button>
+
+    <!-- Floating minimizable aircraft color legend -->
+    <div id="marker-legend" style="display:none">
+      <div id="marker-legend-header">
+        <span id="marker-legend-title">Aircraft Colors</span>
+        <button class="collapse-btn" id="marker-legend-toggle" onclick="toggleMarkerLegend()">&#8963;</button>
+      </div>
+      <div class="panel-body" id="marker-legend-body">
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#22c55e"></span><span>Excellent GDOP &lt;2</span></div>
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#14b8a6"></span><span>Good GDOP 2–5</span></div>
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#eab308"></span><span>Fair GDOP 5–10</span></div>
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#f97316"></span><span>Poor GDOP &gt;10</span></div>
+        <div class="mlgd-sep"></div>
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#ef4444"></span><span>Anomaly detected</span></div>
+        <div class="mlgd-row"><span class="mlgd-dot" style="background:#f59e0b"></span><span>Spoof flag</span></div>
+        <div style="margin-top:5px;color:#6e7681;font-size:.63rem;line-height:1.3">Lower GDOP = better fix accuracy</div>
+      </div>
+    </div>
 
     <!-- Global Clock Sync floating panel (top-left) -->
     <div id="clock-panel">
@@ -168,8 +197,10 @@
         <button class="collapse-btn" id="clock-panel-toggle" onclick="toggleClockPanel()">&#8963;</button>
       </div>
       <div id="clock-panel-body" class="panel-body">
-        <canvas id="health-chart"></canvas>
-        <div id="clock-sensor-dots"></div>
+        <div id="clock-chart-row">
+          <canvas id="health-chart"></canvas>
+          <div id="clock-legend-panel"></div>
+        </div>
       </div>
     </div>
 
@@ -187,6 +218,11 @@
       <span class="dot" id="conn-dot" style="background:#8b949e"></span>
       Locus MLAT
     </header>
+    <div id="net-status">
+      <span class="net-dot" id="net-dot" style="background:#6e7681"></span>
+      <span class="net-label" id="net-label" style="color:#6e7681">OFFLINE</span>
+      <span class="net-count" id="net-count">0 / 0 sensors</span>
+    </div>
 
     <!-- Alerts panel (collapsible) -->
     <div class="panel" id="alerts-panel">
@@ -221,15 +257,15 @@
     </div>
     <div id="aircraft-list"></div>
 
-    <!-- GDOP Coverage Stats (collapsible, visible only when GDOP heatmap active) -->
-    <div class="panel" id="coverage-stats" style="display:none;">
+    <!-- Heatmap Coverage: unified color key + live stats (visible only when GDOP heatmap active) -->
+    <div class="panel" id="heatmap-coverage" style="display:none;">
       <div class="panel-header">
-        <span class="panel-title" style="margin-bottom:0">Coverage Stats
-          <span class="info-icon" data-tip="Geometric Dilution of Precision airspace coverage breakdown. Lower GDOP = better sensor geometry.">i</span>
+        <span class="panel-title" style="margin-bottom:0">Heatmap Coverage
+          <span class="info-icon" data-tip="GDOP color key and live airspace coverage breakdown. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
         </span>
-        <button class="collapse-btn" id="coverage-toggle" onclick="togglePanel('coverage-body','coverage-toggle')">&#8963;</button>
+        <button class="collapse-btn" id="heatmap-coverage-toggle" onclick="togglePanel('heatmap-coverage-body','heatmap-coverage-toggle')">&#8963;</button>
       </div>
-      <div class="panel-body" id="coverage-body"></div>
+      <div class="panel-body" id="heatmap-coverage-body"></div>
     </div>
 
     <div id="status-bar">
@@ -271,7 +307,7 @@ const IDLE_WARNING_MS = 60_000;   // show red triangle after 60 s idle
 const REMOVE_MS       = 300_000;  // hard-remove after 5 min
 let sensorsVisible    = false;
 const sensorMarkers   = {};       // sensor_id → L.marker
-const sensorData      = {};       // sensor_id → { lat, lon, alt_m, offsets[] }
+const sensorData      = {};       // sensor_id → { lat, lon, alt_m, status, offset_ns, uncertainty_ns, inSolve }
 let selectedIcao      = null;
 let attributionLines  = [];       // active L.polyline[] for sensor highlight
 
@@ -357,12 +393,13 @@ function makeIdleIcon(color) {
   });
 }
 
-function makeSensorIcon() {
+function makeSensorIcon(color) {
+  const c = color || "#60a5fa";
   return L.divIcon({
     className: "",
     html: `<svg width="20" height="24" viewBox="0 0 20 24">
-             <rect x="9" y="12" width="2" height="10" fill="#60a5fa"/>
-             <polygon points="10,2 4,13 16,13" fill="#60a5fa" stroke="#1e3a5f" stroke-width="1"/>
+             <rect x="9" y="12" width="2" height="10" fill="${c}"/>
+             <polygon points="10,2 4,13 16,13" fill="${c}" stroke="#1e3a5f" stroke-width="1"/>
            </svg>`,
     iconSize: [20, 24], iconAnchor: [10, 22],
   });
@@ -625,19 +662,18 @@ function toggleSensors() {
 // ─── Display mode toggle ──────────────────────────────────────────────────────
 function toggleDisplayMode() {
   displayMode = displayMode === "mlat" ? "adsb" : "mlat";
-  const btn    = document.getElementById("mode-toggle");
-  const legend = document.getElementById("gdop-legend");
+  const btn = document.getElementById("mode-toggle");
 
   if (displayMode === "mlat") {
     btn.style.background   = "#6b21a8";
     btn.style.borderColor  = "#7c3aed";
     btn.innerHTML          = "&#128994; MLAT";
-    legend.style.display   = "block";
+    document.getElementById("marker-legend").style.display = "block";
   } else {
     btn.style.background   = "#1d4ed8";
     btn.style.borderColor  = "#2563eb";
     btn.innerHTML          = "&#128998; ADS-B";
-    legend.style.display   = "none";
+    document.getElementById("marker-legend").style.display = "none";
   }
 
   // Reapply visibility and recolor every tracked aircraft
@@ -659,28 +695,49 @@ function toggleDisplayMode() {
   scheduleRenderList();
 }
 
-function createSensorMarker(id, sd) {
-  // Build offset table rows for pairs that include this sensor
-  const offsets = (sd.offsets || []).map(o => {
-    const peer = o.sensor_i == id ? o.sensor_j : o.sensor_i;
-    const converged = o.is_converged ? "&#10003;" : "&#8987;";
-    const ns = o.offset_ns.toFixed(1) + " ns";
-    return `<tr><td>${peer}</td><td>${ns}</td><td>${converged}</td></tr>`;
-  }).join("");
+function buildSensorPopupHtml(id, sd) {
+  const status      = sd.status || "unknown";
+  const statusColor = sensorStatusColor(status);
+  const offsetStr   = (sd.offset_ns != null) ? sd.offset_ns.toFixed(1) + " ns" : "—";
+  const uncertStr   = (sd.uncertainty_ns != null) ? "\u00b1" + sd.uncertainty_ns.toFixed(1) + " ns" : "—";
+  const inSolveStr  = sd.inSolve ? "Yes" : "No";
 
-  const popupHtml = `
-    <div style="font-family:monospace;font-size:.8rem;color:#c9d1d9;min-width:180px">
-      <b>Sensor ${id}</b><br>
-      ${sd.lat?.toFixed(5)}° ${sd.lon?.toFixed(5)}°<br>
+  // [PAIRWISE DISABLED] const offsets = (sd.offsets || []).map(o => { ... }).join("");
+
+  return `
+    <div style="font-family:monospace;font-size:.8rem;color:#c9d1d9;min-width:200px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <b>Sensor ${id}</b>
+        <span style="background:${statusColor};color:#000;font-size:.65rem;font-weight:700;padding:1px 5px;border-radius:8px">${status.toUpperCase()}</span>
+      </div>
+      ${sd.lat?.toFixed(5)}&deg; ${sd.lon?.toFixed(5)}&deg;<br>
       Alt: ${Math.round(sd.alt_m ?? 0)} m<br>
-      ${offsets ? `<table style="width:100%;margin-top:4px;border-collapse:collapse">
-        <tr><th>Peer</th><th>Offset</th><th></th></tr>${offsets}</table>` : "<em>No clock pairs yet</em>"}
+      <table style="width:100%;margin-top:4px;border-collapse:collapse;line-height:1.6">
+        <tr><td style="color:#8b949e">Clock offset</td><td style="text-align:right">${offsetStr}</td></tr>
+        <tr><td style="color:#8b949e">Uncertainty</td><td style="text-align:right">${uncertStr}</td></tr>
+        <tr><td style="color:#8b949e">In clock solve</td>
+            <td style="text-align:right;color:${sd.inSolve ? '#22c55e' : '#6e7681'}">${inSolveStr}</td></tr>
+      </table>
+      <!-- [PAIRWISE DISABLED] per-peer offset table removed -->
     </div>`;
+}
 
-  const marker = L.marker([sd.lat, sd.lon], { icon: makeSensorIcon() })
-    .bindPopup(popupHtml)
+function createSensorMarker(id, sd) {
+  if (sd.lat == null || sd.lon == null) return;
+  const color  = sensorStatusColor(sd.status);
+  const marker = L.marker([sd.lat, sd.lon], { icon: makeSensorIcon(color) })
+    .bindPopup(buildSensorPopupHtml(id, sd))
     .addTo(map);
   sensorMarkers[id] = marker;
+}
+
+function refreshSensorMarkerPopup(id) {
+  const marker = sensorMarkers[id];
+  const sd     = sensorData[id];
+  if (!marker || !sd) return;
+  if (marker.isPopupOpen()) {
+    marker.setPopupContent(buildSensorPopupHtml(id, sd));
+  }
 }
 
 // ─── GDOP Heatmap ─────────────────────────────────────────────────────────────
@@ -758,19 +815,16 @@ function updateGdopHeatmap(data) {
 
   if (!data.points || data.points.length === 0) {
 
-    // Show "no coverage" message if layer is visible
+    // Show color key + no-data warning if layer is visible
     if (gdopVisible) {
-      const statsPanel = document.getElementById("coverage-stats");
-      const body = document.getElementById("coverage-body");
-      if (statsPanel) statsPanel.style.display = "block";
-      if (body) body.innerHTML = `
-        <div style="font-size:.72rem;color:#f59e0b;padding:10px 0;text-align:center">
-          ⚠️ No coverage data<br>
-          <span style="font-size:.65rem;color:#6e7681">
-            Requires ≥3 active sensors
-          </span>
-        </div>
-      `;
+      const panel = document.getElementById("heatmap-coverage");
+      if (panel) panel.style.display = "block";
+      updateCoverageStats();
+      const body = document.getElementById("heatmap-coverage-body");
+      if (body) body.innerHTML += `
+        <div style="font-size:.72rem;color:#f59e0b;padding:6px 0;text-align:center;border-top:1px solid #30363d;margin-top:4px">
+          No coverage data &mdash; requires ≥3 active sensors
+        </div>`;
     }
     return;
   }
@@ -803,79 +857,109 @@ function updateGdopHeatmap(data) {
 
 function toggleGdopHeatmap() {
   gdopVisible = !gdopVisible;
-  const btn = document.getElementById("gdop-toggle");
-  const statsPanel = document.getElementById("coverage-stats");
+  const btn   = document.getElementById("gdop-toggle");
+  const panel = document.getElementById("heatmap-coverage");
   btn.classList.toggle("active", gdopVisible);
 
   if (gdopVisible) {
     gdopLayer.addTo(map);
-
-    if (gdopStats) {
-      // Data already loaded
-      if (statsPanel) statsPanel.style.display = "block";
-      updateCoverageStats();
-    } else {
-      // Show loading message
-      if (statsPanel) {
-        statsPanel.style.display = "block";
-        const body = document.getElementById("coverage-body");
-        if (body) body.innerHTML = `
-          <div style="font-size:.72rem;color:#8b949e;padding:10px 0;text-align:center">
-            ⏳ Computing heatmap...<br>
-            <span style="font-size:.65rem;color:#6e7681">
-              Requires ≥3 sensors<br>
-              Updates every 60s
-            </span>
-          </div>
-        `;
-      }
+    if (panel) panel.style.display = "block";
+    updateCoverageStats(); // renders color key immediately; stats section when data is ready
+    if (!gdopStats) {
+      const body = document.getElementById("heatmap-coverage-body");
+      if (body) body.innerHTML += `
+        <div style="font-size:.72rem;color:#8b949e;padding:6px 0;text-align:center;border-top:1px solid #30363d;margin-top:4px">
+          ⏳ Awaiting first heatmap update&hellip;<br>
+          <span style="font-size:.63rem;color:#6e7681">Updates every 60s</span>
+        </div>`;
     }
   } else {
     map.removeLayer(gdopLayer);
-    if (statsPanel) statsPanel.style.display = "none";
+    if (panel) panel.style.display = "none";
   }
 }
 
 function updateCoverageStats() {
-  const body = document.getElementById("coverage-body");
-  if (!body || !gdopStats) return;
+  const body = document.getElementById("heatmap-coverage-body");
+  if (!body) return;
 
-  const total = gdopStats.total_points;
-  if (total === 0) return;
+  // Color key — always rendered, matches heatmap qualityOrder tiers
+  const keyRows = [
+    { color: "#22c55e", label: "Excellent",    range: "< 2.0"   },
+    { color: "#84cc16", label: "Good",         range: "2 – 5"   },
+    { color: "#eab308", label: "Moderate",     range: "5 – 10"  },
+    { color: "#f97316", label: "Poor",         range: "10 – 20" },
+    { color: "#ef4444", label: "Unacceptable", range: "≥ 20"    },
+    { color: "#18181b", label: "No data",      range: "—", border: true },
+  ];
 
-  const pct = (count) => ((count / total) * 100).toFixed(1);
+  const keyHtml = keyRows.map(r => `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+      <span>
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${r.color};margin-right:6px;vertical-align:middle${r.border ? ';border:1px solid #30363d' : ''}"></span>
+        <span style="color:#c9d1d9">${r.label}</span>
+      </span>
+      <span style="color:#6e7681;font-size:.68rem">${r.range}</span>
+    </div>`).join('');
 
-  body.innerHTML = `
-    <div style="font-size:.72rem;line-height:1.6;color:#8b949e;padding-top:4px">
-      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
-        <span style="color:#22c55e">● Excellent (&lt;2.0)</span>
-        <span style="color:#c9d1d9">${pct(gdopStats.excellent)}%</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
-        <span style="color:#84cc16">● Good (2.0-5.0)</span>
-        <span style="color:#c9d1d9">${pct(gdopStats.good)}%</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
-        <span style="color:#eab308">● Moderate (5.0-10.0)</span>
-        <span style="color:#c9d1d9">${pct(gdopStats.moderate)}%</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
-        <span style="color:#f97316">● Poor (10.0-20.0)</span>
-        <span style="color:#c9d1d9">${pct(gdopStats.poor)}%</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
-        <span style="color:#ef4444">● Unacceptable (≥20.0)</span>
-        <span style="color:#c9d1d9">${pct(gdopStats.unacceptable)}%</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-top:6px;padding-top:4px;border-top:1px solid #30363d">
-        <span>Mean GDOP</span>
-        <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
-      </div>
-    </div>
-  `;
+  // Live stats — only shown when server has sent heatmap data
+  let statsHtml = '';
+  if (gdopStats && gdopStats.total_points > 0) {
+    const pct = (count) => ((count / gdopStats.total_points) * 100).toFixed(1);
+    const statRows = [
+      { color: "#22c55e", label: "Excellent",    value: pct(gdopStats.excellent)    },
+      { color: "#84cc16", label: "Good",         value: pct(gdopStats.good)         },
+      { color: "#eab308", label: "Moderate",     value: pct(gdopStats.moderate)     },
+      { color: "#f97316", label: "Poor",         value: pct(gdopStats.poor)         },
+      { color: "#ef4444", label: "Unacceptable", value: pct(gdopStats.unacceptable) },
+    ];
+    statsHtml = `
+      <div style="margin-top:8px;padding-top:6px;border-top:1px solid #30363d">
+        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.06em;color:#6e7681;margin-bottom:4px">Airspace breakdown</div>
+        ${statRows.map(r => `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
+          <span style="color:${r.color}">● ${r.label}</span>
+          <span style="color:#c9d1d9">${r.value}%</span>
+        </div>`).join('')}
+        <div style="display:flex;justify-content:space-between;margin-top:4px;padding-top:4px;border-top:1px solid #21262d">
+          <span style="color:#8b949e">Mean GDOP</span>
+          <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
+        </div>
+      </div>`;
+  }
+
+  body.innerHTML = `<div style="font-size:.72rem;line-height:1.6;padding-top:4px">${keyHtml}${statsHtml}</div>`;
 }
 
 // ─── Sensor health chart (time-series) ───────────────────────────────────────
+// Fixed identity colors per sensor — line color never changes regardless of status
+const SENSOR_PALETTE = [
+  "#60a5fa", // blue     S1
+  "#a78bfa", // purple   S2
+  "#34d399", // emerald  S3
+  "#f472b6", // pink     S4
+  "#fb923c", // orange   S5
+  "#facc15", // yellow   S6
+  "#22d3ee", // cyan     S7
+  "#e879f9", // fuchsia  S8
+];
+
+// Status → per-point dot color (reflects stability at that exact timestamp)
+function statusDotColor(status) {
+  if (status === "stable")   return "#22c55e"; // green
+  if (status === "marginal") return "#f59e0b"; // amber
+  if (status === "unstable") return "#ef4444"; // red
+  return "#6e7681";                            // gray (disconnected / unknown)
+}
+
+// Status → sensor map icon / network health color
+function sensorStatusColor(status) {
+  if (status === "stable")   return "#22c55e";
+  if (status === "marginal") return "#f59e0b";
+  if (status === "unstable") return "#ef4444";
+  return "#6e7681"; // disconnected / unknown
+}
+
 const healthData = { labels: [], datasets: [] };
 const MAX_CHART_POINTS = 60; // 60 data points at 5s intervals = 5 minutes
 
@@ -888,42 +972,42 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
     plugins: {
-      legend: {
-        display: true,
-        position: 'bottom',
-        labels: {
-          color: "#8b949e",
-          font: { size: 9 },
-          boxWidth: 12,
-          usePointStyle: true
-        }
-      },
+      legend: { display: false },
       tooltip: {
         mode: 'index',
         intersect: false,
+        backgroundColor: '#1c2128',
+        borderColor: '#30363d',
+        borderWidth: 1,
+        padding: { top: 8, bottom: 8, left: 12, right: 14 },
+        titleColor: '#8b949e',
+        bodyColor: '#c9d1d9',
+        titleFont:  { family: 'monospace', size: 11 },
+        bodyFont:   { family: 'monospace', size: 11 },
+        boxWidth: 10,
+        boxHeight: 10,
         callbacks: {
+          title: (items) => items[0]?.label ?? "",
           label: (context) => {
             const sensorId = context.dataset.sensorId;
-            const offset = context.parsed.y;
-            if (!sensorId) return `${offset.toFixed(1)} ns`;
+            const offset   = context.parsed.y;
+            if (!sensorId) return ` ${offset.toFixed(1)} ns`;
 
             const sensor = context.dataset.latestSensor;
-            if (!sensor) return `S${sensorId}: ${offset.toFixed(1)} ns`;
+            if (!sensor) return ` S${sensorId}: ${offset.toFixed(1)} ns`;
 
-            let lines = [
-              `S${sensorId}: ${offset.toFixed(1)} ns`,
-              `  Drift: ${sensor.drift_ns_per_s.toFixed(3)} ns/s`,
-              `  Uncertainty: ±${sensor.uncertainty_ns.toFixed(1)} ns`,
-              `  Status: ${sensor.status.toUpperCase()}`
-            ];
-
-            if (sensor.allan_deviation) {
-              const ad = sensor.allan_deviation;
-              lines.push(`  ADEV(60s): ${ad.adev_60s.toFixed(1)} ns`);
-            }
-
-            return lines;
-          }
+            const sign   = offset >= 0 ? "+" : "";
+            const uncert = sensor.uncertainty_ns != null ? ` ±${sensor.uncertainty_ns.toFixed(1)}` : "";
+            const status = sensor.status ? `  ${sensor.status.toUpperCase()}` : "";
+            return ` S${sensorId}  ${sign}${offset.toFixed(1)} ns${uncert}${status}`;
+          },
+          // Swatch color matches sensor's identity line color
+          labelColor: (context) => ({
+            borderColor: context.dataset.paletteColor || "#8b949e",
+            backgroundColor: context.dataset.paletteColor || "#8b949e",
+            borderWidth: 2,
+            borderRadius: 2,
+          })
         }
       }
     },
@@ -954,105 +1038,72 @@ const healthChart = new Chart(document.getElementById("health-chart"), {
 function updateSensorHealthChart(clockData) {
   if (!clockData || !clockData.sensors) return;
 
-  // Add new timestamp to labels
-  const timestamp = new Date().toLocaleTimeString();
-  healthData.labels.push(timestamp);
-  if (healthData.labels.length > MAX_CHART_POINTS) {
-    healthData.labels.shift();
-  }
+  // Add timestamp label
+  healthData.labels.push(new Date().toLocaleTimeString());
+  if (healthData.labels.length > MAX_CHART_POINTS) healthData.labels.shift();
 
-  // Track which sensors we've seen in this update
   const seenSensors = new Set();
 
-  // Update or create dataset for each sensor
   for (const sensor of clockData.sensors) {
     seenSensors.add(sensor.sensor_id);
 
-    // Find existing dataset for this sensor
     let dataset = healthData.datasets.find(ds => ds.sensorId === sensor.sensor_id);
 
     if (!dataset) {
-      // Create new dataset for this sensor
-      // Color by status
-      let color = "#6e7681"; // Disconnected
-      if (sensor.status === "stable") color = "#22c55e";
-      else if (sensor.status === "marginal") color = "#f59e0b";
-      else if (sensor.status === "unstable") color = "#ef4444";
-
-      // Backfill with nulls for previous time points
+      // First time seeing this sensor — assign a fixed palette color (identity)
+      const paletteIndex = healthData.datasets.length;
+      const paletteColor = SENSOR_PALETTE[paletteIndex % SENSOR_PALETTE.length];
       const backfill = new Array(healthData.labels.length - 1).fill(null);
 
       dataset = {
         label: `S${sensor.sensor_id}`,
         sensorId: sensor.sensor_id,
+        paletteColor,               // fixed identity color — never changes
         data: backfill,
-        borderColor: color,
-        backgroundColor: color,
+        borderColor: paletteColor,
+        backgroundColor: paletteColor + "18",
         borderWidth: 2,
-        pointRadius: 2,
-        pointHoverRadius: 4,
-        tension: 0.1,
-        latestSensor: sensor
+        pointRadius: 0,             // no dots — clean lines only
+        pointHoverRadius: 3,        // subtle hover indicator
+        tension: 0.3,
+        latestSensor: sensor,
       };
       healthData.datasets.push(dataset);
     } else {
-      // Update existing dataset
+      // Existing sensor — update metadata only, never mutate borderColor
       dataset.latestSensor = sensor;
-
-      // Update color based on current status
-      let color = "#6e7681";
-      if (sensor.status === "stable") color = "#22c55e";
-      else if (sensor.status === "marginal") color = "#f59e0b";
-      else if (sensor.status === "unstable") color = "#ef4444";
-      dataset.borderColor = color;
-      dataset.backgroundColor = color;
     }
 
-    // Add new data point (raw nanoseconds)
+    // Append new data point
     dataset.data.push(sensor.offset_ns);
-
-    // Trim old data points
-    if (dataset.data.length > MAX_CHART_POINTS) {
-      dataset.data.shift();
-    }
+    if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
   }
 
-  // For sensors not in this update, add null to maintain alignment
+  // Null-pad sensors absent from this update (maintains time alignment)
   for (const dataset of healthData.datasets) {
     if (!seenSensors.has(dataset.sensorId)) {
       dataset.data.push(null);
-      if (dataset.data.length > MAX_CHART_POINTS) {
-        dataset.data.shift();
-      }
+      if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
     }
   }
 
   healthChart.update();
 }
 
-function updateSensorHealth(offsets, sensors) {
-  // Upsert sensorData from sensors array
-  if (sensors) {
-    for (const s of sensors) {
-      sensorData[s.sensor_id] = { ...sensorData[s.sensor_id], ...s, offsets: [] };
-    }
-  }
-  // Attach offset info to each sensor
-  for (const o of offsets) {
-    if (sensorData[o.sensor_i]) {
-      sensorData[o.sensor_i].offsets = [...(sensorData[o.sensor_i].offsets || []), o];
-    }
-    if (sensorData[o.sensor_j]) {
-      sensorData[o.sensor_j].offsets = [...(sensorData[o.sensor_j].offsets || []), o];
-    }
-  }
-
-  // Chart is fed exclusively via clock_sync_global → updateSensorHealthChart()
-  // to avoid label duplication from dual message paths.
-
-  // Refresh popup idle strip if aircraft selected
-  if (selectedIcao) refreshPopupIdleStrip();
-}
+// [PAIRWISE DISABLED] updateSensorHealth handled pairwise sensor_health messages.
+// sensorData is now populated exclusively via processClockSyncGlobal (clock_sync_global).
+// function updateSensorHealth(offsets, sensors) {
+//   if (sensors) {
+//     for (const s of sensors) {
+//       sensorData[s.sensor_id] = { ...sensorData[s.sensor_id], ...s, offsets: [] };
+//     }
+//   }
+//   for (const o of offsets) {
+//     if (sensorData[o.sensor_i]) sensorData[o.sensor_i].offsets = [...(sensorData[o.sensor_i].offsets || []), o];
+//     if (sensorData[o.sensor_j]) sensorData[o.sensor_j].offsets = [...(sensorData[o.sensor_j].offsets || []), o];
+//   }
+//   if (selectedIcao) refreshPopupIdleStrip();
+// }
 
 // ─── Aircraft click popup ─────────────────────────────────────────────────────
 function openPopup(icao24) {
@@ -1165,9 +1216,10 @@ function drawAttributionLines(icao24) {
 function clearAttributionLines() {
   for (const l of attributionLines) map.removeLayer(l);
   attributionLines = [];
-  // Reset all sensor marker colors
-  for (const m of Object.values(sensorMarkers)) {
-    m.getElement()?.querySelector("polygon")?.setAttribute("fill", "#60a5fa");
+  // Reset all sensor marker icons to their current status color
+  for (const [id, m] of Object.entries(sensorMarkers)) {
+    const status = sensorData[id]?.status;
+    m.setIcon(makeSensorIcon(sensorStatusColor(status)));
   }
 }
 
@@ -1327,14 +1379,44 @@ function renderStabilityAlerts() {
 let prevSensorStatuses = {};
 
 function processClockSyncGlobal(clockData) {
-  // Update topology visualization
   updateTopology(clockData);
+
+  // ── Sync status into sensorData + update map marker colors ───────────────
+  const seenInSolve = new Set();
+
+  if (clockData.sensors) {
+    for (const sensor of clockData.sensors) {
+      seenInSolve.add(sensor.sensor_id);
+
+      if (!sensorData[sensor.sensor_id]) sensorData[sensor.sensor_id] = {};
+      sensorData[sensor.sensor_id].status         = sensor.status;
+      sensorData[sensor.sensor_id].offset_ns      = sensor.offset_ns;
+      sensorData[sensor.sensor_id].uncertainty_ns = sensor.uncertainty_ns;
+      sensorData[sensor.sensor_id].inSolve        = true;
+
+      if (sensorMarkers[sensor.sensor_id]) {
+        sensorMarkers[sensor.sensor_id].setIcon(makeSensorIcon(sensorStatusColor(sensor.status)));
+        refreshSensorMarkerPopup(sensor.sensor_id);
+      }
+    }
+  }
+
+  // Mark sensors absent from this solve as disconnected
+  for (const id of Object.keys(sensorData)) {
+    if (!seenInSolve.has(Number(id)) && !seenInSolve.has(id)) {
+      sensorData[id].status  = "disconnected";
+      sensorData[id].inSolve = false;
+      if (sensorMarkers[id]) {
+        sensorMarkers[id].setIcon(makeSensorIcon(sensorStatusColor("disconnected")));
+      }
+    }
+  }
 
   // Detect sensor status changes and generate alerts
   if (clockData.sensors) {
     for (const sensor of clockData.sensors) {
       const prevStatus = prevSensorStatuses[sensor.sensor_id];
-      const newStatus = sensor.status;
+      const newStatus  = sensor.status;
 
       if (prevStatus !== newStatus) {
         if (newStatus === "unstable") {
@@ -1350,17 +1432,14 @@ function processClockSyncGlobal(clockData) {
           addStabilityAlert("info", `Sensor ${sensor.sensor_id} → STABLE`);
         }
       }
-
       prevSensorStatuses[sensor.sensor_id] = newStatus;
     }
   }
 
-  // System-level health alert
   if (clockData.condition_number > 1e7) {
     addStabilityAlert("warning", `System ill-conditioned (κ=${clockData.condition_number.toExponential(1)})`);
   }
 
-  // Update chart with enhanced tooltips
   updateSensorHealthChart(clockData);
   updateClockPanelHeader(clockData);
 }
@@ -1374,6 +1453,14 @@ function togglePanel(bodyId, btnId) {
   btn.innerHTML = isCollapsed ? "&#8964;" : "&#8963;"; // ⌄ / ⌃
 }
 
+// ─── Marker legend toggle ─────────────────────────────────────────────────────
+let markerLegendCollapsed = false;
+function toggleMarkerLegend() {
+  markerLegendCollapsed = !markerLegendCollapsed;
+  document.getElementById("marker-legend-body").classList.toggle("collapsed", markerLegendCollapsed);
+  document.getElementById("marker-legend-toggle").innerHTML = markerLegendCollapsed ? "&#8964;" : "&#8963;";
+}
+
 // ─── Clock panel toggle ───────────────────────────────────────────────────────
 let clockPanelCollapsed = false;
 function toggleClockPanel() {
@@ -1383,6 +1470,36 @@ function toggleClockPanel() {
 }
 
 // ─── Clock panel live stats ───────────────────────────────────────────────────
+// ─── Network health indicator ─────────────────────────────────────────────────
+function updateNetworkHealth(sensors) {
+  const dotEl   = document.getElementById("net-dot");
+  const labelEl = document.getElementById("net-label");
+  const countEl = document.getElementById("net-count");
+  if (!dotEl || !labelEl || !countEl) return;
+
+  if (!sensors || sensors.length === 0) {
+    dotEl.style.background = "#6e7681";
+    labelEl.textContent    = "OFFLINE";
+    labelEl.style.color    = "#6e7681";
+    countEl.textContent    = "0 / 0 sensors";
+    return;
+  }
+
+  const total  = sensors.length;
+  const stable = sensors.filter(s => s.status === "stable").length;
+  const active = sensors.filter(s => s.status === "stable" || s.status === "marginal").length;
+
+  let color, label;
+  if (stable >= 3)      { color = "#22c55e"; label = "OPERATIONAL"; }
+  else if (active >= 1) { color = "#f59e0b"; label = "DEGRADED";    }
+  else                  { color = "#ef4444"; label = "OFFLINE";      }
+
+  dotEl.style.background = color;
+  labelEl.textContent    = label;
+  labelEl.style.color    = color;
+  countEl.textContent    = `${active} / ${total} sensors`;
+}
+
 function updateClockPanelHeader(clockData) {
   if (!clockData) return;
   const rms = clockData.global_rms_ns;
@@ -1392,18 +1509,26 @@ function updateClockPanelHeader(clockData) {
     el.style.color = rms < 50 ? "#22c55e" : rms < 100 ? "#f59e0b" : "#ef4444";
   }
   updateClockSensorDots(clockData.sensors);
+  updateNetworkHealth(clockData.sensors);
 }
 
 function updateClockSensorDots(sensors) {
-  const el = document.getElementById("clock-sensor-dots");
+  const el = document.getElementById("clock-legend-panel");
   if (!el || !sensors) return;
   el.innerHTML = sensors.map(s => {
-    const c = s.status === "stable"   ? "#22c55e"
-            : s.status === "marginal" ? "#f59e0b"
-            : s.status === "unstable" ? "#ef4444"
-            :                           "#6e7681";
-    return `<span title="S${s.sensor_id}: ${s.status}" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-right:3px"></span>`
-         + `<span style="font-size:.65rem;color:#6e7681;margin-right:6px">S${s.sensor_id}</span>`;
+    const ds = healthData.datasets.find(d => d.sensorId === s.sensor_id);
+    const lineColor = ds?.paletteColor || "#8b949e";
+    const statusColor = s.status === "stable"   ? "#22c55e"
+                      : s.status === "marginal" ? "#f59e0b"
+                      : s.status === "unstable" ? "#ef4444" : "#6e7681";
+    const statusLabel = s.status === "stable"   ? "OK"
+                      : s.status === "marginal" ? "MGRL"
+                      : s.status === "unstable" ? "UNST" : "—";
+    return `<div title="S${s.sensor_id}: ${s.status}" style="display:flex;align-items:center;gap:4px;padding:3px 0;border-bottom:1px solid #21262d">
+      <span style="display:inline-block;width:14px;height:2px;background:${lineColor};flex-shrink:0;border-radius:1px"></span>
+      <span style="font-size:.65rem;color:#c9d1d9;font-family:monospace;flex:1;line-height:1">S${s.sensor_id}</span>
+      <span style="font-size:.58rem;font-weight:700;color:${statusColor};line-height:1">${statusLabel}</span>
+    </div>`;
   }).join('');
 }
 
@@ -1429,8 +1554,24 @@ function connect() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
 
+    // sensor_health: seed sensorData with lat/lon/alt from sensor registry.
+    // Pairwise offsets remain disabled — only geographic position is extracted here.
     if (msg.type === "sensor_health") {
-      updateSensorHealth(Array.isArray(msg.offsets) ? msg.offsets : [], msg.sensors);
+      if (Array.isArray(msg.sensors)) {
+        for (const s of msg.sensors) {
+          if (!sensorData[s.sensor_id]) sensorData[s.sensor_id] = {};
+          sensorData[s.sensor_id].lat   = s.lat;
+          sensorData[s.sensor_id].lon   = s.lon;
+          sensorData[s.sensor_id].alt_m = s.alt_m;
+        }
+        if (sensorsVisible) {
+          for (const [id, sd] of Object.entries(sensorData)) {
+            if (!sensorMarkers[id] && sd.lat != null && sd.lon != null) {
+              createSensorMarker(id, sd);
+            }
+          }
+        }
+      }
     } else if (msg.type === "clock_sync_global") {
       // Phase 4: Process global clock sync with topology + analytics
       processClockSyncGlobal(msg);
