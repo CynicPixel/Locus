@@ -53,13 +53,29 @@
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
   }
   #sensor-toggle.active { background: #1a7f37; border-color: #22c55e; color: #fff; }
+  /* Mode toggle button */
+  #mode-toggle {
+    position: absolute; top: 120px; right: 10px; z-index: 1000;
+    background: #6b21a8; color: #fff; border: 1px solid #7c3aed;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
+    font-weight: 600;
+  }
+  /* GDOP quality legend */
+  #gdop-legend {
+    position: absolute; top: 163px; right: 10px; z-index: 1000;
+    background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 6px;
+    padding: 8px 10px; font-size: .72rem; color: #c9d1d9; min-width: 136px;
+  }
+  #gdop-legend .legend-dot {
+    display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;
+  }
   /* Aircraft popup panel */
   #ac-popup {
     display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
     background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 12px 14px; min-width: 260px; max-width: 320px; font-size: .82rem;
+    padding: 12px 14px; min-width: 260px; max-width: 340px; font-size: .82rem;
   }
-  #ac-popup .popup-title { font-weight: 700; font-family: monospace; font-size: .95rem; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  #ac-popup .popup-title { font-weight: 700; font-family: monospace; font-size: .95rem; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
   #ac-popup table { width: 100%; border-collapse: collapse; }
   #ac-popup td { padding: 2px 4px; color: #8b949e; }
   #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
@@ -70,6 +86,15 @@
 <div id="layout">
   <div id="map">
     <button id="sensor-toggle" onclick="toggleSensors()">&#128225; Sensors</button>
+    <button id="mode-toggle" onclick="toggleDisplayMode()">&#128994; MLAT</button>
+    <div id="gdop-legend">
+      <div style="font-weight:600;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e">GDOP Quality</div>
+      <div><span class="legend-dot" style="background:#22c55e"></span>&lt; 2 &nbsp;Excellent</div>
+      <div><span class="legend-dot" style="background:#14b8a6"></span>2 – 5 &nbsp;Good</div>
+      <div><span class="legend-dot" style="background:#eab308"></span>5 – 10 Fair</div>
+      <div><span class="legend-dot" style="background:#f97316"></span>&gt; 10 Poor</div>
+      <div style="margin-top:5px;color:#6b7280;font-size:.64rem;line-height:1.3">Lower GDOP = better sensor geometry = more accurate fix</div>
+    </div>
     <div id="ac-popup">
       <div class="popup-title">
         <span id="popup-icao">—</span>
@@ -132,13 +157,50 @@ const sensorData      = {};       // sensor_id → { lat, lon, alt_m, offsets[] 
 let selectedIcao      = null;
 let attributionLines  = [];       // active L.polyline[] for sensor highlight
 
+// ─── Display mode ─────────────────────────────────────────────────────────────
+let displayMode = "mlat"; // "mlat" | "adsb"
+
+// GDOP quality tiers for MLAT positions
+// Returns null for ADS-B (gdop === 0)
+function gdopTier(gdop) {
+  if (!gdop || gdop === 0) return null;
+  if (gdop < 2)  return { tier: 1, label: "Excellent", color: "#22c55e", style: "background:#1a7f37;color:#fff" };
+  if (gdop < 5)  return { tier: 2, label: "Good",      color: "#14b8a6", style: "background:#0f766e;color:#fff" };
+  if (gdop < 10) return { tier: 3, label: "Fair",      color: "#eab308", style: "background:#854d0e;color:#fef08a" };
+  return           { tier: 4, label: "Poor",     color: "#f97316", style: "background:#7c2d12;color:#fed7aa" };
+}
+
+// Whether to show this aircraft in the current mode
+function aircraftVisible(state) {
+  return displayMode === "mlat" ? state.gdop > 0 : state.gdop === 0;
+}
+
+// Add or remove an aircraft's marker + ellipse from the map without deleting state
+function setAircraftMapVisibility(icao24, visible) {
+  const ac = aircraft[icao24];
+  if (!ac) return;
+  if (visible) {
+    if (!map.hasLayer(ac.marker)) ac.marker.addTo(map);
+    if (ac.ellipse && !map.hasLayer(ac.ellipse)) ac.ellipse.addTo(map);
+  } else {
+    if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
+    if (ac.ellipse && map.hasLayer(ac.ellipse)) map.removeLayer(ac.ellipse);
+  }
+}
+
 const MAX_TRAIL_POINTS = 300;
 const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
 let trailPolylines = [];  // active L.polyline[] for the selected trail
 
+// ─── Marker color ─────────────────────────────────────────────────────────────
+// Priority: anomaly > spoof > GDOP tier (MLAT mode) > default green
 function markerColor(state) {
-  if (state.anomaly_label === "anomalous") return "#ef4444";
-  if (state.spoof_flag)          return "#f59e0b";
+  if (state.anomaly_label === "anomalous" && state.anomaly_confidence > 0.75) return "#ef4444";
+  if (state.spoof_flag) return "#f59e0b";
+  if (displayMode === "mlat" && state.gdop > 0) {
+    const tier = gdopTier(state.gdop);
+    if (tier) return tier.color;
+  }
   return "#22c55e";
 }
 
@@ -220,7 +282,9 @@ function flushTrailSource(icao24) {
     if (p1.spoof_flag || (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)) {
       color = "#ef4444";
     } else if (p1.gdop > 0) {
-      color = "#60a5fa";
+      // MLAT trail — color by GDOP tier
+      const tier = gdopTier(p1.gdop);
+      color = tier ? tier.color : "#60a5fa";
     } else {
       color = "#94a3b8";
       dashArray = "4 4";
@@ -240,48 +304,65 @@ function clearTrailSource() {
 }
 
 // ─── Aircraft update ──────────────────────────────────────────────────────────
+function ellipseFillOpacity(state) {
+  if (state.gdop === 0) return 0.06;
+  const tier = gdopTier(state.gdop);
+  return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
+}
+
 function updateAircraft(state) {
-  const { icao24, lat, lon, alt_m, anomaly_label, spoof_flag } = state;
+  const { icao24, lat, lon, anomaly_label, spoof_flag } = state;
   if (lat == null || lon == null) return;
   if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
   if (lat === 0 && lon === 0) return;
 
   const color = markerColor(state);
   const pos = [lat, lon];
+  const visible = aircraftVisible(state);
+  const fillOpacity = ellipseFillOpacity(state);
 
   if (!aircraft[icao24]) {
     const marker = L.marker(pos, { icon: makeIcon(color) })
-      .bindTooltip(icao24, { permanent: false, direction: "top" })
-      .addTo(map);
+      .bindTooltip(icao24, { permanent: false, direction: "top" });
     marker.on("click", () => focusAircraft(icao24));
-    const ellipse = L.circle(pos, { radius: Math.max(state.confidence_ellipse_m || 200, 100),
-      color, fillColor: color, fillOpacity: 0.08, weight: 1 }).addTo(map);
+    const ellipse = L.circle(pos, {
+      radius: Math.max(state.confidence_ellipse_m || 200, 100),
+      color, fillColor: color, fillOpacity, weight: 1
+    });
     aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now(), idle: false };
+    if (visible) {
+      marker.addTo(map);
+      ellipse.addTo(map);
+    }
     pushTrailPoint(icao24, state);
     if (selectedIcao === icao24) flushTrailSource(icao24);
   } else {
     const ac = aircraft[icao24];
-    ac.marker.setLatLng(pos).setIcon(makeIcon(color));
-    ac.ellipse.setLatLng(pos)
-      .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
-      .setStyle({ color, fillColor: color });
+    if (visible) {
+      ac.marker.setLatLng(pos).setIcon(makeIcon(color));
+      ac.ellipse.setLatLng(pos)
+        .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
+        .setStyle({ color, fillColor: color, fillOpacity });
+    }
+    setAircraftMapVisibility(icao24, visible);
     ac.lastSeen = Date.now();
     ac.state = state;
-    // Clear idle state on fresh update
     if (ac.idle) {
       ac.idle = false;
-      ac.marker.setIcon(makeIcon(color));
+      if (visible) ac.marker.setIcon(makeIcon(color));
     }
     pushTrailPoint(icao24, state);
     if (selectedIcao === icao24) flushTrailSource(icao24);
   }
 
+  // Close popup if this aircraft is no longer visible in current mode
+  if (selectedIcao === icao24 && !visible) closePopup();
+
   renderList();
 
   if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
 
-  // Refresh popup if this is the selected aircraft
-  if (selectedIcao === icao24) {
+  if (selectedIcao === icao24 && visible) {
     refreshPopup();
     drawAttributionLines(icao24);
   }
@@ -301,18 +382,28 @@ function addAlert(state) {
 
 function focusAircraft(icao24) {
   const ac = aircraft[icao24];
-  if (ac) {
-    map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
-    openPopup(icao24);
-  }
+  if (!ac || !aircraftVisible(ac.state)) return;
+  map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
+  openPopup(icao24);
 }
 
 function renderList() {
   const list = document.getElementById("aircraft-list");
   const sorted = Object.entries(aircraft)
+    .filter(([, ac]) => aircraftVisible(ac.state))
     .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
 
   list.innerHTML = "";
+
+  if (sorted.length === 0) {
+    const hint = document.createElement("div");
+    hint.style.cssText = "padding:14px;color:#6b7280;font-size:.78rem;line-height:1.5";
+    hint.textContent = displayMode === "mlat"
+      ? "No MLAT-positioned aircraft — waiting for 3+ sensor correlation."
+      : "No ADS-B-positioned aircraft in current stream.";
+    list.appendChild(hint);
+  }
+
   for (const [icao, ac] of sorted) {
     const s = ac.state;
     const row = document.createElement("div");
@@ -330,10 +421,19 @@ function renderList() {
     const idleBadge = ac.idle
       ? `<span class="badge badge-idle">IDLE</span>` : "";
 
+    // Show GDOP tier badge for Fair (3) and Poor (4) only — Excellent/Good are clean
+    let gdopBadge = "";
+    if (displayMode === "mlat" && s.gdop > 0) {
+      const tier = gdopTier(s.gdop);
+      if (tier && tier.tier >= 3) {
+        gdopBadge = `<span class="badge" style="${tier.style}" title="GDOP ${s.gdop.toFixed(1)} — lower is better">&#9651; ${tier.label}</span>`;
+      }
+    }
+
     row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
       <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
-      ${badge}${spoofBadge}${idleBadge}`;
+      ${badge}${spoofBadge}${gdopBadge}${idleBadge}`;
     list.appendChild(row);
   }
   document.getElementById("ac-count").textContent = sorted.length;
@@ -346,8 +446,8 @@ setInterval(() => {
   for (const [icao, ac] of Object.entries(aircraft)) {
     const age = now - ac.lastSeen;
     if (age > REMOVE_MS) {
-      map.removeLayer(ac.marker);
-      map.removeLayer(ac.ellipse);
+      if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
+      if (ac.ellipse && map.hasLayer(ac.ellipse)) map.removeLayer(ac.ellipse);
       if (selectedIcao === icao) {
         clearTrailSource();
         closePopup();
@@ -359,7 +459,9 @@ setInterval(() => {
     if (shouldBeIdle !== ac.idle) {
       ac.idle = shouldBeIdle;
       const color = markerColor(ac.state);
-      ac.marker.setIcon(shouldBeIdle ? makeIdleIcon(color) : makeIcon(color));
+      if (aircraftVisible(ac.state)) {
+        ac.marker.setIcon(shouldBeIdle ? makeIdleIcon(color) : makeIcon(color));
+      }
     }
   }
   renderList();
@@ -378,6 +480,43 @@ function toggleSensors() {
     for (const m of Object.values(sensorMarkers)) map.removeLayer(m);
     for (const k of Object.keys(sensorMarkers)) delete sensorMarkers[k];
   }
+}
+
+// ─── Display mode toggle ──────────────────────────────────────────────────────
+function toggleDisplayMode() {
+  displayMode = displayMode === "mlat" ? "adsb" : "mlat";
+  const btn    = document.getElementById("mode-toggle");
+  const legend = document.getElementById("gdop-legend");
+
+  if (displayMode === "mlat") {
+    btn.style.background   = "#6b21a8";
+    btn.style.borderColor  = "#7c3aed";
+    btn.innerHTML          = "&#128994; MLAT";
+    legend.style.display   = "block";
+  } else {
+    btn.style.background   = "#1d4ed8";
+    btn.style.borderColor  = "#2563eb";
+    btn.innerHTML          = "&#128998; ADS-B";
+    legend.style.display   = "none";
+  }
+
+  // Reapply visibility and recolor every tracked aircraft
+  for (const [icao, ac] of Object.entries(aircraft)) {
+    const visible = aircraftVisible(ac.state);
+    setAircraftMapVisibility(icao, visible);
+    if (visible) {
+      const color = markerColor(ac.state);
+      ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color));
+      if (ac.ellipse) {
+        ac.ellipse.setStyle({ color, fillColor: color, fillOpacity: ellipseFillOpacity(ac.state) });
+      }
+    }
+  }
+
+  // Close popup if selected aircraft is not visible in new mode
+  if (selectedIcao && !aircraftVisible(aircraft[selectedIcao]?.state)) closePopup();
+
+  renderList();
 }
 
 function createSensorMarker(id, sd) {
@@ -487,10 +626,19 @@ function refreshPopup() {
   const ac = aircraft[selectedIcao];
   const s = ac.state;
   const age = Date.now() - ac.lastSeen;
+
+  // Source badge + GDOP tier badge
   const isAdsb = s.gdop === 0;
-  const srcBadge = isAdsb
-    ? `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`
-    : `<span class="badge" style="background:#6b21a8;color:#fff">MLAT</span>`;
+  let srcBadge;
+  if (isAdsb) {
+    srcBadge = `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`;
+  } else {
+    const tier = gdopTier(s.gdop);
+    const tierBadge = tier && tier.tier >= 3
+      ? ` <span class="badge" style="${tier.style}" title="Geometric Dilution of Precision — lower is better">&#9651; GDOP ${tier.label}</span>`
+      : "";
+    srcBadge = `<span class="badge" style="background:#6b21a8;color:#fff">MLAT</span>${tierBadge}`;
+  }
   document.getElementById("popup-icao").innerHTML = `${s.icao24.toUpperCase()} ${srcBadge}`;
 
   const speedKts = Math.sqrt((s.vel_lat || 0) ** 2 + (s.vel_lon || 0) ** 2) * 111000 * 1.944;
@@ -501,11 +649,22 @@ function refreshPopup() {
   const durationStr = durationMs < 60000
     ? `${Math.round(durationMs / 1000)}s`
     : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
+
+  // GDOP row — show numeric + tier label for MLAT, N/A for ADS-B
+  const gdopCell = (() => {
+    if (s.gdop === 0) return "N/A (ADS-B)";
+    const tier = gdopTier(s.gdop);
+    const tierHtml = tier
+      ? ` <span style="${tier.style};padding:1px 5px;border-radius:8px;font-size:.68rem">${tier.label}</span>`
+      : "";
+    return `${s.gdop.toFixed(2)}${tierHtml}`;
+  })();
+
   const rows = [
     ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
     ["Speed", `${speedKts.toFixed(0)} kts`],
     ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
-    ["GDOP", s.gdop > 0 ? s.gdop.toFixed(2) : "N/A (ADS-B)"],
+    ["GDOP", gdopCell],
     ["Accuracy", `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
     ["Sensors", s.sensor_count],
     ["Anomaly", `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`],

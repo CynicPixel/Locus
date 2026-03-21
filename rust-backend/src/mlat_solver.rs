@@ -459,9 +459,8 @@ pub fn solve(
         jtj_inv.trace().sqrt()
     };
 
-    let gdop_threshold = 10.0;
-    if !gdop.is_finite() || gdop > gdop_threshold {
-        tracing::debug!(gdop, "MLAT solution discarded — GDOP exceeds threshold");
+    if !gdop.is_finite() {
+        tracing::debug!(gdop, "MLAT solution discarded — non-finite GDOP");
         return None;
     }
 
