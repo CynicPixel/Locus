@@ -100,6 +100,15 @@ pub struct GdopGrid {
     pub altitude_m: f64,
     pub points: Vec<GdopPoint>,
     pub stats: CoverageStats,
+    /// Planning mode indicator: "live" (real sensors only) or "planning" (real + virtual)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Count of real sensors used in computation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_sensor_count: Option<usize>,
+    /// Count of virtual sensors used in computation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_sensor_count: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +185,9 @@ impl GdopHeatmapEngine {
             altitude_m,
             points,
             stats,
+            mode: None,
+            real_sensor_count: None,
+            virtual_sensor_count: None,
         }
     }
 
@@ -358,6 +370,68 @@ impl GdopHeatmapEngine {
             median_gdop,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Sensor Support
+// ---------------------------------------------------------------------------
+
+/// Merge real + virtual sensors for GDOP computation.
+///
+/// Combines ECEF positions from production sensor registry with per-client
+/// virtual sensors for planning mode GDOP calculation.
+pub fn merge_sensor_positions(
+    real_sensors: &crate::sensors::SensorRegistry,
+    virtual_sensors: &crate::virtual_sensors::VirtualSensorRegistry,
+) -> Vec<Vector3<f64>> {
+    let mut positions = real_sensors.all_ecef();
+    positions.extend(virtual_sensors.get_ecef_positions());
+    positions
+}
+
+/// Compute GDOP grid with hybrid sensor topology (real + virtual).
+///
+/// # Parameters
+/// - `real_sensors`: Production sensor registry
+/// - `virtual_sensors`: Per-client virtual sensor registry
+/// - `altitude_m`: Grid altitude (meters MSL)
+/// - `resolution_deg`: Grid resolution (degrees)
+///
+/// # Returns
+/// `Ok(GdopGrid)` with planning mode metadata, or `Err` if insufficient sensors.
+pub fn compute_grid_with_virtual(
+    real_sensors: &crate::sensors::SensorRegistry,
+    virtual_sensors: &crate::virtual_sensors::VirtualSensorRegistry,
+    altitude_m: f64,
+    resolution_deg: f64,
+) -> Result<GdopGrid, String> {
+    let sensor_positions = merge_sensor_positions(real_sensors, virtual_sensors);
+    let real_count = real_sensors.all_ecef().len();
+    let virtual_count = virtual_sensors.count();
+
+    if sensor_positions.len() < 3 {
+        return Err(format!(
+            "Insufficient sensors: {} real + {} virtual = {} total (need ≥3)",
+            real_count,
+            virtual_count,
+            sensor_positions.len()
+        ));
+    }
+
+    // Reuse existing parallel computation engine
+    let mut grid = GdopHeatmapEngine::compute_grid(
+        &sensor_positions,
+        None,  // Auto-compute bounds
+        resolution_deg,
+        altitude_m,
+    );
+
+    // Add planning mode metadata
+    grid.mode = Some("planning".to_string());
+    grid.real_sensor_count = Some(real_count);
+    grid.virtual_sensor_count = Some(virtual_count);
+
+    Ok(grid)
 }
 
 // ---------------------------------------------------------------------------

@@ -49,6 +49,9 @@ clap = { version = "4", features = ["derive"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+[dev-dependencies]
+approx = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = true

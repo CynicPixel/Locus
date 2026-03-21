@@ -10,6 +10,7 @@ mod kalman;
 mod mlat_solver;
 mod sensors;
 mod spoof_detector;
+mod virtual_sensors;
 mod ws_server;
 
 use std::sync::Arc;
@@ -105,12 +106,18 @@ async fn main() -> anyhow::Result<()> {
     // ---- spawn ingestor (connects to Go Unix socket) ----------------------
     let _ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
 
+    // ---- pipeline state --------------------------------------------------
+    let mut correlator = Correlator::new();
+    let mut clock_sync = ClockSyncEngine::new();
+    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
+
     // ---- spawn WebSocket server -------------------------------------------
     {
         let ws_tx2 = ws_tx.clone();
         let addr = cli.ws_addr.clone();
+        let registry_clone = sensor_registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2).await {
+            if let Err(e) = ws_server::run_ws_server(addr, registry_clone, ws_tx2).await {
                 tracing::error!("WS server error: {e}");
             }
         });
@@ -118,11 +125,6 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- spawn GDOP heatmap background task -------------------------------
     let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
-
-    // ---- pipeline state --------------------------------------------------
-    let mut correlator = Correlator::new();
-    let mut clock_sync = ClockSyncEngine::new();
-    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
     let mut adsb_parser = AdsbParser::new();
