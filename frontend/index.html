@@ -148,6 +148,9 @@
   #ac-popup td { padding: 2px 4px; color: #8b949e; }
   #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
   #ac-popup .idle-strip { margin-top: 8px; background: #7f1d1d; color: #fca5a5; border-radius: 4px; padding: 4px 8px; font-size: .75rem; display: none; }
+  /* Aircraft map callsign label */
+  .ac-label { background: transparent !important; border: none !important; box-shadow: none !important;
+    color: #c9d1d9; font-size: 10px; font-family: monospace; padding: 0 !important; white-space: nowrap; }
   /* Stability alerts panel */
   .alert-critical { color: #ef4444; font-weight: 600; }
   .alert-warning { color: #f59e0b; }
@@ -260,8 +263,8 @@
     <!-- Heatmap Coverage: unified color key + live stats (visible only when GDOP heatmap active) -->
     <div class="panel" id="heatmap-coverage" style="display:none;">
       <div class="panel-header">
-        <span class="panel-title" style="margin-bottom:0">Heatmap Coverage
-          <span class="info-icon" data-tip="GDOP color key and live airspace coverage breakdown. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
+        <span class="panel-title" style="margin-bottom:0">GDOP Coverage
+          <span class="info-icon" data-tip="Each tier shows its GDOP range and the % of monitored airspace at that quality. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
         </span>
         <button class="collapse-btn" id="heatmap-coverage-toggle" onclick="togglePanel('heatmap-coverage-body','heatmap-coverage-toggle')">&#8963;</button>
       </div>
@@ -489,8 +492,9 @@ function updateAircraft(state) {
   const fillOpacity = ellipseFillOpacity(state);
 
   if (!aircraft[icao24]) {
+    const tooltipLabel = state.callsign ? `${state.callsign} (${icao24.toUpperCase()})` : icao24.toUpperCase();
     const marker = L.marker(pos, { icon: makeIcon(color) })
-      .bindTooltip(icao24, { permanent: false, direction: "top" });
+      .bindTooltip(tooltipLabel, { permanent: false, direction: "top" });
     marker.on("click", () => focusAircraft(icao24));
     const ellipse = L.circle(pos, {
       radius: Math.max(state.confidence_ellipse_m || 200, 100),
@@ -514,6 +518,9 @@ function updateAircraft(state) {
     setAircraftMapVisibility(icao24, visible);
     ac.lastSeen = Date.now();
     ac.state = state;
+    // Update hover tooltip with callsign when enrichment arrives.
+    const newLabel = state.callsign ? `${state.callsign} (${icao24.toUpperCase()})` : icao24.toUpperCase();
+    ac.marker.getTooltip()?.setContent(newLabel);
     if (ac.idle) {
       ac.idle = false;
       if (visible) ac.marker.setIcon(makeIcon(color));
@@ -883,52 +890,50 @@ function updateCoverageStats() {
   const body = document.getElementById("heatmap-coverage-body");
   if (!body) return;
 
-  // Color key — always rendered, matches heatmap qualityOrder tiers
-  const keyRows = [
-    { color: "#22c55e", label: "Excellent",    range: "< 2.0"   },
-    { color: "#84cc16", label: "Good",         range: "2 – 5"   },
-    { color: "#eab308", label: "Moderate",     range: "5 – 10"  },
-    { color: "#f97316", label: "Poor",         range: "10 – 20" },
-    { color: "#ef4444", label: "Unacceptable", range: "≥ 20"    },
-    { color: "#18181b", label: "No data",      range: "—", border: true },
+  // Merged color key + coverage% in one compact table.
+  const tiers = [
+    { color: "#22c55e", label: "Excellent",    range: "< 2",   key: "excellent"    },
+    { color: "#84cc16", label: "Good",         range: "2–5",   key: "good"         },
+    { color: "#eab308", label: "Moderate",     range: "5–10",  key: "moderate"     },
+    { color: "#f97316", label: "Poor",         range: "10–20", key: "poor"         },
+    { color: "#ef4444", label: "Unacceptable", range: "≥ 20",  key: "unacceptable" },
   ];
 
-  const keyHtml = keyRows.map(r => `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
-      <span>
-        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${r.color};margin-right:6px;vertical-align:middle${r.border ? ';border:1px solid #30363d' : ''}"></span>
-        <span style="color:#c9d1d9">${r.label}</span>
-      </span>
-      <span style="color:#6e7681;font-size:.68rem">${r.range}</span>
+  const hasStats = gdopStats && gdopStats.total_points > 0;
+  const pct = (key) => hasStats
+    ? `<span style="color:#c9d1d9">${((gdopStats[key] / gdopStats.total_points) * 100).toFixed(1)}%</span>`
+    : `<span style="color:#30363d">—</span>`;
+
+  const rows = tiers.map(t => `
+    <div style="display:grid;grid-template-columns:10px 1fr auto auto;align-items:center;gap:5px;margin-bottom:2px">
+      <span style="width:8px;height:8px;border-radius:50%;background:${t.color};display:inline-block"></span>
+      <span style="color:#c9d1d9">${t.label}</span>
+      <span style="color:#6e7681;font-size:.66rem;text-align:right">${t.range}</span>
+      <span style="min-width:36px;text-align:right;font-size:.72rem">${pct(t.key)}</span>
     </div>`).join('');
 
-  // Live stats — only shown when server has sent heatmap data
-  let statsHtml = '';
-  if (gdopStats && gdopStats.total_points > 0) {
-    const pct = (count) => ((count / gdopStats.total_points) * 100).toFixed(1);
-    const statRows = [
-      { color: "#22c55e", label: "Excellent",    value: pct(gdopStats.excellent)    },
-      { color: "#84cc16", label: "Good",         value: pct(gdopStats.good)         },
-      { color: "#eab308", label: "Moderate",     value: pct(gdopStats.moderate)     },
-      { color: "#f97316", label: "Poor",         value: pct(gdopStats.poor)         },
-      { color: "#ef4444", label: "Unacceptable", value: pct(gdopStats.unacceptable) },
-    ];
-    statsHtml = `
-      <div style="margin-top:8px;padding-top:6px;border-top:1px solid #30363d">
-        <div style="font-size:.65rem;text-transform:uppercase;letter-spacing:.06em;color:#6e7681;margin-bottom:4px">Airspace breakdown</div>
-        ${statRows.map(r => `
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
-          <span style="color:${r.color}">● ${r.label}</span>
-          <span style="color:#c9d1d9">${r.value}%</span>
-        </div>`).join('')}
-        <div style="display:flex;justify-content:space-between;margin-top:4px;padding-top:4px;border-top:1px solid #21262d">
-          <span style="color:#8b949e">Mean GDOP</span>
-          <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
-        </div>
-      </div>`;
-  }
+  const noDataRow = `
+    <div style="display:grid;grid-template-columns:10px 1fr auto auto;align-items:center;gap:5px;margin-bottom:2px">
+      <span style="width:8px;height:8px;border-radius:50%;background:#18181b;border:1px solid #30363d;display:inline-block"></span>
+      <span style="color:#8b949e">No data</span>
+      <span style="color:#6e7681;font-size:.66rem;text-align:right">—</span>
+      <span style="min-width:36px"></span>
+    </div>`;
 
-  body.innerHTML = `<div style="font-size:.72rem;line-height:1.6;padding-top:4px">${keyHtml}${statsHtml}</div>`;
+  const meanRow = hasStats ? `
+    <div style="display:flex;justify-content:space-between;margin-top:5px;padding-top:4px;border-top:1px solid #21262d">
+      <span style="color:#8b949e">Mean GDOP</span>
+      <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
+    </div>` : '';
+
+  const header = `<div style="display:grid;grid-template-columns:10px 1fr auto auto;gap:5px;margin-bottom:3px;padding-bottom:3px;border-bottom:1px solid #21262d">
+    <span></span>
+    <span style="color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Tier</span>
+    <span style="color:#6e7681;font-size:.65rem;text-align:right">GDOP</span>
+    <span style="color:#6e7681;font-size:.65rem;text-align:right;min-width:36px">Cover</span>
+  </div>`;
+
+  body.innerHTML = `<div style="font-size:.72rem;line-height:1.5;padding-top:4px">${header}${rows}${noDataRow}${meanRow}</div>`;
 }
 
 // ─── Sensor health chart (time-series) ───────────────────────────────────────
@@ -1153,7 +1158,13 @@ function refreshPopup() {
     return `${s.gdop.toFixed(2)}${tierHtml}`;
   })();
 
+  const enrichRows = [];
+  if (s.callsign)   enrichRows.push(["Callsign", `<b>${s.callsign}</b>`]);
+  if (s.squawk)     enrichRows.push(["Squawk",   s.squawk]);
+  if (s.on_ground != null) enrichRows.push(["On Ground", s.on_ground ? "Yes" : "No"]);
+
   const rows = [
+    ...enrichRows,
     ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
     ["Speed", `${speedKts.toFixed(0)} kts`],
     ["Heading", `${headingDeg.toFixed(0)}\u00b0`],

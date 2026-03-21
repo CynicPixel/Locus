@@ -1,8 +1,6 @@
 // WebSocket broadcast server.
 // Accepts TCP connections, upgrades to WebSocket, and fans out JSON messages.
 
-
-
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -54,6 +52,15 @@ pub struct AircraftState {
     /// Semi-MLAT DOP (only present for semi-MLAT observations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdop: Option<f64>,
+    /// Callsign from OpenSky (e.g. "BAW123"). None until enriched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callsign: Option<String>,
+    /// Transponder squawk code from OpenSky (e.g. "1000"). None until enriched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub squawk: Option<String>,
+    /// True = aircraft reported on-ground by ADS-B transponder. None if unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_ground: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
