@@ -46,6 +46,12 @@ pub struct AircraftState {
     pub is_clock_beacon: bool,
     /// How many clock-sync observations this aircraft has contributed so far.
     pub beacon_obs_count: u32,
+    /// Observation mode: "full_mlat" | "semi_mlat" | "adsb" | "prediction_only"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_mode: Option<String>,
+    /// Semi-MLAT DOP (only present for semi-MLAT observations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdop: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

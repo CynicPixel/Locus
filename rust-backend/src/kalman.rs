@@ -173,6 +173,14 @@ impl AircraftKalman {
     pub fn velocity_ms(&self) -> (f64, f64, f64) {
         (self.x[3], self.x[4], self.x[5])
     }
+
+    /// Extract Kalman prior for semi-MLAT (position + covariance).
+    pub fn get_prior(&self) -> crate::semi_mlat_solver::KalmanPrior {
+        crate::semi_mlat_solver::KalmanPrior {
+            position: Vector3::new(self.x[0], self.x[1], self.x[2]),
+            covariance: self.p.fixed_view::<3, 3>(0, 0).into_owned(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,5 +298,48 @@ impl KalmanRegistry {
             + lat_r.cos() * lon_r.sin() * vy
             + lat_r.sin() * vz;
         Some((east, north, up))
+    }
+
+    /// Get Kalman prior for semi-MLAT (if track exists).
+    pub fn get_prior(&self, icao24: &str) -> Option<crate::semi_mlat_solver::KalmanPrior> {
+        self.filters.get(icao24).map(|k| k.get_prior())
+    }
+
+    /// Update Kalman filter from semi-MLAT solution.
+    /// Identical to regular update() but logs observation mode.
+    pub fn update_from_semi_mlat(
+        &mut self,
+        icao24: &str,
+        solution: &crate::semi_mlat_solver::SemiMlatSolution,
+        now_ns: u64,
+    ) {
+        let (x_ecef, y_ecef, z_ecef) = (solution.ecef[0], solution.ecef[1], solution.ecef[2]);
+
+        let entry = self
+            .filters
+            .entry(icao24.to_string())
+            .or_insert_with(|| AircraftKalman::new(icao24.to_string(), x_ecef, y_ecef, z_ecef));
+
+        let dt = if entry.last_update_ns == 0 {
+            0.1
+        } else {
+            (now_ns.saturating_sub(entry.last_update_ns)) as f64 / 1e9
+        };
+        let dt = dt.clamp(0.0, 30.0);
+        entry.predict(dt);
+        entry.update(x_ecef, y_ecef, z_ecef, solution.accuracy_m);
+        entry.last_update_ns = now_ns;
+
+        let hist = self
+            .histories
+            .entry(icao24.to_string())
+            .or_insert_with(AircraftHistory::new);
+        hist.push(entry);
+
+        tracing::debug!(
+            icao24 = %icao24,
+            sdop = solution.sdop,
+            "Kalman updated from semi-MLAT"
+        );
     }
 }

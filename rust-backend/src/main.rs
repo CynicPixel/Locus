@@ -8,6 +8,7 @@ mod global_clock_solver;
 mod ingestor;
 mod kalman;
 mod mlat_solver;
+mod semi_mlat_solver;
 mod sensors;
 mod spoof_detector;
 mod ws_server;
@@ -361,6 +362,135 @@ fn process_frame(
 }
 
 // ---------------------------------------------------------------------------
+// Semi-MLAT solver for 2-sensor observations (requires existing Kalman track)
+// ---------------------------------------------------------------------------
+
+async fn solve_semi_mlat_and_broadcast(
+    mut group: correlator::CorrelationGroup,
+    clock_sync: &mut ClockSyncEngine,
+    sensor_registry: &SensorRegistry,
+    kalman_registry: &mut KalmanRegistry,
+    ws_tx: &BroadcastTx,
+) {
+    // Extract ICAO24 for track lookup
+    let icao24 = format!(
+        "{:02X}{:02X}{:02X}",
+        group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
+    );
+
+    // Require existing Kalman track (no cold starts from 2-sensor data)
+    let kalman_prior = match kalman_registry.get_prior(&icao24) {
+        Some(prior) => prior,
+        None => {
+            tracing::debug!(icao24 = %icao24, "2-sensor obs discarded: no existing track");
+            return;
+        }
+    };
+
+    // Apply clock corrections
+    clock_sync.apply_corrections(&mut group.frames);
+
+    // Collect sensor ECEF positions (should be exactly 2)
+    let sensor_vecs: Vec<Vector3<f64>> = group
+        .frames
+        .iter()
+        .filter_map(|f| sensor_registry.get(f.sensor_id).copied())
+        .collect();
+    if sensor_vecs.len() != 2 {
+        tracing::debug!(icao24 = %icao24, "2-sensor group corrupted (missing sensor positions)");
+        return;
+    }
+
+    // Compute TDOA (meters) relative to sensor[0]
+    let ref_ts_ns = group.frames[0].timestamp_ns() as i64;
+    let tdoa_ns = group.frames[1].timestamp_ns() as i64 - ref_ts_ns;
+    let observed_tdoa_m = tdoa_ns as f64 * C_M_PER_NS;
+
+    // TDOA variance from clock sync (or fallback to 300m if unavailable)
+    let ref_id = group.frames[0].sensor_id;
+    let other_id = group.frames[1].sensor_id;
+    let var_ns2 = clock_sync.get_pair_variance_ns2(other_id, ref_id);
+    let tdoa_variance_m2 = var_ns2 * C_M_PER_NS * C_M_PER_NS;
+
+    // Build semi-MLAT input
+    let input = semi_mlat_solver::SemiMlatInput {
+        sensor_positions: [sensor_vecs[0], sensor_vecs[1]],
+        observed_tdoa_m,
+        tdoa_variance_m2,
+        kalman_prior,
+        adsb_alt_m: None, // TODO: could extract from ADS-B parser if needed
+        alt_age_seconds: 0.0,
+    };
+
+    // Solve
+    let solution = match semi_mlat_solver::solve_semi_mlat(&input) {
+        Some(s) => s,
+        None => {
+            tracing::debug!(icao24 = %icao24, "semi-MLAT solve failed");
+            return;
+        }
+    };
+
+    tracing::debug!(
+        icao24 = %icao24,
+        sdop = solution.sdop,
+        accuracy_m = solution.accuracy_m,
+        lat = solution.lat,
+        lon = solution.lon,
+        alt_m = solution.alt_m,
+        "semi-MLAT solution"
+    );
+
+    // Update Kalman filter
+    let now_ns = group.first_seen_ns;
+    kalman_registry.update_from_semi_mlat(&icao24, &solution, now_ns);
+
+    // Get smoothed position from Kalman
+    let (lat, lon, alt_m) = kalman_registry
+        .get_wgs84(&icao24)
+        .unwrap_or((solution.lat, solution.lon, solution.alt_m));
+
+    // Velocity (ENU → deg/s for frontend)
+    let (east, north, up) = kalman_registry
+        .get_velocity_enu(&icao24, lat, lon)
+        .unwrap_or((0.0, 0.0, 0.0));
+    let cos_lat = lat.to_radians().cos().abs().max(1e-9);
+    let vel_lat = north / 111_320.0;
+    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_alt = up;
+
+    // Build AircraftState (observation_mode = "semi_mlat")
+    let sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
+    let aircraft_state = AircraftState {
+        icao24: icao24.clone(),
+        lat,
+        lon,
+        alt_m,
+        vel_lat,
+        vel_lon,
+        vel_alt,
+        gdop: 0.0, // N/A for semi-MLAT
+        confidence_ellipse_m: solution.accuracy_m,
+        spoof_flag: false, // Don't run spoof detector on semi-MLAT (lower accuracy)
+        divergence_m: 0.0, // N/A
+        anomaly_label: "unknown".to_string(), // Don't classify on semi-MLAT
+        anomaly_confidence: 0.0,
+        sensor_count: 2,
+        timestamp_ms: now_ns / 1_000_000,
+        dof: 1, // 4 residuals - 3 unknowns = 1 DOF
+        sensor_ids,
+        is_clock_beacon: false,
+        beacon_obs_count: 0,
+        observation_mode: Some("semi_mlat".to_string()), // NEW: tag observation mode
+        sdop: Some(solution.sdop), // Semi-MLAT quality metric
+    };
+
+    // Broadcast
+    let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
+    let _ = ws_tx.send(msg);
+}
+
+// ---------------------------------------------------------------------------
 // Per-group MLAT → Kalman → spoof → broadcast
 // ---------------------------------------------------------------------------
 
@@ -414,10 +544,23 @@ async fn solve_and_broadcast(
         }
     }
 
-    // MLAT still requires >= 3
-    if group.frames.len() < 3 {
+    // Branch: 2-sensor semi-MLAT vs 3+ sensor full MLAT
+    if group.frames.len() == 2 {
+        // Semi-MLAT path: requires existing Kalman track
+        solve_semi_mlat_and_broadcast(
+            group,
+            clock_sync,
+            sensor_registry,
+            kalman_registry,
+            ws_tx,
+        ).await;
+        return;
+    } else if group.frames.len() < 2 {
+        // Reject single-sensor observations (cannot constrain position)
         return;
     }
+
+    // Full MLAT path (3+ sensors) continues below...
 
     // 1. Apply clock corrections (no-op until clock sync warms up)
     clock_sync.apply_corrections(&mut group.frames);
@@ -610,6 +753,8 @@ async fn solve_and_broadcast(
         sensor_ids: sensor_ids.clone(),
         is_clock_beacon: false, // MLAT track — beacon flag carried by ADS-B broadcast
         beacon_obs_count: beacon_obs.get(&icao24).copied().unwrap_or(0),
+        observation_mode: Some("full_mlat".to_string()), // Full MLAT with 3+ sensors
+        sdop: None, // SDOP only applies to semi-MLAT
     };
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
@@ -731,6 +876,8 @@ async fn broadcast_adsb(
         sensor_ids: vec![],
         is_clock_beacon: adsb.nuc >= 6 && beacon_obs.contains_key(icao24.as_str()),
         beacon_obs_count: beacon_obs.get(icao24.as_str()).copied().unwrap_or(0),
+        observation_mode: Some("adsb".to_string()), // ADS-B source
+        sdop: None, // Not applicable for ADS-B
     };
 
     tracing::debug!(
