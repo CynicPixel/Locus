@@ -66,7 +66,7 @@
   .collapse-btn:hover { color: #c9d1d9; }
   /* ─── Clock sync floating panel ───────────────────────────────────── */
   #clock-panel {
-    position: absolute; top: 90px; left: 10px; z-index: 1000; width: 280px;
+    position: absolute; top: 90px; left: 10px; z-index: 1000; width: 400px;
     background: rgba(22,27,34,0.95); border: 1px solid #30363d;
     border-radius: 8px; font-size: .8rem; color: #c9d1d9;
     box-shadow: 0 4px 16px rgba(0,0,0,.5);
@@ -79,7 +79,7 @@
   #clock-panel-rms { font-size: .72rem; font-weight: 700; }
   #clock-panel-body { padding: 8px 10px 10px; }
   #clock-chart-row { display: flex; gap: 8px; align-items: flex-start; }
-  #clock-chart-row canvas { flex: 1; min-width: 0; height: 150px !important; }
+  #clock-chart-row canvas { flex: 1; min-width: 0; height: 180px !important; }
   #clock-legend-panel {
     width: 72px; flex-shrink: 0; display: flex; flex-direction: column;
     justify-content: flex-start; gap: 1px;
@@ -137,17 +137,29 @@
   .mlgd-row { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
   .mlgd-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
   .mlgd-sep { border-top: 1px solid #30363d; margin: 5px 0; }
-  /* Aircraft popup panel */
-  #ac-popup {
+  /* Aircraft popup — flex wrapper positions both cards */
+  #ac-popup-wrapper {
     display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
+    flex-direction: row; gap: 8px; align-items: flex-end;
+  }
+  /* Left card: identity + flight state */
+  #ac-popup {
     background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 12px 14px; min-width: 260px; max-width: 340px; font-size: .82rem;
+    padding: 12px 14px; min-width: 220px; max-width: 270px; font-size: .82rem;
   }
   #ac-popup .popup-title { font-weight: 700; font-family: monospace; font-size: .95rem; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
   #ac-popup table { width: 100%; border-collapse: collapse; }
   #ac-popup td { padding: 2px 4px; color: #8b949e; }
   #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
   #ac-popup .idle-strip { margin-top: 8px; background: #7f1d1d; color: #fca5a5; border-radius: 4px; padding: 4px 8px; font-size: .75rem; display: none; }
+  /* Right card: quality + tracking data */
+  #ac-popup-right {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 10px 12px; min-width: 160px; font-size: .82rem;
+  }
+  #ac-popup-right table { width: 100%; border-collapse: collapse; }
+  #ac-popup-right td { padding: 2px 4px; color: #8b949e; }
+  #ac-popup-right td:last-child { color: #c9d1d9; text-align: right; }
   /* Aircraft map callsign label */
   .ac-label { background: transparent !important; border: none !important; box-shadow: none !important;
     color: #c9d1d9; font-size: 10px; font-family: monospace; padding: 0 !important; white-space: nowrap; }
@@ -207,13 +219,20 @@
       </div>
     </div>
 
-    <div id="ac-popup">
-      <div class="popup-title">
-        <span id="popup-icao">—</span>
-        <span style="cursor:pointer;color:#8b949e" onclick="closePopup()">&#x2715;</span>
+    <div id="ac-popup-wrapper">
+      <!-- LEFT card: identity + flight state -->
+      <div id="ac-popup">
+        <div class="popup-title">
+          <span id="popup-icao">—</span>
+          <span style="cursor:pointer;color:#8b949e" onclick="closePopup()">&#x2715;</span>
+        </div>
+        <div class="idle-strip" id="popup-idle">&#9888; No signal for <span id="popup-idle-time"></span></div>
+        <table id="popup-table"></table>
       </div>
-      <div class="idle-strip" id="popup-idle">&#9888; No signal for <span id="popup-idle-time"></span></div>
-      <table id="popup-table"></table>
+      <!-- RIGHT card: quality + tracking data -->
+      <div id="ac-popup-right">
+        <table id="popup-table-right"></table>
+      </div>
     </div>
   </div>
   <div id="sidebar">
@@ -1114,7 +1133,7 @@ function updateSensorHealthChart(clockData) {
 function openPopup(icao24) {
   selectedIcao = icao24;
   refreshPopup();
-  document.getElementById("ac-popup").style.display = "block";
+  document.getElementById("ac-popup-wrapper").style.display = "flex";
   drawAttributionLines(icao24);
   flushTrailSource(icao24);
 }
@@ -1163,23 +1182,34 @@ function refreshPopup() {
   if (s.squawk)     enrichRows.push(["Squawk",   s.squawk]);
   if (s.on_ground != null) enrichRows.push(["On Ground", s.on_ground ? "Yes" : "No"]);
 
-  const rows = [
+  const sensorsCell = (s.calibrated_sensor_count != null && s.calibrated_sensor_count < s.sensor_count)
+    ? `${s.sensor_count} <span style="color:#f59e0b;font-size:.68rem">(${s.calibrated_sensor_count} cal)</span>`
+    : s.sensor_count;
+
+  // LEFT card: identity + flight state
+  const leftRows = [
     ...enrichRows,
-    ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
-    ["Speed", `${speedKts.toFixed(0)} kts`],
+    ["Alt",     `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
+    ["Speed",   `${speedKts.toFixed(0)} kts`],
     ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
-    ["GDOP", gdopCell],
-    ["Accuracy", `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
-    ["Sensors", s.sensor_count],
-    ["Anomaly", `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`],
-    ["Spoof", s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m div` : "No"],
-    ["DoF", s.dof],
-    ["Last seen", `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`],
-    ["Tracked", durationStr],
-    ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
   ];
   document.getElementById("popup-table").innerHTML =
-    rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+    leftRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+
+  // RIGHT card: quality + tracking
+  const rightRows = [
+    ["GDOP",      gdopCell],
+    ["Accuracy",  `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
+    ["Sensors",   sensorsCell],
+    ["Anomaly",   `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`],
+    ["Spoof",     s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m` : "No"],
+    ["DoF",       s.dof],
+    ["Last seen", `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`],
+    ["Tracked",   durationStr],
+    ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
+  ];
+  document.getElementById("popup-table-right").innerHTML =
+    rightRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
 
   refreshPopupIdleStrip(age);
 }
@@ -1197,7 +1227,7 @@ function refreshPopupIdleStrip(age) {
 
 function closePopup() {
   selectedIcao = null;
-  document.getElementById("ac-popup").style.display = "none";
+  document.getElementById("ac-popup-wrapper").style.display = "none";
   clearAttributionLines();
   clearTrailSource();
 }

@@ -46,13 +46,22 @@ const OUTLIER_MAD_THRESHOLD: f64 = 2.0;
 const MAX_IRLS_ITERATIONS: usize = 5;
 
 /// IRLS convergence threshold (relative change in weights).
-const IRLS_CONVERGENCE_THRESHOLD: f64 = 0.01;
-
-/// Regularization epsilon for numerical stability (ns²).
-const REGULARIZATION_EPSILON: f64 = 1e-6;
+/// Audit Bug #5: Relaxed from 0.01 — 0.01 was too tight, forcing extra iterations with no accuracy gain.
+const IRLS_CONVERGENCE_THRESHOLD: f64 = 0.05;
 
 /// Maximum condition number before warning.
 const MAX_CONDITION_NUMBER: f64 = 1e8;
+
+// Hysteresis thresholds for sensor status transitions (Audit Issue #8).
+// Wider gap between enter/exit thresholds prevents status flapping.
+/// Uncertainty threshold to enter Marginal from Stable (ns).
+const MARGINAL_ENTER_NS: f64 = 350.0;
+/// Uncertainty threshold to exit Marginal back to Stable (ns).
+const MARGINAL_EXIT_NS: f64 = 200.0;
+/// Uncertainty threshold to exit Unstable down to Marginal (ns).
+const UNSTABLE_EXIT_NS: f64 = 400.0;
+/// Consecutive zero-edge solves required before declaring Disconnected.
+const DISCONNECTED_COUNT: u32 = 3;
 
 /// Drift tracking window size (seconds).
 const DRIFT_WINDOW_S: f64 = 60.0;
@@ -170,8 +179,10 @@ pub enum SensorStatus {
     Marginal,
     /// High uncertainty or poorly constrained.
     Unstable,
-    /// Not connected to the graph.
+    /// Was previously connected but has lost all edges for multiple consecutive solves.
     Disconnected,
+    /// Has never participated in any solve yet (initial state).
+    Unknown,
 }
 
 /// Topology metrics for the global clock network.
@@ -432,9 +443,12 @@ fn solve_global_offsets(
         b[j] -= w * r;
     }
 
-    // Regularization: H += ε·I for numerical stability.
+    // Adaptive regularization: ε = max_diag * 1e-6, scales with problem magnitude (Audit Bug #2).
+    // Fixed 1e-6 failed on collinear sensors (diagonal << 1) and was inert on large networks.
+    let max_diag = (0..n).map(|i| h[(i, i)]).fold(0.0_f64, f64::max);
+    let epsilon = (max_diag * 1e-6).max(1e-10);
     for i in 0..n {
-        h[(i, i)] += REGULARIZATION_EPSILON;
+        h[(i, i)] += epsilon;
     }
 
     // Anchor constraint: Fix sensor 0 to zero offset (remove row/col 0).
@@ -545,7 +559,7 @@ fn solve_with_irls(
         }
 
         residuals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let mad = residuals[residuals.len() / 2].max(10.0); // Floor at 10 ns.
+        let mad = residuals[residuals.len() / 2].max(50.0); // Floor at 50 ns — GPS physical timing floor (Audit Bug #4).
 
         // Update weights with Huber loss.
         let threshold = OUTLIER_MAD_THRESHOLD * mad;
@@ -820,6 +834,10 @@ pub struct GlobalClockSolver {
     buffer: ObservationBuffer,
     drift_tracker: DriftTracker,
     cached_result: Option<SolveResult>,
+    /// Per-sensor status from the last solve — used for hysteresis (Audit Issue #8).
+    last_statuses: HashMap<i64, SensorStatus>,
+    /// Consecutive solve count with zero edges per sensor — gates Disconnected label.
+    zero_edge_counts: HashMap<i64, u32>,
 }
 
 impl GlobalClockSolver {
@@ -828,6 +846,8 @@ impl GlobalClockSolver {
             buffer: ObservationBuffer::new(BUFFER_CAPACITY, 60_000_000_000), // 60s window
             drift_tracker: DriftTracker::new((DRIFT_WINDOW_S * 1e9) as u64),
             cached_result: None,
+            last_statuses: HashMap::new(),
+            zero_edge_counts: HashMap::new(),
         }
     }
 
@@ -930,35 +950,70 @@ impl GlobalClockSolver {
             }
         }
 
-        // Classify sensor status (now includes Allan deviation check).
-        let mut statuses = HashMap::new();
+        // Classify sensor status with hysteresis (Audit Issue #8).
+        // Sharp thresholds caused flapping; hysteresis requires sustained change to transition.
         let mut edge_counts: HashMap<i64, usize> = HashMap::new();
         for &(si, sj) in edges.keys() {
             *edge_counts.entry(si).or_default() += 1;
             *edge_counts.entry(sj).or_default() += 1;
         }
 
+        let mut statuses = HashMap::new();
         for &sid in &sensor_ids {
-            let uncertainty = uncertainties.get(&sid).copied().unwrap_or(1e6);
-            let edge_count = edge_counts.get(&sid).copied().unwrap_or(0);
-
-            // Check Allan deviation threshold (60s ADEV > 1000ns + Degraded → Unstable).
-            let is_degraded_oscillator = allan_deviations.get(&sid)
-                .map(|adev| adev.adev_60s > 1000.0 && adev.oscillator_class == OscillatorClass::Degraded)
+            let uncertainty     = uncertainties.get(&sid).copied().unwrap_or(1e6);
+            let edge_count      = edge_counts.get(&sid).copied().unwrap_or(0);
+            let is_degraded     = allan_deviations.get(&sid)
+                .map(|a| a.adev_60s > 1000.0 && a.oscillator_class == OscillatorClass::Degraded)
                 .unwrap_or(false);
 
-            let status = if edge_count == 0 {
-                SensorStatus::Disconnected
-            } else if uncertainty > UNSTABLE_SENSOR_THRESHOLD_NS || is_degraded_oscillator {
-                SensorStatus::Unstable
-            } else if edge_count < MIN_EDGES_PER_SENSOR || uncertainty > UNSTABLE_SENSOR_THRESHOLD_NS * 0.5 {
-                SensorStatus::Marginal
+            // Track consecutive zero-edge solves; only declare Disconnected after DISCONNECTED_COUNT.
+            if edge_count == 0 {
+                *self.zero_edge_counts.entry(sid).or_default() += 1;
             } else {
-                SensorStatus::Stable
-            };
+                self.zero_edge_counts.remove(&sid);
+            }
+            let zero_runs = self.zero_edge_counts.get(&sid).copied().unwrap_or(0);
 
+            let prev = self.last_statuses.get(&sid).copied().unwrap_or(SensorStatus::Unknown);
+
+            let status = match prev {
+                // Unknown: first-ever appearance. Promote immediately if edges exist.
+                SensorStatus::Unknown => {
+                    if edge_count == 0 { SensorStatus::Unknown }
+                    else if uncertainty > UNSTABLE_SENSOR_THRESHOLD_NS || is_degraded { SensorStatus::Unstable }
+                    else if edge_count < MIN_EDGES_PER_SENSOR || uncertainty > MARGINAL_ENTER_NS { SensorStatus::Marginal }
+                    else { SensorStatus::Stable }
+                }
+                // Stable: only degrade if clearly over the enter threshold.
+                SensorStatus::Stable => {
+                    if edge_count == 0 && zero_runs >= DISCONNECTED_COUNT { SensorStatus::Disconnected }
+                    else if uncertainty > UNSTABLE_SENSOR_THRESHOLD_NS || is_degraded { SensorStatus::Unstable }
+                    else if edge_count < MIN_EDGES_PER_SENSOR || uncertainty > MARGINAL_ENTER_NS { SensorStatus::Marginal }
+                    else { SensorStatus::Stable }
+                }
+                // Marginal: recover to Stable only if well below the exit threshold.
+                SensorStatus::Marginal => {
+                    if edge_count == 0 && zero_runs >= DISCONNECTED_COUNT { SensorStatus::Disconnected }
+                    else if uncertainty > UNSTABLE_SENSOR_THRESHOLD_NS || is_degraded { SensorStatus::Unstable }
+                    else if edge_count >= MIN_EDGES_PER_SENSOR && uncertainty < MARGINAL_EXIT_NS { SensorStatus::Stable }
+                    else { SensorStatus::Marginal }
+                }
+                // Unstable: recover to Marginal (not Stable) when uncertainty drops enough.
+                SensorStatus::Unstable => {
+                    if edge_count == 0 && zero_runs >= DISCONNECTED_COUNT { SensorStatus::Disconnected }
+                    else if !is_degraded && uncertainty < UNSTABLE_EXIT_NS { SensorStatus::Marginal }
+                    else { SensorStatus::Unstable }
+                }
+                // Disconnected: re-enter at Marginal when edges reappear.
+                SensorStatus::Disconnected => {
+                    if edge_count > 0 { SensorStatus::Marginal }
+                    else { SensorStatus::Disconnected }
+                }
+            };
             statuses.insert(sid, status);
         }
+        // Persist statuses for next solve's hysteresis decisions.
+        self.last_statuses = statuses.clone();
 
         // Topology metrics.
         let num_sensors = sensor_ids.len();

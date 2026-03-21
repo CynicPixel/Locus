@@ -36,6 +36,9 @@ pub struct AircraftState {
     pub anomaly_label: String,
     pub anomaly_confidence: f64,
     pub sensor_count: usize,
+    /// Sensors with Stable or Marginal clock calibration that contributed to this fix.
+    /// May be < sensor_count during warmup. Zero for ADS-B source.
+    pub calibrated_sensor_count: usize,
     pub timestamp_ms: u64,
     /// Degrees of freedom (n_receivers + 1_if_alt_constrained - 4). 0 for ADS-B source.
     pub dof: i32,

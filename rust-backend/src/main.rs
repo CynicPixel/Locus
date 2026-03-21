@@ -499,8 +499,12 @@ async fn solve_semi_mlat_and_broadcast(
         sensor_ids,
         is_clock_beacon: false,
         beacon_obs_count: 0,
-        observation_mode: Some("semi_mlat".to_string()), // NEW: tag observation mode
-        sdop: Some(solution.sdop),                       // Semi-MLAT quality metric
+        calibrated_sensor_count: 0, // semi-MLAT: no full clock calibration check
+        observation_mode: Some("semi_mlat".to_string()),
+        sdop: Some(solution.sdop),
+        callsign: None,
+        squawk: None,
+        on_ground: None,
     };
 
     // Broadcast
@@ -667,6 +671,11 @@ async fn solve_and_broadcast(
     let mut sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
     sensor_ids.sort_unstable();
 
+    // Count sensors with valid clock calibration (Stable or Marginal status).
+    let calibrated_sensor_count = sensor_ids.iter()
+        .filter(|&&sid| clock_sync.is_calibrated(sid, now_ns))
+        .count();
+
     // 5b. ADS-B altitude constraint (adsb_parsed already computed above).
     let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
 
@@ -775,6 +784,7 @@ async fn solve_and_broadcast(
         anomaly_label: "unknown".to_string(),
         anomaly_confidence: 0.0,
         sensor_count: group.frames.len(),
+        calibrated_sensor_count,
         timestamp_ms: now_ns / 1_000_000,
         dof: solution.dof,
         sensor_ids: sensor_ids.clone(),
@@ -911,6 +921,7 @@ async fn broadcast_adsb(
         anomaly_label: "unknown".to_string(),
         anomaly_confidence: 0.0,
         sensor_count,
+        calibrated_sensor_count: 0, // ADS-B — not applicable
         timestamp_ms: now_ns / 1_000_000,
         dof: 0,
         sensor_ids: vec![],
