@@ -3,6 +3,8 @@ mod anomaly_client;
 mod clock_sync;
 mod coords;
 mod correlator;
+mod gdop_heatmap;
+mod global_clock_solver;
 mod ingestor;
 mod kalman;
 mod mlat_solver;
@@ -10,11 +12,12 @@ mod sensors;
 mod spoof_detector;
 mod ws_server;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use nalgebra::Vector3;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::info;
 
 use adsb_parser::AdsbParser;
@@ -57,6 +60,28 @@ const EVICTION_TICK_MS: u64 = 10;
 const HEALTH_BROADCAST_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Classify topology health based on global metrics.
+///
+/// Returns: "excellent" | "good" | "marginal" | "poor"
+fn classify_topology_health(global_rms_ns: f64, connectivity: f64, condition_number: f64) -> &'static str {
+    if condition_number > 1e8 {
+        return "poor"; // Ill-conditioned system
+    }
+    if global_rms_ns < 50.0 && connectivity > 0.7 {
+        "excellent"
+    } else if global_rms_ns < 100.0 && connectivity > 0.5 {
+        "good"
+    } else if global_rms_ns < 300.0 && connectivity > 0.3 {
+        "marginal"
+    } else {
+        "poor"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -91,10 +116,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---- spawn GDOP heatmap background task -------------------------------
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
+
     // ---- pipeline state --------------------------------------------------
     let mut correlator = Correlator::new();
     let mut clock_sync = ClockSyncEngine::new();
-    let mut sensor_registry = SensorRegistry::new();
+    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
     let mut adsb_parser = AdsbParser::new();
@@ -113,7 +141,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
     let mut health_tick =
         tokio::time::interval(Duration::from_secs(HEALTH_BROADCAST_SECS));
+    let mut heatmap_tick =
+        tokio::time::interval(Duration::from_secs(60));
     let mut frame_count: u64 = 0;
+    let mut last_sensor_count: usize = 0;
+    let mut first_heatmap_triggered = false;
 
     // ---- main event loop -------------------------------------------------
     loop {
@@ -137,13 +169,16 @@ async fn main() -> anyhow::Result<()> {
                         ).await;
                     }
                 }
-                process_frame(
-                    frame,
-                    &mut last_frame_ns,
-                    &mut frame_count,
-                    &mut sensor_registry,
-                    &mut correlator,
-                );
+                {
+                    let mut registry = sensor_registry.write().await;
+                    process_frame(
+                        frame,
+                        &mut last_frame_ns,
+                        &mut frame_count,
+                        &mut *registry,
+                        &mut correlator,
+                    );
+                }
             }
 
             _ = eviction_tick.tick() => {
@@ -151,11 +186,12 @@ async fn main() -> anyhow::Result<()> {
                 let groups = correlator.evict_stale(last_frame_ns);
                 // Evict stale clock sync pairs (FIX-11).
                 clock_sync.evict_stale_pairs(last_frame_ns);
+                let registry_read = sensor_registry.read().await;
                 for group in groups {
                     solve_and_broadcast(
                         group,
                         &mut clock_sync,
-                        &sensor_registry,
+                        &*registry_read,
                         &mut kalman_registry,
                         &mut spoof_detector,
                         &mut adsb_parser,
@@ -170,8 +206,21 @@ async fn main() -> anyhow::Result<()> {
             }
 
             _ = health_tick.tick() => {
+                // Trigger global clock solve (async, non-blocking).
+                clock_sync.trigger_global_solve(last_frame_ns, sensor_registry.clone());
+
+                // Update cached global result.
+                clock_sync.update_cached_result().await;
+
+                // Export legacy pairwise offsets.
                 let offsets = clock_sync.export_offsets();
-                let sensors = sensor_registry.export_wgs84();
+
+                // Export global solver result (if available).
+                let global_result = clock_sync.export_global_result();
+
+                let sensors = sensor_registry.read().await.export_wgs84();
+
+                // Legacy sensor_health message.
                 let msg = serde_json::json!({
                     "type": "sensor_health",
                     "offsets": offsets,
@@ -180,6 +229,99 @@ async fn main() -> anyhow::Result<()> {
                     "live_groups": correlator.live_group_count(),
                 });
                 let _ = ws_tx.send(msg.to_string());
+
+                // New global clock sync message (with Phase 3 analytics).
+                if let Some(result) = global_result {
+                    let global_msg = serde_json::json!({
+                        "type": "clock_sync_global",
+                        "success": result.success,
+                        "num_sensors": result.topology.num_sensors,
+                        "num_edges": result.topology.num_edges,
+                        "global_rms_ns": result.topology.global_rms_ns,
+                        "connectivity": result.topology.connectivity,
+                        "condition_number": result.topology.condition_number,
+                        "health": classify_topology_health(
+                            result.topology.global_rms_ns,
+                            result.topology.connectivity,
+                            result.topology.condition_number
+                        ),
+                        "sensors": result.offsets.iter().map(|(&sid, &offset)| {
+                            serde_json::json!({
+                                "sensor_id": sid,
+                                "offset_ns": offset,
+                                "uncertainty_ns": result.uncertainties.get(&sid).copied().unwrap_or(0.0),
+                                "drift_ns_per_s": result.drift_rates.get(&sid).copied().unwrap_or(0.0),
+                                "status": result.statuses.get(&sid).copied().unwrap_or(crate::global_clock_solver::SensorStatus::Disconnected),
+                                "allan_deviation": result.allan_deviations.get(&sid).cloned(),
+                            })
+                        }).collect::<Vec<_>>(),
+                        "edges": result.edges.iter().map(|edge| {
+                            serde_json::json!({
+                                "sensor_i": edge.sensor_i,
+                                "sensor_j": edge.sensor_j,
+                                "weight": edge.weight,
+                                "obs_count": edge.obs_count,
+                                "mad_ns": edge.mad_ns,
+                                "baseline_m": edge.baseline_m,
+                            })
+                        }).collect::<Vec<_>>(),
+                    });
+                    let _ = ws_tx.send(global_msg.to_string());
+                }
+            }
+
+            _ = heatmap_tick.tick() => {
+                // GDOP heatmap: compute theoretical coverage quality field.
+                // Triggers every 60s OR on significant sensor topology change.
+                tracing::debug!("GDOP heatmap tick fired");
+
+                let sensors_lock = sensor_registry.read().await;
+                let sensor_ecef: Vec<Vector3<f64>> = sensors_lock
+                    .export_wgs84()
+                    .iter()
+                    .map(|s| {
+                        let (x, y, z) = crate::coords::wgs84_to_ecef(s.lat, s.lon, s.alt_m);
+                        Vector3::new(x, y, z)
+                    })
+                    .collect();
+                let count = sensor_ecef.len();
+                drop(sensors_lock);
+
+                tracing::debug!(count, last_sensor_count, "checking sensor count");
+
+                // Only recompute if significant topology change (>20% sensor count change)
+                let change_ratio = if last_sensor_count > 0 {
+                    (count as f64 - last_sensor_count as f64).abs() / last_sensor_count as f64
+                } else {
+                    1.0
+                };
+
+                let should_compute = count >= 3 && (
+                    change_ratio > 0.2
+                    || last_sensor_count == 0
+                    || (!first_heatmap_triggered && count >= 3)  // Immediate first computation
+                );
+
+                if should_compute {
+                    tracing::info!(
+                        num_sensors = count,
+                        change_ratio,
+                        first_run = !first_heatmap_triggered,
+                        "triggering GDOP heatmap computation"
+                    );
+
+                    let _ = heatmap_tx.try_send(gdop_heatmap::HeatmapRequest::Compute {
+                        sensor_ecef,
+                        bounds: None,  // Auto-compute from sensors
+                        resolution_deg: 0.1,
+                        altitude_m: 9144.0,  // FL300
+                    });
+
+                    last_sensor_count = count;
+                    first_heatmap_triggered = true;  // Mark as triggered
+                } else {
+                    tracing::debug!(count, change_ratio, "GDOP heatmap skipped");
+                }
             }
 
             _ = tokio::signal::ctrl_c() => {
@@ -262,6 +404,7 @@ async fn solve_and_broadcast(
                                 group.frames[i].timestamp_ns(),
                                 group.frames[j].timestamp_ns(),
                                 beacon_ecef,
+                                adsb.nuc, // FIX-2: Pass NUC for quality filtering/weighting.
                             );
                             used_as_beacon = true;
                         }
@@ -278,6 +421,16 @@ async fn solve_and_broadcast(
 
     // 1. Apply clock corrections (no-op until clock sync warms up)
     clock_sync.apply_corrections(&mut group.frames);
+
+    // Diagnostic: Log corrected timestamps for debugging
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let timestamps: Vec<u64> = group.frames.iter().map(|f| f.timestamp_ns()).collect();
+        tracing::trace!(
+            "MLAT timestamps after correction: ref={}, others={:?}",
+            timestamps[0],
+            &timestamps[1..]
+        );
+    }
 
     // 2. Collect sensor ECEF positions from registry
     let sensor_vecs: Vec<Vector3<f64>> = group
@@ -319,6 +472,20 @@ async fn solve_and_broadcast(
         "{:02X}{:02X}{:02X}",
         group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
     );
+
+    // Diagnostic: Log TDOA values
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let tdoa_ns: Vec<i64> = group.frames[1..]
+            .iter()
+            .map(|f| f.timestamp_ns() as i64 - ref_ts_ns)
+            .collect();
+        tracing::trace!(
+            "ICAO={} TDOA: ns={:?}, m={:?}",
+            icao24,
+            tdoa_ns,
+            observed_tdoa_m
+        );
+    }
 
     // Track beacon obs count for UI display.
     if used_as_beacon {

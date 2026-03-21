@@ -1,20 +1,27 @@
 // Self-calibrating clock synchronisation engine.
 //
-// Uses beacon aircraft (any ADS-B position reporter) to measure per-sensor-pair
-// clock offsets via the difference between expected and observed TDOA.
+// **Hybrid architecture**: Maintains both pairwise regression (legacy) and global
+// solver (new) for gradual migration. The global solver provides globally consistent
+// offsets with transitivity guarantees, while pairwise fallback ensures robustness.
 //
 // FIX-6: Linear regression on (timestamp, offset) pairs tracks clock drift
 //   (frequency error) so the correction tracks real receiver clock behaviour.
 //   Replaces simple windowed median which cannot account for drift.
 // FIX-11: Pairs expire after 120 s without update; corrections become invalid
 //   after 30 s of inactivity, falling back to zero correction gracefully.
+// FIX-GLOBAL: Global least-squares solver replaces pairwise regression for
+//   transitivity-preserving clock synchronization with unstable sensor detection.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use serde::Serialize;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::coords::ecef_dist;
+use crate::global_clock_solver::{ClockObservation, GlobalClockSolver, SolveResult};
 use crate::ingestor::RawFrame;
+use crate::sensors::SensorRegistry;
 
 const WINDOW_SIZE: usize = 50; // ~5 s at 10 beacon obs/s
 /// Speed of light in air (m/ns). c_vacuum/1.0003 — matches mlat-server Cair.
@@ -162,14 +169,90 @@ pub struct SensorOffsetReport {
 // Clock sync engine
 // ---------------------------------------------------------------------------
 
+/// Message to trigger a global solve.
+pub enum SolveRequest {
+    Solve(u64, Arc<RwLock<SensorRegistry>>), // Solve at this timestamp (ns) with sensor registry
+}
+
 pub struct ClockSyncEngine {
+    // Legacy pairwise regression (fallback).
     pairs: HashMap<(i64, i64), PairState>,
+
+    // Global solver integration.
+    global_solver: Arc<RwLock<GlobalClockSolver>>,
+    solve_tx: mpsc::Sender<SolveRequest>,
+
+    // Cached global solution.
+    cached_global_result: Option<SolveResult>,
+
+    // Enable global solver (false = use pairwise only).
+    use_global_solver: bool,
 }
 
 impl ClockSyncEngine {
     pub fn new() -> Self {
+        let global_solver = Arc::new(RwLock::new(GlobalClockSolver::new()));
+        let (solve_tx, mut solve_rx) = mpsc::channel::<SolveRequest>(16);
+
+        // Spawn background solver task.
+        let solver_clone = global_solver.clone();
+        tokio::spawn(async move {
+            while let Some(req) = solve_rx.recv().await {
+                match req {
+                    SolveRequest::Solve(now_ns, sensor_registry) => {
+                        let mut solver = solver_clone.write().await;
+
+                        // Read sensor registry (acquires read lock).
+                        let registry_read = sensor_registry.read().await;
+                        let result = solver.solve(now_ns, Some(&*registry_read));
+                        drop(registry_read); // Release registry read lock.
+                        drop(solver); // Release solver write lock.
+
+                        if result.success {
+                            tracing::debug!(
+                                "Global clock solve: {} sensors, {} edges, RMS={:.1}ns",
+                                result.topology.num_sensors,
+                                result.topology.num_edges,
+                                result.topology.global_rms_ns
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             pairs: HashMap::new(),
+            global_solver,
+            solve_tx,
+            cached_global_result: None,
+            use_global_solver: true, // Enable by default.
+        }
+    }
+
+    /// Enable or disable global solver.
+    #[allow(dead_code)]
+    pub fn set_use_global_solver(&mut self, enabled: bool) {
+        self.use_global_solver = enabled;
+        tracing::info!("Global clock solver: {}", if enabled { "enabled" } else { "disabled" });
+    }
+
+    /// Trigger a global solve (non-blocking).
+    pub fn trigger_global_solve(&self, now_ns: u64, sensor_registry: Arc<RwLock<SensorRegistry>>) {
+        if self.use_global_solver {
+            let _ = self.solve_tx.try_send(SolveRequest::Solve(now_ns, sensor_registry));
+        }
+    }
+
+    /// Update cached global result from solver (called periodically from main loop).
+    pub async fn update_cached_result(&mut self) {
+        if !self.use_global_solver {
+            return;
+        }
+
+        let solver = self.global_solver.read().await;
+        if let Some(result) = solver.get_cached_result() {
+            self.cached_global_result = Some(result.clone());
         }
     }
 
@@ -177,6 +260,8 @@ impl ClockSyncEngine {
     ///
     /// `pos_i` / `pos_j` are ECEF tuples (meters) — pass from `SensorRegistry`
     /// to avoid repeated `wgs84_to_ecef` calls.
+    ///
+    /// **Hybrid approach**: Pushes to global solver AND maintains pairwise fallback.
     pub fn update_from_beacon(
         &mut self,
         sensor_i: i64,
@@ -186,6 +271,7 @@ impl ClockSyncEngine {
         t_i_ns: u64,
         t_j_ns: u64,
         beacon_ecef: (f64, f64, f64),
+        beacon_nuc: u8,
     ) {
         let dist_i = ecef_dist(pos_i, beacon_ecef);
         let dist_j = ecef_dist(pos_j, beacon_ecef);
@@ -193,6 +279,47 @@ impl ClockSyncEngine {
         let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
         let error_ns = observed_tdoa_ns - expected_tdoa_ns;
 
+        // FIX-2: Quality gate - only accept high-accuracy beacons (NUC ≥ 6).
+        // NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
+        if beacon_nuc < 6 {
+            tracing::trace!(
+                "beacon rejected: NUC={} (threshold=6)",
+                beacon_nuc
+            );
+            return;
+        }
+
+        // Weight observations by NUC and baseline distance.
+        let baseline_m = ecef_dist(pos_i, pos_j);
+        let nuc_weight = match beacon_nuc {
+            6 => 1.0,
+            7 => 2.0,
+            8..=9 => 4.0,
+            _ => 0.5, // Fallback (should not reach here due to NUC < 6 gate).
+        };
+        let baseline_weight = (baseline_m / 100_000.0).min(2.0); // Favor long baselines.
+        let weight = nuc_weight * baseline_weight;
+
+        // Push to global solver (synchronous, O(1) - just a VecDeque push).
+        if self.use_global_solver {
+            let obs = ClockObservation {
+                sensor_i,
+                sensor_j,
+                residual_ns: error_ns,
+                weight,
+                timestamp_ns: t_i_ns,
+                beacon_ecef,
+            };
+
+            // Non-blocking: try to get write lock, but don't block if solver is busy.
+            if let Ok(mut solver) = self.global_solver.try_write() {
+                solver.add_observation(obs);
+            }
+            // If lock is held (solver is running), skip this observation.
+            // This is acceptable since we have many observations per second.
+        }
+
+        // Maintain pairwise regression (fallback).
         let pair = self.pairs
             .entry((sensor_i, sensor_j))
             .or_insert_with(|| PairState::new(t_i_ns));
@@ -211,7 +338,8 @@ impl ClockSyncEngine {
             }
         } else if pair.len() >= 2 {
             let mean = pair.mean();
-            if (error_ns - mean).abs() > 3000.0 { // 3 µs gross outlier gate during warmup
+            // FIX-3: Tightened from 3000ns (3µs) to 1000ns (1µs) to prevent bad warm-up data.
+            if (error_ns - mean).abs() > 1000.0 {
                 return;
             }
         }
@@ -229,7 +357,32 @@ impl ClockSyncEngine {
 
     /// Return the regression-predicted offset for a sensor pair at `at_ns` (nanoseconds).
     /// Returns 0.0 if no valid observations.
+    ///
+    /// **Hybrid**: Uses global solver if available, falls back to pairwise.
     pub fn get_offset_at(&mut self, sensor_i: i64, sensor_j: i64, at_ns: u64) -> f64 {
+        // Try global solver first.
+        if self.use_global_solver {
+            if let Some(ref result) = self.cached_global_result {
+                if result.success {
+                    // Get global offsets for both sensors.
+                    let offset_i = result.offsets.get(&sensor_i).copied().unwrap_or(0.0);
+                    let offset_j = result.offsets.get(&sensor_j).copied().unwrap_or(0.0);
+
+                    // Apply drift extrapolation.
+                    let drift_i = result.drift_rates.get(&sensor_i).copied().unwrap_or(0.0);
+                    let drift_j = result.drift_rates.get(&sensor_j).copied().unwrap_or(0.0);
+
+                    let dt_s = (at_ns.saturating_sub(result.solve_timestamp_ns) as f64) / 1e9;
+                    let extrapolated_i = offset_i + drift_i * dt_s;
+                    let extrapolated_j = offset_j + drift_j * dt_s;
+
+                    // Return i-j offset (convention: sensor_i - sensor_j).
+                    return extrapolated_i - extrapolated_j;
+                }
+            }
+        }
+
+        // Fallback to pairwise regression.
         let pair = self.pairs
             .entry((sensor_i, sensor_j))
             .or_insert_with(|| PairState::new(at_ns));
@@ -239,7 +392,21 @@ impl ClockSyncEngine {
     /// Variance of TDOA error for the pair (nanoseconds²).
     /// Used by mlat_solver for per-measurement weighting (FIX-4).
     /// Returns a conservative default if pair not yet converged.
+    ///
+    /// **Hybrid**: Uses global uncertainties if available, falls back to pairwise.
     pub fn get_pair_variance_ns2(&mut self, sensor_i: i64, sensor_j: i64) -> f64 {
+        // Try global solver first: σ²_pair = σ²_i + σ²_j.
+        if self.use_global_solver {
+            if let Some(ref result) = self.cached_global_result {
+                if result.success {
+                    let sigma_i = result.uncertainties.get(&sensor_i).copied().unwrap_or(300.0);
+                    let sigma_j = result.uncertainties.get(&sensor_j).copied().unwrap_or(300.0);
+                    return sigma_i * sigma_i + sigma_j * sigma_j;
+                }
+            }
+        }
+
+        // Fallback to pairwise regression.
         match self.pairs.get_mut(&(sensor_i, sensor_j)) {
             Some(p) if p.len() >= MIN_SAMPLE_COUNT => p.variance_ns2(),
             _ => 300.0 * 300.0, // 300 ns default sigma → 90_000 ns²
@@ -276,6 +443,23 @@ impl ClockSyncEngine {
             .map(|f| self.get_offset_at(f.sensor_id, ref_id, ref_ts_ns))
             .collect();
 
+        // Diagnostic: Log corrections if any are non-zero (trace level only)
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let has_corrections = corrections.iter().any(|&c| c.abs() > 1.0);
+            if has_corrections {
+                let sensor_corrections: Vec<(i64, f64)> = frames[1..]
+                    .iter()
+                    .zip(corrections.iter())
+                    .map(|(f, &c)| (f.sensor_id, c))
+                    .collect();
+                tracing::trace!(
+                    "Clock corrections applied (ref={}): {:?}",
+                    ref_id,
+                    sensor_corrections
+                );
+            }
+        }
+
         for (frame, correction_ns) in frames[1..].iter_mut().zip(corrections) {
             let raw_ns = frame.timestamp_ns() as i64;
             let corrected_ns = (raw_ns - correction_ns.round() as i64).max(0) as u64;
@@ -285,7 +469,7 @@ impl ClockSyncEngine {
         }
     }
 
-    /// Snapshot of all pair offsets for WebSocket broadcast.
+    /// Snapshot of all pair offsets for WebSocket broadcast (legacy).
     pub fn export_offsets(&mut self) -> Vec<SensorOffsetReport> {
         self.pairs
             .iter_mut()
@@ -300,5 +484,10 @@ impl ClockSyncEngine {
                 }
             })
             .collect()
+    }
+
+    /// Export global solver result for WebSocket broadcast (new).
+    pub fn export_global_result(&self) -> Option<SolveResult> {
+        self.cached_global_result.clone()
     }
 }
