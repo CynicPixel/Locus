@@ -3,10 +3,12 @@
 
 
 
+use std::sync::Arc;
+
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 pub type BroadcastTx = broadcast::Sender<String>;
@@ -59,7 +61,11 @@ pub struct AircraftState {
 // ---------------------------------------------------------------------------
 
 /// Listen on `addr`, accept WebSocket connections, and broadcast messages from `rx`.
-pub async fn run_ws_server(addr: String, tx: BroadcastTx) -> anyhow::Result<()> {
+pub async fn run_ws_server(
+    addr: String,
+    tx: BroadcastTx,
+    cache: Arc<RwLock<Option<String>>>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("WebSocket server listening on {addr}");
 
@@ -67,6 +73,7 @@ pub async fn run_ws_server(addr: String, tx: BroadcastTx) -> anyhow::Result<()> 
         let (stream, peer) = listener.accept().await?;
         tracing::debug!("WS peer connected: {peer}");
         let mut rx = tx.subscribe();
+        let cache = Arc::clone(&cache);
 
         tokio::spawn(async move {
             let ws = match tokio_tungstenite::accept_async(stream).await {
@@ -77,6 +84,14 @@ pub async fn run_ws_server(addr: String, tx: BroadcastTx) -> anyhow::Result<()> 
                 }
             };
             let (mut sink, _source) = ws.split();
+
+            // Send cached heatmap immediately — no wait for next 60s tick
+            {
+                let cached = cache.read().await;
+                if let Some(json) = cached.as_ref() {
+                    let _ = sink.send(Message::Text(json.clone().into())).await;
+                }
+            }
 
             loop {
                 match rx.recv().await {

@@ -103,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<RawFrame>(4096);
     let (ws_tx, _) = broadcast::channel::<String>(4096);
 
+    // ---- heatmap cache: last computed result served instantly to new clients
+    let heatmap_cache: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
     // ---- spawn ingestor (connects to Go Unix socket) ----------------------
     let _ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
 
@@ -110,15 +113,16 @@ async fn main() -> anyhow::Result<()> {
     {
         let ws_tx2 = ws_tx.clone();
         let addr = cli.ws_addr.clone();
+        let cache = Arc::clone(&heatmap_cache);
         tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2).await {
+            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache).await {
                 tracing::error!("WS server error: {e}");
             }
         });
     }
 
     // ---- spawn GDOP heatmap background task -------------------------------
-    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
 
     // ---- pipeline state --------------------------------------------------
     let mut correlator = Correlator::new();
