@@ -282,11 +282,13 @@ impl ClockSyncEngine {
         let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
         let error_ns = observed_tdoa_ns - expected_tdoa_ns;
 
-        // FIX-2: Quality gate - only accept high-accuracy beacons (NUC ≥ 6).
-        // NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
-        if beacon_nuc < 6 {
+        // Quality gate - only accept beacons NUC ≥ 5.
+        // NUC 5 = HPL <370m, NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
+        // NUC 5 included but down-weighted; keeps observation rate high enough to fill buffer in regions
+        // with few high-accuracy beacons.
+        if beacon_nuc < 5 {
             tracing::trace!(
-                "beacon rejected: NUC={} (threshold=6)",
+                "beacon rejected: NUC={} (threshold=5)",
                 beacon_nuc
             );
             return;
@@ -295,6 +297,7 @@ impl ClockSyncEngine {
         // Weight observations by NUC and baseline distance.
         let baseline_m = ecef_dist(pos_i, pos_j);
         let nuc_weight = match beacon_nuc {
+            5 => 0.5,
             6 => 1.0,
             7 => 2.0,
             8..=9 => 4.0,

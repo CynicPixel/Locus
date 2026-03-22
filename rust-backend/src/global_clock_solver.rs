@@ -29,8 +29,8 @@ use crate::sensors::SensorRegistry;
 /// Speed of light in air (m/ns). c_vacuum/1.0003 — matches mlat-server Cair.
 const C_M_PER_NS: f64 = 0.299_702_547;
 
-/// Observation buffer capacity (60s at ~80 obs/s = 5000 samples).
-const BUFFER_CAPACITY: usize = 5000;
+/// Observation buffer capacity (60s at ~500 obs/s with 8+ sensors = 30_000 samples).
+const BUFFER_CAPACITY: usize = 30_000;
 
 /// Minimum edges per sensor to be considered well-constrained.
 const MIN_EDGES_PER_SENSOR: usize = 2;

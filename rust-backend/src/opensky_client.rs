@@ -12,9 +12,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Enrichment fields from OpenSky for one aircraft.
 #[derive(Debug, Clone, Default)]
 pub struct OpenSkyInfo {
-    pub callsign:  Option<String>,
-    pub squawk:    Option<String>,
-    pub on_ground: Option<bool>,
+    pub callsign:       Option<String>,
+    pub squawk:         Option<String>,
+    pub origin_country: Option<String>,
 }
 
 pub type OpenSkyCache = Arc<RwLock<HashMap<String, OpenSkyInfo>>>;
@@ -60,7 +60,7 @@ pub fn spawn_opensky_task(cache: OpenSkyCache, bbox: (f64, f64, f64, f64)) {
                             map.clear();
                             for sv in &states {
                                 // OpenSky state vector field indices:
-                                // 0 = icao24, 1 = callsign, 8 = on_ground, 14 = squawk
+                                // 0 = icao24, 1 = callsign, 2 = origin_country, 14 = squawk
                                 let Some(icao) = sv.get(0)
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.trim().to_lowercase())
@@ -72,14 +72,17 @@ pub fn spawn_opensky_task(cache: OpenSkyCache, bbox: (f64, f64, f64, f64)) {
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty());
 
-                                let on_ground = sv.get(8).and_then(|v| v.as_bool());
+                                let origin_country = sv.get(2)
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
 
                                 let squawk = sv.get(14)
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty());
 
-                                map.insert(icao, OpenSkyInfo { callsign, squawk, on_ground });
+                                map.insert(icao, OpenSkyInfo { callsign, squawk, origin_country });
                             }
                             tracing::debug!("OpenSky: cache refreshed ({} aircraft)", map.len());
                         }

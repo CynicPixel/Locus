@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- heatmap cache: last computed result served instantly to new clients
     let heatmap_cache: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    // ---- OpenSky enrichment cache: callsign/squawk/on_ground keyed by ICAO24
+    // ---- OpenSky enrichment cache: callsign/squawk/origin_country keyed by ICAO24
     let opensky_cache = opensky_client::new_cache();
     opensky_client::spawn_opensky_task(
         Arc::clone(&opensky_cache),
@@ -504,7 +504,7 @@ async fn solve_semi_mlat_and_broadcast(
         sdop: Some(solution.sdop),
         callsign: None,
         squawk: None,
-        on_ground: None,
+        origin_country: None,
     };
 
     // Broadcast
@@ -760,10 +760,10 @@ async fn solve_and_broadcast(
 
     // 11. Build AircraftState and broadcast
     // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
-    let (callsign, squawk, on_ground) = {
+    let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
         if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.on_ground)
+            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
         } else {
             (None, None, None)
         }
@@ -794,7 +794,7 @@ async fn solve_and_broadcast(
         sdop: None,                                      // SDOP only applies to semi-MLAT
         callsign,
         squawk,
-        on_ground,
+        origin_country,
     };
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
@@ -897,10 +897,10 @@ async fn broadcast_adsb(
     spoof_detector.record_adsb(icao24, adsb.lat, adsb.lon, adsb.alt_m);
 
     // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
-    let (callsign, squawk, on_ground) = {
+    let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
         if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.on_ground)
+            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
         } else {
             (None, None, None)
         }
@@ -931,7 +931,7 @@ async fn broadcast_adsb(
         sdop: None,                                 // Not applicable for ADS-B
         callsign,
         squawk,
-        on_ground,
+        origin_country,
     };
 
     tracing::debug!(icao24, lat, lon, alt_m, "ADS-B position broadcast");

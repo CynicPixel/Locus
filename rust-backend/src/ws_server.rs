@@ -61,9 +61,9 @@ pub struct AircraftState {
     /// Transponder squawk code from OpenSky (e.g. "1000"). None until enriched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub squawk: Option<String>,
-    /// True = aircraft reported on-ground by ADS-B transponder. None if unknown.
+    /// Country of registration from OpenSky. None until enriched.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_ground: Option<bool>,
+    pub origin_country: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
