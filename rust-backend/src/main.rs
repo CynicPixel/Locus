@@ -8,6 +8,8 @@ mod global_clock_solver;
 mod ingestor;
 mod kalman;
 mod mlat_solver;
+mod opensky_client;
+mod semi_mlat_solver;
 mod sensors;
 mod spoof_detector;
 mod virtual_sensors;
@@ -67,7 +69,11 @@ const HEALTH_BROADCAST_SECS: u64 = 5;
 /// Classify topology health based on global metrics.
 ///
 /// Returns: "excellent" | "good" | "marginal" | "poor"
-fn classify_topology_health(global_rms_ns: f64, connectivity: f64, condition_number: f64) -> &'static str {
+fn classify_topology_health(
+    global_rms_ns: f64,
+    connectivity: f64,
+    condition_number: f64,
+) -> &'static str {
     if condition_number > 1e8 {
         return "poor"; // Ill-conditioned system
     }
@@ -103,6 +109,16 @@ async fn main() -> anyhow::Result<()> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<RawFrame>(4096);
     let (ws_tx, _) = broadcast::channel::<String>(4096);
 
+    // ---- heatmap cache: last computed result served instantly to new clients
+    let heatmap_cache: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    // ---- OpenSky enrichment cache: callsign/squawk/origin_country keyed by ICAO24
+    let opensky_cache = opensky_client::new_cache();
+    opensky_client::spawn_opensky_task(
+        Arc::clone(&opensky_cache),
+        (43.0, -6.0, 57.0, 18.0), // Europe bbox: lamin, lomin, lamax, lomax
+    );
+
     // ---- spawn ingestor (connects to Go Unix socket) ----------------------
     let _ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
 
@@ -118,6 +134,9 @@ async fn main() -> anyhow::Result<()> {
         let registry_clone = sensor_registry.clone();
         tokio::spawn(async move {
             if let Err(e) = ws_server::run_ws_server(addr, registry_clone, ws_tx2).await {
+        let cache = Arc::clone(&heatmap_cache);
+        tokio::spawn(async move {
+            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache).await {
                 tracing::error!("WS server error: {e}");
             }
         });
@@ -125,6 +144,12 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- spawn GDOP heatmap background task -------------------------------
     let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
+
+    // ---- pipeline state --------------------------------------------------
+    let mut correlator = Correlator::new();
+    let mut clock_sync = ClockSyncEngine::new();
+    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
     let mut adsb_parser = AdsbParser::new();
@@ -132,19 +157,18 @@ async fn main() -> anyhow::Result<()> {
     let anomaly_client = AnomalyClient::new(cli.ml_service_url.clone());
 
     // FIX-14: Per-aircraft rate limiting — skip if last solve < 1 s ago.
-    let mut last_solve_ns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut last_solve_ns: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // FIX-16: Track when altitude was last observed per aircraft for degraded weighting.
-    let mut last_alt_time_ns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut last_alt_time_ns: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // Clock beacon tracking: icao24 → cumulative obs count contributed to clock sync.
     let mut beacon_obs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     let mut last_frame_ns: u64 = 0;
-    let mut eviction_tick =
-        tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
-    let mut health_tick =
-        tokio::time::interval(Duration::from_secs(HEALTH_BROADCAST_SECS));
-    let mut heatmap_tick =
-        tokio::time::interval(Duration::from_secs(60));
+    let mut eviction_tick = tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
+    let mut health_tick = tokio::time::interval(Duration::from_secs(HEALTH_BROADCAST_SECS));
+    let mut heatmap_tick = tokio::time::interval(Duration::from_secs(60));
     let mut frame_count: u64 = 0;
     let mut last_sensor_count: usize = 0;
     let mut first_heatmap_triggered = false;
@@ -168,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
                             frame.timestamp_ns(),
                             1,
                             &mut beacon_obs,
+                            &opensky_cache,
                         ).await;
                     }
                 }
@@ -203,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
                         &mut last_solve_ns,
                         &mut last_alt_time_ns,
                         &mut beacon_obs,
+                        &opensky_cache,
                     ).await;
                 }
             }
@@ -363,6 +389,140 @@ fn process_frame(
 }
 
 // ---------------------------------------------------------------------------
+// Semi-MLAT solver for 2-sensor observations (requires existing Kalman track)
+// ---------------------------------------------------------------------------
+
+async fn solve_semi_mlat_and_broadcast(
+    mut group: correlator::CorrelationGroup,
+    clock_sync: &mut ClockSyncEngine,
+    sensor_registry: &SensorRegistry,
+    kalman_registry: &mut KalmanRegistry,
+    ws_tx: &BroadcastTx,
+) {
+    // Extract ICAO24 for track lookup
+    let icao24 = format!(
+        "{:02X}{:02X}{:02X}",
+        group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
+    );
+
+    // Require existing Kalman track (no cold starts from 2-sensor data)
+    let kalman_prior = match kalman_registry.get_prior(&icao24) {
+        Some(prior) => prior,
+        None => {
+            tracing::debug!(icao24 = %icao24, "2-sensor obs discarded: no existing track");
+            return;
+        }
+    };
+
+    // Apply clock corrections
+    clock_sync.apply_corrections(&mut group.frames);
+
+    // Collect sensor ECEF positions (should be exactly 2)
+    let sensor_vecs: Vec<Vector3<f64>> = group
+        .frames
+        .iter()
+        .filter_map(|f| sensor_registry.get(f.sensor_id).copied())
+        .collect();
+    if sensor_vecs.len() != 2 {
+        tracing::debug!(icao24 = %icao24, "2-sensor group corrupted (missing sensor positions)");
+        return;
+    }
+
+    // Compute TDOA (meters) relative to sensor[0]
+    let ref_ts_ns = group.frames[0].timestamp_ns() as i64;
+    let tdoa_ns = group.frames[1].timestamp_ns() as i64 - ref_ts_ns;
+    let observed_tdoa_m = tdoa_ns as f64 * C_M_PER_NS;
+
+    // TDOA variance from clock sync (or fallback to 300m if unavailable)
+    let ref_id = group.frames[0].sensor_id;
+    let other_id = group.frames[1].sensor_id;
+    let var_ns2 = clock_sync.get_pair_variance_ns2(other_id, ref_id);
+    let tdoa_variance_m2 = var_ns2 * C_M_PER_NS * C_M_PER_NS;
+
+    // Build semi-MLAT input
+    let input = semi_mlat_solver::SemiMlatInput {
+        sensor_positions: [sensor_vecs[0], sensor_vecs[1]],
+        observed_tdoa_m,
+        tdoa_variance_m2,
+        kalman_prior,
+        adsb_alt_m: None, // TODO: could extract from ADS-B parser if needed
+        alt_age_seconds: 0.0,
+    };
+
+    // Solve
+    let solution = match semi_mlat_solver::solve_semi_mlat(&input) {
+        Some(s) => s,
+        None => {
+            tracing::debug!(icao24 = %icao24, "semi-MLAT solve failed");
+            return;
+        }
+    };
+
+    tracing::debug!(
+        icao24 = %icao24,
+        sdop = solution.sdop,
+        accuracy_m = solution.accuracy_m,
+        lat = solution.lat,
+        lon = solution.lon,
+        alt_m = solution.alt_m,
+        "semi-MLAT solution"
+    );
+
+    // Update Kalman filter
+    let now_ns = group.first_seen_ns;
+    kalman_registry.update_from_semi_mlat(&icao24, &solution, now_ns);
+
+    // Get smoothed position from Kalman
+    let (lat, lon, alt_m) =
+        kalman_registry
+            .get_wgs84(&icao24)
+            .unwrap_or((solution.lat, solution.lon, solution.alt_m));
+
+    // Velocity (ENU → deg/s for frontend)
+    let (east, north, up) = kalman_registry
+        .get_velocity_enu(&icao24, lat, lon)
+        .unwrap_or((0.0, 0.0, 0.0));
+    let cos_lat = lat.to_radians().cos().abs().max(1e-9);
+    let vel_lat = north / 111_320.0;
+    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_alt = up;
+
+    // Build AircraftState (observation_mode = "semi_mlat")
+    let sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
+    let aircraft_state = AircraftState {
+        icao24: icao24.clone(),
+        lat,
+        lon,
+        alt_m,
+        vel_lat,
+        vel_lon,
+        vel_alt,
+        gdop: 0.0, // N/A for semi-MLAT
+        confidence_ellipse_m: solution.accuracy_m,
+        spoof_flag: false, // Don't run spoof detector on semi-MLAT (lower accuracy)
+        divergence_m: 0.0, // N/A
+        anomaly_label: "unknown".to_string(), // Don't classify on semi-MLAT
+        anomaly_confidence: 0.0,
+        sensor_count: 2,
+        timestamp_ms: now_ns / 1_000_000,
+        dof: 1, // 4 residuals - 3 unknowns = 1 DOF
+        sensor_ids,
+        is_clock_beacon: false,
+        beacon_obs_count: 0,
+        calibrated_sensor_count: 0, // semi-MLAT: no full clock calibration check
+        observation_mode: Some("semi_mlat".to_string()),
+        sdop: Some(solution.sdop),
+        callsign: None,
+        squawk: None,
+        origin_country: None,
+    };
+
+    // Broadcast
+    let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
+    let _ = ws_tx.send(msg);
+}
+
+// ---------------------------------------------------------------------------
 // Per-group MLAT → Kalman → spoof → broadcast
 // ---------------------------------------------------------------------------
 
@@ -380,11 +540,12 @@ async fn solve_and_broadcast(
     last_solve_ns: &mut std::collections::HashMap<String, u64>,
     last_alt_time_ns: &mut std::collections::HashMap<String, u64>,
     beacon_obs: &mut std::collections::HashMap<String, u32>,
+    opensky_cache: &opensky_client::OpenSkyCache,
 ) {
     // Step A: parse ADS-B from frame[0] early (shared by clock sync AND altitude constraint)
-    let adsb_parsed = group.frames[0].bytes().and_then(|bytes| {
-        adsb_parser.parse(bytes, group.frames[0].timestamp_ns())
-    });
+    let adsb_parsed = group.frames[0]
+        .bytes()
+        .and_then(|bytes| adsb_parser.parse(bytes, group.frames[0].timestamp_ns()));
 
     // Step B: clock sync for ANY group >= 2 sensors (was previously gated by >= 3)
     let mut used_as_beacon = false;
@@ -416,10 +577,18 @@ async fn solve_and_broadcast(
         }
     }
 
-    // MLAT still requires >= 3
-    if group.frames.len() < 3 {
+    // Branch: 2-sensor semi-MLAT vs 3+ sensor full MLAT
+    if group.frames.len() == 2 {
+        // Semi-MLAT path: requires existing Kalman track
+        solve_semi_mlat_and_broadcast(group, clock_sync, sensor_registry, kalman_registry, ws_tx)
+            .await;
+        return;
+    } else if group.frames.len() < 2 {
+        // Reject single-sensor observations (cannot constrain position)
         return;
     }
+
+    // Full MLAT path (3+ sensors) continues below...
 
     // 1. Apply clock corrections (no-op until clock sync warms up)
     clock_sync.apply_corrections(&mut group.frames);
@@ -450,13 +619,19 @@ async fn solve_and_broadcast(
     const TDOA_GUARD_NS: f64 = 1_000.0; // 1 µs guard
     for (fi, pi) in group.frames.iter().zip(sensor_vecs.iter()) {
         for (fj, pj) in group.frames.iter().zip(sensor_vecs.iter()) {
-            if fi.sensor_id >= fj.sensor_id { continue; }
+            if fi.sensor_id >= fj.sensor_id {
+                continue;
+            }
             let max_tdoa_ns = (pi - pj).norm() * 1.05 / C_M_PER_NS + TDOA_GUARD_NS;
-            let obs_ns = (fi.timestamp_ns() as i64 - fj.timestamp_ns() as i64).unsigned_abs() as f64;
+            let obs_ns =
+                (fi.timestamp_ns() as i64 - fj.timestamp_ns() as i64).unsigned_abs() as f64;
             if obs_ns > max_tdoa_ns {
                 tracing::debug!(
                     "feasibility check failed: sensors {}/{} tdoa={:.0}ns max={:.0}ns",
-                    fi.sensor_id, fj.sensor_id, obs_ns, max_tdoa_ns
+                    fi.sensor_id,
+                    fj.sensor_id,
+                    obs_ns,
+                    max_tdoa_ns
                 );
                 return;
             }
@@ -506,6 +681,11 @@ async fn solve_and_broadcast(
     let mut sensor_ids: Vec<i64> = group.frames.iter().map(|f| f.sensor_id).collect();
     sensor_ids.sort_unstable();
 
+    // Count sensors with valid clock calibration (Stable or Marginal status).
+    let calibrated_sensor_count = sensor_ids.iter()
+        .filter(|&&sid| clock_sync.is_calibrated(sid, now_ns))
+        .count();
+
     // 5b. ADS-B altitude constraint (adsb_parsed already computed above).
     let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
 
@@ -515,7 +695,8 @@ async fn solve_and_broadcast(
         last_alt_time_ns.insert(icao24.clone(), now_ns);
         0.0
     } else {
-        last_alt_time_ns.get(&icao24)
+        last_alt_time_ns
+            .get(&icao24)
             .map(|&last| now_ns.saturating_sub(last) as f64 / 1e9)
             .unwrap_or(999.0) // Unknown → very stale → altitude constraint disabled
     };
@@ -564,9 +745,10 @@ async fn solve_and_broadcast(
     // 7. Kalman update
     kalman_registry.update(&icao24, &solution, now_ns);
 
-    let (lat, lon, alt_m) = kalman_registry
-        .get_wgs84(&icao24)
-        .unwrap_or((solution.lat, solution.lon, solution.alt_m));
+    let (lat, lon, alt_m) =
+        kalman_registry
+            .get_wgs84(&icao24)
+            .unwrap_or((solution.lat, solution.lon, solution.alt_m));
 
     // 8. Velocity (ENU → deg/s for frontend)
     let (east, north, up) = kalman_registry
@@ -578,13 +760,8 @@ async fn solve_and_broadcast(
     let vel_alt = up;
 
     // 9. Spoof detection
-    let (spoof_flag, divergence_m) = spoof_detector.check(
-        &icao24,
-        lat,
-        lon,
-        alt_m,
-        solution.accuracy_m,
-    );
+    let (spoof_flag, divergence_m) =
+        spoof_detector.check(&icao24, lat, lon, alt_m, solution.accuracy_m);
 
     // 10. Record ADS-B position for spoof detection.
     if let Some(adsb) = &adsb_parsed {
@@ -592,6 +769,16 @@ async fn solve_and_broadcast(
     }
 
     // 11. Build AircraftState and broadcast
+    // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
+    let (callsign, squawk, origin_country) = {
+        let cache = opensky_cache.read().await;
+        if let Some(info) = cache.get(&icao24.to_lowercase()) {
+            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        } else {
+            (None, None, None)
+        }
+    };
+
     let aircraft_state = AircraftState {
         icao24: icao24.clone(),
         lat,
@@ -607,11 +794,17 @@ async fn solve_and_broadcast(
         anomaly_label: "unknown".to_string(),
         anomaly_confidence: 0.0,
         sensor_count: group.frames.len(),
+        calibrated_sensor_count,
         timestamp_ms: now_ns / 1_000_000,
         dof: solution.dof,
         sensor_ids: sensor_ids.clone(),
         is_clock_beacon: false, // MLAT track — beacon flag carried by ADS-B broadcast
         beacon_obs_count: beacon_obs.get(&icao24).copied().unwrap_or(0),
+        observation_mode: Some("full_mlat".to_string()), // Full MLAT with 3+ sensors
+        sdop: None,                                      // SDOP only applies to semi-MLAT
+        callsign,
+        squawk,
+        origin_country,
     };
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
@@ -647,8 +840,7 @@ async fn solve_and_broadcast(
                         anomaly_confidence: resp.confidence,
                         ..state_clone
                     };
-                    let msg = serde_json::to_string(&updated)
-                        .expect("AircraftState serialization");
+                    let msg = serde_json::to_string(&updated).expect("AircraftState serialization");
                     let _ = ws_tx2.send(msg);
                 }
                 Err(e) => {
@@ -677,6 +869,7 @@ async fn broadcast_adsb(
     now_ns: u64,
     sensor_count: usize,
     beacon_obs: &mut std::collections::HashMap<String, u32>,
+    opensky_cache: &opensky_client::OpenSkyCache,
 ) {
     let icao24 = &adsb.icao24;
 
@@ -689,9 +882,9 @@ async fn broadcast_adsb(
             let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
             nalgebra::Vector3::new(x, y, z)
         },
-        gdop: 0.0,          // 0.0 signals ADS-B source (not MLAT)
-        accuracy_m: 500.0,  // ADS-B typical horizontal accuracy (~500 m NUC=5)
-        dof: 0,             // not applicable for ADS-B
+        gdop: 0.0,         // 0.0 signals ADS-B source (not MLAT)
+        accuracy_m: 500.0, // ADS-B typical horizontal accuracy (~500 m NUC=5)
+        dof: 0,            // not applicable for ADS-B
         covariance: nalgebra::Matrix3::identity() * (500.0_f64 * 500.0),
     };
 
@@ -713,6 +906,16 @@ async fn broadcast_adsb(
     // Record this ADS-B position as the "claimed" position for spoof detection.
     spoof_detector.record_adsb(icao24, adsb.lat, adsb.lon, adsb.alt_m);
 
+    // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
+    let (callsign, squawk, origin_country) = {
+        let cache = opensky_cache.read().await;
+        if let Some(info) = cache.get(&icao24.to_lowercase()) {
+            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        } else {
+            (None, None, None)
+        }
+    };
+
     let aircraft_state = AircraftState {
         icao24: icao24.clone(),
         lat,
@@ -728,20 +931,20 @@ async fn broadcast_adsb(
         anomaly_label: "unknown".to_string(),
         anomaly_confidence: 0.0,
         sensor_count,
+        calibrated_sensor_count: 0, // ADS-B — not applicable
         timestamp_ms: now_ns / 1_000_000,
         dof: 0,
         sensor_ids: vec![],
         is_clock_beacon: adsb.nuc >= 6 && beacon_obs.contains_key(icao24.as_str()),
         beacon_obs_count: beacon_obs.get(icao24.as_str()).copied().unwrap_or(0),
+        observation_mode: Some("adsb".to_string()), // ADS-B source
+        sdop: None,                                 // Not applicable for ADS-B
+        callsign,
+        squawk,
+        origin_country,
     };
 
-    tracing::debug!(
-        icao24,
-        lat,
-        lon,
-        alt_m,
-        "ADS-B position broadcast"
-    );
+    tracing::debug!(icao24, lat, lon, alt_m, "ADS-B position broadcast");
 
     let msg = serde_json::to_string(&aircraft_state).expect("AircraftState serialization");
     let _ = ws_tx.send(msg);
@@ -774,8 +977,7 @@ async fn broadcast_adsb(
                         anomaly_confidence: resp.confidence,
                         ..state_clone
                     };
-                    let msg = serde_json::to_string(&updated)
-                        .expect("AircraftState serialization");
+                    let msg = serde_json::to_string(&updated).expect("AircraftState serialization");
                     let _ = ws_tx2.send(msg);
                 }
                 Err(e) => {

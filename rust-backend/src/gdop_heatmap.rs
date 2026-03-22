@@ -18,9 +18,11 @@
 //
 // Assumes 2.5m (1σ) TDOA accuracy from clock synchronization.
 
+use std::sync::Arc;
+
 use nalgebra::{DMatrix, Vector3};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 use crate::coords::{ecef_to_wgs84, wgs84_to_ecef};
 
@@ -455,6 +457,7 @@ pub enum HeatmapRequest {
 /// Returns channel sender for compute requests.
 pub fn spawn_heatmap_task(
     ws_tx: broadcast::Sender<String>,
+    cache: Arc<RwLock<Option<String>>>,
 ) -> mpsc::Sender<HeatmapRequest> {
     let (req_tx, mut req_rx) = mpsc::channel::<HeatmapRequest>(16);
 
@@ -499,6 +502,8 @@ pub fn spawn_heatmap_task(
                                         num_points = grid.points.len(),
                                         "broadcasting GDOP heatmap to WebSocket clients"
                                     );
+                                    // Cache for clients connecting mid-interval
+                                    *cache.write().await = Some(json.clone());
                                     if let Err(e) = ws_tx.send(json) {
                                         tracing::warn!("failed to broadcast GDOP heatmap: {e}");
                                     }

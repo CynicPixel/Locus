@@ -33,6 +33,9 @@ const PAIR_VALIDITY_NS: u64 = 30_000_000_000; // 30 seconds
 const PAIR_EXPIRY_NS: u64 = 120_000_000_000; // 120 seconds
 /// Minimum observations before using a pair's estimate.
 const MIN_SAMPLE_COUNT: usize = 2;
+/// Maximum age of a global result before drift extrapolation is disabled (Audit Bug #3).
+/// Beyond this, the raw offset is used without drift correction to prevent unbounded error growth.
+const MAX_DRIFT_EXTRAPOLATION_NS: u64 = 120_000_000_000; // 120 seconds
 
 // ---------------------------------------------------------------------------
 // Per-pair state — OLS regression replaces windowed median (FIX-6)
@@ -279,11 +282,13 @@ impl ClockSyncEngine {
         let observed_tdoa_ns = t_i_ns as f64 - t_j_ns as f64;
         let error_ns = observed_tdoa_ns - expected_tdoa_ns;
 
-        // FIX-2: Quality gate - only accept high-accuracy beacons (NUC ≥ 6).
-        // NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
-        if beacon_nuc < 6 {
+        // Quality gate - only accept beacons NUC ≥ 5.
+        // NUC 5 = HPL <370m, NUC 6 = HPL <185m, NUC 7 = HPL <75m, NUC 8 = HPL <25m, NUC 9 = HPL <7.5m
+        // NUC 5 included but down-weighted; keeps observation rate high enough to fill buffer in regions
+        // with few high-accuracy beacons.
+        if beacon_nuc < 5 {
             tracing::trace!(
-                "beacon rejected: NUC={} (threshold=6)",
+                "beacon rejected: NUC={} (threshold=5)",
                 beacon_nuc
             );
             return;
@@ -292,6 +297,7 @@ impl ClockSyncEngine {
         // Weight observations by NUC and baseline distance.
         let baseline_m = ecef_dist(pos_i, pos_j);
         let nuc_weight = match beacon_nuc {
+            5 => 0.5,
             6 => 1.0,
             7 => 2.0,
             8..=9 => 4.0,
@@ -372,9 +378,18 @@ impl ClockSyncEngine {
                     let drift_i = result.drift_rates.get(&sensor_i).copied().unwrap_or(0.0);
                     let drift_j = result.drift_rates.get(&sensor_j).copied().unwrap_or(0.0);
 
-                    let dt_s = (at_ns.saturating_sub(result.solve_timestamp_ns) as f64) / 1e9;
-                    let extrapolated_i = offset_i + drift_i * dt_s;
-                    let extrapolated_j = offset_j + drift_j * dt_s;
+                    // Audit Bug #3: cap drift extrapolation to 120s; beyond that use static offset.
+                    let age_ns = at_ns.saturating_sub(result.solve_timestamp_ns);
+                    let (extrapolated_i, extrapolated_j) = if age_ns > MAX_DRIFT_EXTRAPOLATION_NS {
+                        tracing::debug!(
+                            "clock result stale ({:.0}s) — drift extrapolation disabled for {}/{}",
+                            age_ns as f64 / 1e9, sensor_i, sensor_j
+                        );
+                        (offset_i, offset_j)
+                    } else {
+                        let dt_s = age_ns as f64 / 1e9;
+                        (offset_i + drift_i * dt_s, offset_j + drift_j * dt_s)
+                    };
 
                     // Return i-j offset (convention: sensor_i - sensor_j).
                     return extrapolated_i - extrapolated_j;
@@ -489,5 +504,25 @@ impl ClockSyncEngine {
     /// Export global solver result for WebSocket broadcast (new).
     pub fn export_global_result(&self) -> Option<SolveResult> {
         self.cached_global_result.clone()
+    }
+
+    /// Returns true if the sensor has a valid, non-stale global clock calibration.
+    ///
+    /// Stable and Marginal count as calibrated.
+    /// Unstable, Disconnected, and Unknown do not.
+    /// Also returns false if the global result is older than MAX_DRIFT_EXTRAPOLATION_NS.
+    pub fn is_calibrated(&self, sensor_id: i64, now_ns: u64) -> bool {
+        use crate::global_clock_solver::SensorStatus;
+        let result = match &self.cached_global_result {
+            Some(r) if r.success => r,
+            _ => return false,
+        };
+        if now_ns.saturating_sub(result.solve_timestamp_ns) > MAX_DRIFT_EXTRAPOLATION_NS {
+            return false;
+        }
+        matches!(
+            result.statuses.get(&sensor_id),
+            Some(SensorStatus::Stable) | Some(SensorStatus::Marginal)
+        )
     }
 }

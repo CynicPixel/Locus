@@ -459,29 +459,8 @@ pub fn solve(
         jtj_inv.trace().sqrt()
     };
 
-    let gdop_threshold = 10.0;
-    if !gdop.is_finite() || gdop > gdop_threshold {
-        // Enhanced diagnostic logging for high GDOP
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let sensor_locs: Vec<(f64, f64, f64)> = input.sensor_positions
-                .iter()
-                .map(|s| (s.x, s.y, s.z))
-                .collect();
-            tracing::debug!(
-                gdop = gdop,
-                lat = lat_tmp,
-                lon = lon_tmp,
-                alt_m = alt_tmp,
-                num_sensors = input.sensor_positions.len(),
-                "MLAT solution discarded — high GDOP. Sensors at {:?}, aircraft estimate at ({:.1}, {:.1}, {:.1})",
-                sensor_locs,
-                best_ecef.x,
-                best_ecef.y,
-                best_ecef.z
-            );
-        } else {
-            tracing::debug!(gdop, "MLAT solution discarded — GDOP exceeds threshold");
-        }
+    if !gdop.is_finite() {
+        tracing::debug!(gdop, "MLAT solution discarded — non-finite GDOP");
         return None;
     }
 
