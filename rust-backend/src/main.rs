@@ -131,25 +131,18 @@ async fn main() -> anyhow::Result<()> {
     {
         let ws_tx2 = ws_tx.clone();
         let addr = cli.ws_addr.clone();
-        let registry_clone = sensor_registry.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, registry_clone, ws_tx2).await {
         let cache = Arc::clone(&heatmap_cache);
+        let registry_clone = Arc::clone(&sensor_registry);
         tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache).await {
+            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache, registry_clone).await {
                 tracing::error!("WS server error: {e}");
             }
         });
     }
 
     // ---- spawn GDOP heatmap background task -------------------------------
-    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone());
     let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
 
-    // ---- pipeline state --------------------------------------------------
-    let mut correlator = Correlator::new();
-    let mut clock_sync = ClockSyncEngine::new();
-    let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
     let mut adsb_parser = AdsbParser::new();

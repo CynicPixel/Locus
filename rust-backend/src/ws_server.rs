@@ -1,13 +1,20 @@
-// WebSocket broadcast server.
-// Accepts TCP connections, upgrades to WebSocket, and fans out JSON messages.
+// WebSocket broadcast server — bidirectional.
+// Accepts TCP connections, upgrades to WebSocket, fans out JSON broadcasts,
+// and handles per-client virtual sensor commands for planning-mode GDOP.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+use crate::sensors::SensorRegistry;
+use crate::virtual_sensors::{VirtualSensorId, VirtualSensorRegistry};
 
 pub type BroadcastTx = broadcast::Sender<String>;
 
@@ -67,14 +74,41 @@ pub struct AircraftState {
 }
 
 // ---------------------------------------------------------------------------
+// Client → Server messages (virtual sensor planning)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientMessage {
+    AddVirtualSensor { lat: f64, lon: f64, alt_m: f64 },
+    RemoveVirtualSensor { id: u64 },
+    ClearVirtualSensors,
+}
+
+// ---------------------------------------------------------------------------
+// Server → Client responses (per-client, NOT broadcast)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientResponse {
+    VirtualSensorAdded { id: u64, lat: f64, lon: f64, alt_m: f64 },
+    VirtualSensorRemoved { id: u64 },
+    VirtualSensorsCleared,
+    VirtualSensorError { message: String },
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
-/// Listen on `addr`, accept WebSocket connections, and broadcast messages from `rx`.
+/// Listen on `addr`, accept WebSocket connections, broadcast from `rx`,
+/// and handle per-client virtual sensor commands.
 pub async fn run_ws_server(
     addr: String,
     tx: BroadcastTx,
     cache: Arc<RwLock<Option<String>>>,
+    sensor_registry: Arc<RwLock<SensorRegistry>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("WebSocket server listening on {addr}");
@@ -84,6 +118,7 @@ pub async fn run_ws_server(
         tracing::debug!("WS peer connected: {peer}");
         let mut rx = tx.subscribe();
         let cache = Arc::clone(&cache);
+        let sensor_registry = Arc::clone(&sensor_registry);
 
         tokio::spawn(async move {
             let ws = match tokio_tungstenite::accept_async(stream).await {
@@ -93,7 +128,9 @@ pub async fn run_ws_server(
                     return;
                 }
             };
-            let (mut sink, _source) = ws.split();
+
+            let (mut sink, mut source) = ws.split();
+            let mut virtual_registry = VirtualSensorRegistry::new(20);
 
             // Send cached heatmap immediately — no wait for next 60s tick
             {
@@ -104,19 +141,146 @@ pub async fn run_ws_server(
             }
 
             loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if sink.send(Message::Text(msg.into())).await.is_err() {
-                            break; // client disconnected
+                tokio::select! {
+                    // Outbound: broadcast messages from the live pipeline
+                    result = rx.recv() => {
+                        match result {
+                            Ok(msg) => {
+                                if sink.send(Message::Text(msg.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("WS client {peer} lagged by {n} messages");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("WS client {peer} lagged by {n} messages");
+
+                    // Inbound: virtual sensor commands from this client
+                    result = source.next() => {
+                        match result {
+                            Some(Ok(Message::Text(text))) => {
+                                handle_client_msg(
+                                    &text,
+                                    &mut virtual_registry,
+                                    &mut sink,
+                                    &sensor_registry,
+                                    peer,
+                                ).await;
+                            }
+                            Some(Ok(Message::Close(_))) | None => break,
+                            Some(Err(e)) => {
+                                tracing::warn!("WS client {peer} error: {e}");
+                                break;
+                            }
+                            _ => {} // Ping/Pong/Binary — ignore
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+
+            // virtual_registry is dropped here — ephemeral, no shared state
             tracing::debug!("WS peer disconnected: {peer}");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-client message handler
+// ---------------------------------------------------------------------------
+
+async fn handle_client_msg(
+    text: &str,
+    vreg: &mut VirtualSensorRegistry,
+    sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
+    sreg: &Arc<RwLock<SensorRegistry>>,
+    peer: SocketAddr,
+) {
+    let msg: ClientMessage = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("unparseable WS message from {peer}: {e}");
+            return;
+        }
+    };
+
+    match msg {
+        ClientMessage::AddVirtualSensor { lat, lon, alt_m } => {
+            match vreg.add(lat, lon, alt_m) {
+                Ok(id) => {
+                    send_json(sink, &ClientResponse::VirtualSensorAdded {
+                        id: id.0, lat, lon, alt_m,
+                    }).await;
+                    recompute_planning_gdop(vreg, sink, sreg).await;
+                }
+                Err(e) => {
+                    send_json(sink, &ClientResponse::VirtualSensorError { message: e }).await;
+                }
+            }
+        }
+        ClientMessage::RemoveVirtualSensor { id } => {
+            vreg.remove(VirtualSensorId(id));
+            send_json(sink, &ClientResponse::VirtualSensorRemoved { id }).await;
+            recompute_planning_gdop(vreg, sink, sreg).await;
+        }
+        ClientMessage::ClearVirtualSensors => {
+            vreg.clear();
+            send_json(sink, &ClientResponse::VirtualSensorsCleared).await;
+            // No recompute — client exits planning mode, live heatmap resumes
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Planning-mode GDOP recomputation (per-client, never broadcast)
+// ---------------------------------------------------------------------------
+
+async fn recompute_planning_gdop(
+    vreg: &VirtualSensorRegistry,
+    sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
+    sreg: &Arc<RwLock<SensorRegistry>>,
+) {
+    // Snapshot both registries — release async lock before spawn_blocking.
+    // SensorRegistry: #[derive(Clone)], VirtualSensorRegistry: #[derive(Clone)]
+    let real_snap = sreg.read().await.clone();
+    let virt_snap = vreg.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::gdop_heatmap::compute_grid_with_virtual(
+            &real_snap,
+            &virt_snap,
+            9144.0, // FL300 — same as live heatmap
+            0.1,    // 0.1° resolution — same as live heatmap
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(grid)) => {
+            if let Ok(json) = serde_json::to_string(&grid) {
+                let _ = sink.send(Message::Text(json.into())).await;
+            }
+        }
+        Ok(Err(e)) => {
+            send_json(sink, &ClientResponse::VirtualSensorError {
+                message: format!("GDOP computation failed: {e}"),
+            })
+            .await;
+        }
+        Err(e) => tracing::error!("spawn_blocking panic in planning GDOP: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+async fn send_json<T: Serialize>(
+    sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
+    payload: &T,
+) {
+    if let Ok(json) = serde_json::to_string(payload) {
+        let _ = sink.send(Message::Text(json.into())).await;
     }
 }

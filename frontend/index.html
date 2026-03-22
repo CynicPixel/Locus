@@ -1,736 +1,1356 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
+
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Locus MLAT — Aircraft Tracker</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; font-family: "Segoe UI", system-ui, sans-serif; background: #0d1117; color: #c9d1d9; }
-  #layout { display: flex; height: 100vh; }
-  #map { flex: 1; position: relative; }
-  #sidebar {
-    width: 340px; min-width: 260px; display: flex; flex-direction: column;
-    background: #161b22; border-left: 1px solid #30363d; overflow: hidden;
-  }
-  #sidebar header {
-    padding: 12px 16px; background: #1c2128; border-bottom: 1px solid #30363d;
-    font-size: 1rem; font-weight: 600; letter-spacing: .03em;
-  }
-  #sidebar header span.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
-  .panel { border-bottom: 1px solid #30363d; padding: 10px 14px; }
-  .panel-title { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: #8b949e; margin-bottom: 6px; }
-  #aircraft-list { overflow-y: auto; flex: 1; min-height: 0; }
-  .ac-row {
-    padding: 7px 14px; border-bottom: 1px solid #21262d; cursor: pointer;
-    display: flex; align-items: center; gap: 8px; font-size: .82rem;
-  }
-  .ac-row:hover { background: #1c2128; }
-  .ac-icao { font-weight: 700; font-family: monospace; min-width: 60px; }
-  .ac-pos { color: #8b949e; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .badge {
-    font-size: .68rem; padding: 2px 6px; border-radius: 10px; font-weight: 700; white-space: nowrap;
-  }
-  .badge-normal  { background: #1a7f37; color: #fff; }
-  .badge-anomaly { background: #b91c1c; color: #fff; }
-  .badge-unknown { background: #374151; color: #9ca3af; }
-  .badge-idle    { background: #7f1d1d; color: #fca5a5; }
-  #alert-list { max-height: 120px; overflow-y: auto; }
-  .alert-entry { font-size: .75rem; padding: 3px 0; border-bottom: 1px solid #21262d; color: #f59e0b; }
-  /* ─── Info tooltip system ─────────────────────────────────────────── */
-  .info-icon {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 14px; height: 14px; border-radius: 50%;
-    background: #30363d; color: #8b949e;
-    font-size: 9px; font-weight: 700;
-    cursor: help; margin-left: 5px; position: relative;
-  }
-  .info-icon:hover::after {
-    content: attr(data-tip);
-    position: absolute; left: 18px; top: -4px;
-    background: #1c2128; border: 1px solid #30363d;
-    border-radius: 6px; padding: 6px 8px;
-    font-size: .7rem; color: #c9d1d9;
-    width: 200px; white-space: normal; z-index: 9999;
-    pointer-events: none; line-height: 1.4; font-weight: 400;
-    box-shadow: 0 4px 12px rgba(0,0,0,.4);
-  }
-  /* ─── Collapsible panels ──────────────────────────────────────────── */
-  .panel-header { display: flex; align-items: center; justify-content: space-between; }
-  .panel-body { transition: max-height .25s ease, opacity .25s ease; overflow: hidden; }
-  .panel-body.collapsed { max-height: 0 !important; opacity: 0; }
-  .collapse-btn { background: none; border: none; color: #8b949e; cursor: pointer; padding: 0 4px; font-size: .8rem; }
-  .collapse-btn:hover { color: #c9d1d9; }
-  /* ─── Clock sync floating panel ───────────────────────────────────── */
-  #clock-panel {
-    position: absolute; top: 90px; left: 10px; z-index: 1000; width: 400px;
-    background: rgba(22,27,34,0.95); border: 1px solid #30363d;
-    border-radius: 8px; font-size: .8rem; color: #c9d1d9;
-    box-shadow: 0 4px 16px rgba(0,0,0,.5);
-  }
-  #clock-panel-header {
-    display: flex; align-items: center; gap: 6px; padding: 8px 10px;
-    border-bottom: 1px solid #30363d; font-weight: 600; font-size: .78rem; letter-spacing: .04em;
-  }
-  #clock-panel-header .clock-title { flex: 1; }
-  #clock-panel-rms { font-size: .72rem; font-weight: 700; }
-  #clock-panel-body { padding: 8px 10px 10px; }
-  #clock-chart-row { display: flex; gap: 8px; align-items: flex-start; }
-  #clock-chart-row canvas { flex: 1; min-width: 0; height: 180px !important; }
-  #clock-legend-panel {
-    width: 72px; flex-shrink: 0; display: flex; flex-direction: column;
-    justify-content: flex-start; gap: 1px;
-  }
-  #status-bar {
-    padding: 5px 14px; font-size: .72rem; color: #8b949e;
-    border-top: 1px solid #30363d; display: flex; justify-content: space-between;
-    flex-shrink: 0;
-  }
-  /* ─── Network health indicator ─────────────────────────────────────────── */
-  #net-status {
-    display: flex; align-items: center; gap: 8px;
-    padding: 5px 16px 6px; font-size: .72rem;
-    background: #1c2128; border-bottom: 1px solid #30363d; flex-shrink: 0;
-  }
-  #net-status .net-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  #net-status .net-label { font-weight: 700; letter-spacing: .05em; }
-  #net-status .net-count { color: #8b949e; margin-left: auto; font-size: .68rem; }
-  /* Sensor toggle button */
-  #sensor-toggle {
-    position: absolute; top: 80px; right: 10px; z-index: 1000;
-    background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
-    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
-  }
-  #sensor-toggle.active { background: #1a7f37; border-color: #22c55e; color: #fff; }
-  /* Mode toggle button */
-  #mode-toggle {
-    position: absolute; top: 120px; right: 10px; z-index: 1000;
-    background: #6b21a8; color: #fff; border: 1px solid #7c3aed;
-    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
-    font-weight: 600;
-  }
-  /* GDOP heatmap toggle button */
-  #gdop-toggle {
-    position: absolute; top: 160px; right: 10px; z-index: 1000;
-    background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
-    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: .8rem;
-  }
-  #gdop-toggle.active { background: #7c3aed; border-color: #a78bfa; color: #fff; }
-  /* ─── Floating aircraft color legend ───────────────────────────────────── */
-  #marker-legend {
-    position: absolute; top: 202px; right: 10px; z-index: 1000;
-    background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 6px;
-    font-size: .72rem; color: #c9d1d9; min-width: 156px;
-  }
-  #marker-legend-header {
-    display: flex; align-items: center; gap: 4px;
-    padding: 5px 8px 5px 10px; cursor: default;
-  }
-  #marker-legend-title {
-    flex: 1; font-weight: 600; font-size: .68rem;
-    letter-spacing: .06em; color: #8b949e; text-transform: uppercase;
-  }
-  #marker-legend-body { padding: 6px 10px 8px; }
-  .mlgd-row { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
-  .mlgd-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
-  .mlgd-sep { border-top: 1px solid #30363d; margin: 5px 0; }
-  /* Aircraft popup — flex wrapper positions both cards */
-  #ac-popup-wrapper {
-    display: none; position: absolute; bottom: 36px; left: 10px; z-index: 1000;
-    flex-direction: row; gap: 8px; align-items: flex-end;
-  }
-  /* Left card: identity + flight state */
-  #ac-popup {
-    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 12px 14px; min-width: 220px; max-width: 270px; font-size: .82rem;
-  }
-  #ac-popup .popup-title { font-weight: 700; font-family: monospace; font-size: .95rem; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
-  #ac-popup table { width: 100%; border-collapse: collapse; }
-  #ac-popup td { padding: 2px 4px; color: #8b949e; }
-  #ac-popup td:last-child { color: #c9d1d9; text-align: right; }
-  #ac-popup .idle-strip { margin-top: 8px; background: #7f1d1d; color: #fca5a5; border-radius: 4px; padding: 4px 8px; font-size: .75rem; display: none; }
-  /* Right card: quality + tracking data */
-  #ac-popup-right {
-    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-    padding: 10px 12px; min-width: 160px; font-size: .82rem;
-  }
-  #ac-popup-right table { width: 100%; border-collapse: collapse; }
-  #ac-popup-right td { padding: 2px 4px; color: #8b949e; }
-  #ac-popup-right td:last-child { color: #c9d1d9; text-align: right; }
-  /* Aircraft map callsign label */
-  .ac-label { background: transparent !important; border: none !important; box-shadow: none !important;
-    color: #c9d1d9; font-size: 10px; font-family: monospace; padding: 0 !important; white-space: nowrap; }
-  /* Stability alerts panel */
-  .alert-critical { color: #ef4444; font-weight: 600; }
-  .alert-warning { color: #f59e0b; }
-  .alert-info { color: #3b82f6; }
-  #stability-alerts {
-    font-size: .72rem; background: #0d1117; border-bottom: 1px solid #30363d;
-  }
-  .stability-alert-entry {
-    padding: 4px 0; border-bottom: 1px solid #21262d;
-    display: flex; align-items: center; gap: 6px;
-  }
-  .stability-alert-entry:last-child { border-bottom: none; }
-  .alert-time { color: #6e7681; min-width: 60px; }
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Locus MLAT — Aircraft Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      height: 100%;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+    }
+
+    #layout {
+      display: flex;
+      height: 100vh;
+    }
+
+    #map {
+      flex: 1;
+      position: relative;
+    }
+
+    #sidebar {
+      width: 340px;
+      min-width: 260px;
+      display: flex;
+      flex-direction: column;
+      background: #161b22;
+      border-left: 1px solid #30363d;
+      overflow: hidden;
+    }
+
+    #sidebar header {
+      padding: 12px 16px;
+      background: #1c2128;
+      border-bottom: 1px solid #30363d;
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+    }
+
+    #sidebar header span.dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 8px;
+    }
+
+    .panel {
+      border-bottom: 1px solid #30363d;
+      padding: 10px 14px;
+    }
+
+    .panel-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8b949e;
+      margin-bottom: 6px;
+    }
+
+    #aircraft-list {
+      overflow-y: auto;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .ac-row {
+      padding: 7px 14px;
+      border-bottom: 1px solid #21262d;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.82rem;
+    }
+
+    .ac-row:hover {
+      background: #1c2128;
+    }
+
+    .ac-icao {
+      font-weight: 700;
+      font-family: monospace;
+      min-width: 60px;
+    }
+
+    .ac-pos {
+      color: #8b949e;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .badge {
+      font-size: 0.68rem;
+      padding: 2px 6px;
+      border-radius: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .badge-normal {
+      background: #1a7f37;
+      color: #fff;
+    }
+
+    .badge-anomaly {
+      background: #b91c1c;
+      color: #fff;
+    }
+
+    .badge-unknown {
+      background: #374151;
+      color: #9ca3af;
+    }
+
+    .badge-idle {
+      background: #7f1d1d;
+      color: #fca5a5;
+    }
+
+    #alert-list {
+      max-height: 120px;
+      overflow-y: auto;
+    }
+
+    .alert-entry {
+      font-size: 0.75rem;
+      padding: 3px 0;
+      border-bottom: 1px solid #21262d;
+      color: #f59e0b;
+    }
+
+    /* ─── Info tooltip system ─────────────────────────────────────────── */
+    .info-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #30363d;
+      color: #8b949e;
+      font-size: 9px;
+      font-weight: 700;
+      cursor: help;
+      margin-left: 5px;
+      position: relative;
+    }
+
+    .info-icon:hover::after {
+      content: attr(data-tip);
+      position: absolute;
+      left: 18px;
+      top: -4px;
+      background: #1c2128;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 0.7rem;
+      color: #c9d1d9;
+      width: 200px;
+      white-space: normal;
+      z-index: 9999;
+      pointer-events: none;
+      line-height: 1.4;
+      font-weight: 400;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+
+    /* ─── Collapsible panels ──────────────────────────────────────────── */
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .panel-body {
+      transition:
+        max-height 0.25s ease,
+        opacity 0.25s ease;
+      overflow: hidden;
+    }
+
+    .panel-body.collapsed {
+      max-height: 0 !important;
+      opacity: 0;
+    }
+
+    .collapse-btn {
+      background: none;
+      border: none;
+      color: #8b949e;
+      cursor: pointer;
+      padding: 0 4px;
+      font-size: 0.8rem;
+    }
+
+    .collapse-btn:hover {
+      color: #c9d1d9;
+    }
+
+    /* ─── Clock sync floating panel ───────────────────────────────────── */
+    #clock-panel {
+      position: absolute;
+      top: 90px;
+      left: 10px;
+      z-index: 1000;
+      width: 400px;
+      background: rgba(22, 27, 34, 0.95);
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      color: #c9d1d9;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    }
+
+    #clock-panel-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 10px;
+      border-bottom: 1px solid #30363d;
+      font-weight: 600;
+      font-size: 0.78rem;
+      letter-spacing: 0.04em;
+    }
+
+    #clock-panel-header .clock-title {
+      flex: 1;
+    }
+
+    #clock-panel-rms {
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+
+    #clock-panel-body {
+      padding: 8px 10px 10px;
+    }
+
+    #clock-chart-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+
+    #clock-chart-row canvas {
+      flex: 1;
+      min-width: 0;
+      height: 180px !important;
+    }
+
+    #clock-legend-panel {
+      width: 72px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 1px;
+    }
+
+    #status-bar {
+      padding: 5px 14px;
+      font-size: 0.72rem;
+      color: #8b949e;
+      border-top: 1px solid #30363d;
+      display: flex;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    /* ─── Network health indicator ─────────────────────────────────────────── */
+    #net-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 16px 6px;
+      font-size: 0.72rem;
+      background: #1c2128;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+    }
+
+    #net-status .net-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    #net-status .net-label {
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+
+    #net-status .net-count {
+      color: #8b949e;
+      margin-left: auto;
+      font-size: 0.68rem;
+    }
+
+    /* ─── SYS CTRL Rail ─────────────────────────────────────────────────────── */
+    #ctrl-rail {
+      position: absolute; top: 80px; right: 10px; z-index: 1000;
+      width: 82px;
+      background: rgba(13,17,23,0.97);
+      border: 1px solid #30363d;
+      border-radius: 3px;
+      font-family: 'Courier New', Courier, monospace;
+      overflow: hidden;
+      box-shadow: 0 2px 16px rgba(0,0,0,.65), inset 0 0 0 1px rgba(255,255,255,.025);
+    }
+    #ctrl-rail-header {
+      padding: 5px 6px 4px;
+      background: #1c2128;
+      border-bottom: 1px solid #30363d;
+      font-size: .56rem; letter-spacing: .18em;
+      color: #6e7681; text-align: center;
+      font-weight: 700; text-transform: uppercase;
+    }
+    .ctrl-btn {
+      display: flex; flex-direction: column; align-items: center;
+      width: 100%; padding: 9px 6px 8px;
+      background: none; border: none;
+      border-bottom: 1px solid #21262d;
+      cursor: pointer; gap: 5px;
+      transition: background .1s;
+    }
+    .ctrl-btn:last-child { border-bottom: none; }
+    .ctrl-btn:hover { background: rgba(255,255,255,.04); }
+    .ctrl-indicator {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #21262d; border: 1px solid #444c56;
+      transition: all .15s; flex-shrink: 0;
+    }
+    .ctrl-label {
+      font-size: .57rem; letter-spacing: .09em;
+      color: #6e7681; font-weight: 700;
+      text-transform: uppercase; font-family: 'Courier New', monospace;
+      line-height: 1;
+    }
+    #sensor-toggle.active .ctrl-indicator { background: #22c55e; box-shadow: 0 0 5px #22c55e88; border-color: #22c55e; }
+    #sensor-toggle.active .ctrl-label    { color: #22c55e; }
+    #mode-toggle .ctrl-indicator          { background: #7c3aed; box-shadow: 0 0 5px #7c3aed88; border-color: #7c3aed; }
+    #mode-toggle .ctrl-label              { color: #a78bfa; }
+    #gdop-toggle.active .ctrl-indicator  { background: #a78bfa; box-shadow: 0 0 5px #a78bfa88; border-color: #a78bfa; }
+    #gdop-toggle.active .ctrl-label      { color: #a78bfa; }
+    #planning-toggle.active .ctrl-indicator { background: #f59e0b; box-shadow: 0 0 6px #f59e0b99; border-color: #d97706; }
+    #planning-toggle.active .ctrl-label     { color: #fbbf24; }
+
+    /* ─── Virtual Sensor Floating Panel ─────────────────────────────────────── */
+    #vs-float {
+      display: none;
+      position: absolute; top: 80px; right: 102px; z-index: 1000;
+      width: 230px;
+      background: rgba(13,17,23,0.97);
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      font-size: .78rem; color: #c9d1d9;
+      box-shadow: 0 4px 16px rgba(0,0,0,.55);
+      font-family: 'Courier New', Courier, monospace;
+    }
+    #vs-float-header {
+      display: flex; align-items: center; gap: 6px;
+      padding: 7px 10px;
+      background: #1c2128;
+      border-bottom: 1px solid #30363d;
+      font-size: .62rem; font-weight: 700;
+      letter-spacing: .12em; text-transform: uppercase; color: #f59e0b;
+    }
+    #vs-float-header .vs-float-title { flex: 1; }
+    #vs-float-body { padding: 8px 10px 10px; }
+    #vs-float-count { font-size: .58rem; color: #6e7681; letter-spacing: .06em; }
+
+    /* ─── Floating aircraft color legend ───────────────────────────────────── */
+    #marker-legend {
+      position: absolute;
+      top: 262px;
+      right: 10px;
+      z-index: 1000;
+      background: rgba(22, 27, 34, 0.92);
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      color: #c9d1d9;
+      min-width: 156px;
+    }
+
+    #marker-legend-header {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 5px 8px 5px 10px;
+      cursor: default;
+    }
+
+    #marker-legend-title {
+      flex: 1;
+      font-weight: 600;
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      color: #8b949e;
+      text-transform: uppercase;
+    }
+
+    #marker-legend-body {
+      padding: 6px 10px 8px;
+    }
+
+    .mlgd-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 3px;
+    }
+
+    .mlgd-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .mlgd-sep {
+      border-top: 1px solid #30363d;
+      margin: 5px 0;
+    }
+
+    /* Aircraft popup — flex wrapper positions both cards */
+    #ac-popup-wrapper {
+      display: none;
+      position: absolute;
+      bottom: 36px;
+      left: 10px;
+      z-index: 1000;
+      flex-direction: row;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    /* Left card: identity + flight state */
+    #ac-popup {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 12px 14px;
+      min-width: 220px;
+      max-width: 270px;
+      font-size: 0.82rem;
+    }
+
+    #ac-popup .popup-title {
+      font-weight: 700;
+      font-family: monospace;
+      font-size: 0.95rem;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    #ac-popup table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    #ac-popup td {
+      padding: 2px 4px;
+      color: #8b949e;
+    }
+
+    #ac-popup td:last-child {
+      color: #c9d1d9;
+      text-align: right;
+    }
+
+    #ac-popup .idle-strip {
+      margin-top: 8px;
+      background: #7f1d1d;
+      color: #fca5a5;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 0.75rem;
+      display: none;
+    }
+
+    /* Right card: quality + tracking data */
+    #ac-popup-right {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-width: 160px;
+      font-size: 0.82rem;
+    }
+
+    #ac-popup-right table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    #ac-popup-right td {
+      padding: 2px 4px;
+      color: #8b949e;
+    }
+
+    #ac-popup-right td:last-child {
+      color: #c9d1d9;
+      text-align: right;
+    }
+
+    /* Aircraft map callsign label */
+    .ac-label {
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      color: #c9d1d9;
+      font-size: 10px;
+      font-family: monospace;
+      padding: 0 !important;
+      white-space: nowrap;
+    }
+
+    /* Stability alerts panel */
+    .alert-critical {
+      color: #ef4444;
+      font-weight: 600;
+    }
+
+    .alert-warning {
+      color: #f59e0b;
+    }
+
+    .alert-info {
+      color: #3b82f6;
+    }
+
+    #stability-alerts {
+      font-size: 0.72rem;
+      background: #0d1117;
+      border-bottom: 1px solid #30363d;
+    }
+
+    .stability-alert-entry {
+      padding: 4px 0;
+      border-bottom: 1px solid #21262d;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .stability-alert-entry:last-child {
+      border-bottom: none;
+    }
+
+    .alert-time {
+      color: #6e7681;
+      min-width: 60px;
+    }
+  </style>
 </head>
+
 <body>
-<div id="layout">
-  <div id="map">
-    <button id="sensor-toggle" onclick="toggleSensors()">&#128225; Sensors</button>
-    <button id="mode-toggle" onclick="toggleDisplayMode()">&#128994; MLAT</button>
-    <button id="gdop-toggle" onclick="toggleGdopHeatmap()">&#127758; GDOP</button>
+  <div id="layout">
+    <div id="map">
+      <!-- SYS CTRL Rail -->
+      <div id="ctrl-rail">
+        <div id="ctrl-rail-header">SYS CTRL</div>
+        <button id="sensor-toggle" class="ctrl-btn" onclick="toggleSensors()">
+          <span class="ctrl-indicator"></span>
+          <span class="ctrl-label">SENSORS</span>
+        </button>
+        <button id="mode-toggle" class="ctrl-btn" onclick="toggleDisplayMode()">
+          <span class="ctrl-indicator"></span>
+          <span class="ctrl-label" id="ctrl-mode-label">MLAT</span>
+        </button>
+        <button id="gdop-toggle" class="ctrl-btn" onclick="toggleGdopHeatmap()">
+          <span class="ctrl-indicator"></span>
+          <span class="ctrl-label">GDOP</span>
+        </button>
+        <button id="planning-toggle" class="ctrl-btn" onclick="togglePlanningMode()">
+          <span class="ctrl-indicator"></span>
+          <span class="ctrl-label">PLAN</span>
+        </button>
+      </div>
 
-    <!-- Floating minimizable aircraft color legend -->
-    <div id="marker-legend" style="display:none">
-      <div id="marker-legend-header">
-        <span id="marker-legend-title">Aircraft Colors</span>
-        <button class="collapse-btn" id="marker-legend-toggle" onclick="toggleMarkerLegend()">&#8963;</button>
+      <!-- Virtual Sensor Floating Panel (visible only in planning mode) -->
+      <div id="vs-float">
+        <div id="vs-float-header">
+          <span class="vs-float-title">&#11835; VIRTUAL SENSORS</span>
+          <span id="vs-float-count">0 placed</span>
+          <button class="collapse-btn" id="vs-float-toggle" onclick="toggleVsFloat()">&#8963;</button>
+        </div>
+        <div id="vs-float-body" class="panel-body">
+          <div id="vs-error" style="display:none;background:#7f1d1d;color:#fca5a5;border-radius:3px;padding:4px 8px;font-size:.68rem;margin-bottom:6px;font-family:monospace"></div>
+          <div id="vs-list"></div>
+          <div style="margin-top:7px">
+            <button onclick="exitPlanningMode()"
+              style="width:100%;background:#1c2128;color:#fca5a5;border:1px solid #7f1d1d;
+                     border-radius:3px;padding:4px 8px;cursor:pointer;font-size:.62rem;
+                     font-weight:700;letter-spacing:.08em;font-family:'Courier New',monospace">
+              &#x2715; EXIT PLAN
+            </button>
+          </div>
+          <div id="planning-cov-stats" style="margin-top:8px;font-size:.68rem;color:#6e7681;font-family:'Courier New',monospace">
+            Place virtual sensors to see simulated coverage.
+          </div>
+        </div>
       </div>
-      <div class="panel-body" id="marker-legend-body">
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#22c55e"></span><span>Excellent GDOP &lt;2</span></div>
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#14b8a6"></span><span>Good GDOP 2–5</span></div>
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#eab308"></span><span>Fair GDOP 5–10</span></div>
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#f97316"></span><span>Poor GDOP &gt;10</span></div>
-        <div class="mlgd-sep"></div>
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#ef4444"></span><span>Anomaly detected</span></div>
-        <div class="mlgd-row"><span class="mlgd-dot" style="background:#f59e0b"></span><span>Spoof flag</span></div>
-        <div style="margin-top:5px;color:#6e7681;font-size:.63rem;line-height:1.3">Lower GDOP = better fix accuracy</div>
-      </div>
-    </div>
 
-    <!-- Global Clock Sync floating panel (top-left) -->
-    <div id="clock-panel">
-      <div id="clock-panel-header">
-        <span class="clock-title">&#9201; Clock Sync</span>
-        <span id="clock-panel-rms" style="color:#8b949e">RMS: —</span>
-        <span class="info-icon" data-tip="Real-time nanosecond clock offset of each MLAT sensor over a 5-min window. Green=Stable, Orange=Marginal, Red=Unstable.">i</span>
-        <button class="collapse-btn" id="clock-panel-toggle" onclick="toggleClockPanel()">&#8963;</button>
+      <!-- Floating minimizable aircraft color legend -->
+      <div id="marker-legend" style="display: none">
+        <div id="marker-legend-header">
+          <span id="marker-legend-title">Aircraft Colors</span>
+          <button class="collapse-btn" id="marker-legend-toggle" onclick="toggleMarkerLegend()">
+            &#8963;
+          </button>
+        </div>
+        <div class="panel-body" id="marker-legend-body">
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #22c55e"></span><span>Excellent GDOP &lt;2</span>
+          </div>
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #14b8a6"></span><span>Good GDOP 2–5</span>
+          </div>
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #eab308"></span><span>Fair GDOP 5–10</span>
+          </div>
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #f97316"></span><span>Poor GDOP &gt;10</span>
+          </div>
+          <div class="mlgd-sep"></div>
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #ef4444"></span><span>Anomaly detected</span>
+          </div>
+          <div class="mlgd-row">
+            <span class="mlgd-dot" style="background: #f59e0b"></span><span>Spoof flag</span>
+          </div>
+          <div style="
+                margin-top: 5px;
+                color: #6e7681;
+                font-size: 0.63rem;
+                line-height: 1.3;
+              ">
+            Lower GDOP = better fix accuracy
+          </div>
+        </div>
       </div>
-      <div id="clock-panel-body" class="panel-body">
-        <div id="clock-chart-row">
-          <canvas id="health-chart"></canvas>
-          <div id="clock-legend-panel"></div>
+
+      <!-- Global Clock Sync floating panel (top-left) -->
+      <div id="clock-panel">
+        <div id="clock-panel-header">
+          <span class="clock-title">&#9201; Clock Sync</span>
+          <span id="clock-panel-rms" style="color: #8b949e">RMS: —</span>
+          <span class="info-icon"
+            data-tip="Real-time nanosecond clock offset of each MLAT sensor over a 5-min window. Green=Stable, Orange=Marginal, Red=Unstable.">i</span>
+          <button class="collapse-btn" id="clock-panel-toggle" onclick="toggleClockPanel()">
+            &#8963;
+          </button>
+        </div>
+        <div id="clock-panel-body" class="panel-body">
+          <div id="clock-chart-row">
+            <canvas id="health-chart"></canvas>
+            <div id="clock-legend-panel"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="ac-popup-wrapper">
+        <!-- LEFT card: quality + tracking data -->
+        <div id="ac-popup-right">
+          <table id="popup-table-right"></table>
+        </div>
+        <!-- RIGHT card: identity + flight state -->
+        <div id="ac-popup">
+          <div class="popup-title">
+            <span id="popup-icao">—</span>
+            <span style="cursor: pointer; color: #8b949e" onclick="closePopup()">&#x2715;</span>
+          </div>
+          <div class="idle-strip" id="popup-idle">
+            &#9888; No signal for <span id="popup-idle-time"></span>
+          </div>
+          <table id="popup-table"></table>
         </div>
       </div>
     </div>
-
-    <div id="ac-popup-wrapper">
-      <!-- LEFT card: quality + tracking data -->
-      <div id="ac-popup-right">
-        <table id="popup-table-right"></table>
+    <div id="sidebar">
+      <header>
+        <span class="dot" id="conn-dot" style="background: #8b949e"></span>
+        Locus MLAT
+      </header>
+      <div id="net-status">
+        <span class="net-dot" id="net-dot" style="background: #6e7681"></span>
+        <span class="net-label" id="net-label" style="color: #6e7681">OFFLINE</span>
+        <span class="net-count" id="net-count">0 / 0 sensors</span>
       </div>
-      <!-- RIGHT card: identity + flight state -->
-      <div id="ac-popup">
-        <div class="popup-title">
-          <span id="popup-icao">—</span>
-          <span style="cursor:pointer;color:#8b949e" onclick="closePopup()">&#x2715;</span>
+
+      <!-- Alerts panel (collapsible) -->
+      <div class="panel" id="alerts-panel">
+        <div class="panel-header">
+          <span class="panel-title" style="margin-bottom: 0">Alerts
+            <span class="info-icon" data-tip="GPS spoof and ML anomaly detections from live aircraft data.">i</span>
+          </span>
+          <button class="collapse-btn" id="alerts-toggle" onclick="togglePanel('alert-body','alerts-toggle')">
+            &#8963;
+          </button>
         </div>
-        <div class="idle-strip" id="popup-idle">&#9888; No signal for <span id="popup-idle-time"></span></div>
-        <table id="popup-table"></table>
+        <div class="panel-body" id="alert-body" style="max-height: 100px; overflow-y: auto; margin-top: 6px">
+          <div id="alert-list">
+            <em style="color: #555; font-size: 0.75rem">No alerts</em>
+          </div>
+        </div>
+      </div>
+
+      <!-- Clock Stability panel (collapsible, hidden until first alert) -->
+      <div id="stability-alerts" style="display: none">
+        <div class="panel-header" style="padding: 10px 14px 0">
+          <span class="panel-title" style="margin-bottom: 0">Clock Stability
+            <span class="info-icon"
+              data-tip="Sensor clock status transitions — stable/marginal/unstable/disconnected.">i</span>
+          </span>
+          <button class="collapse-btn" id="stability-toggle" onclick="togglePanel('stability-body','stability-toggle')">
+            &#8963;
+          </button>
+        </div>
+        <div class="panel-body collapsed" id="stability-body"
+          style="max-height: 150px; overflow-y: auto; padding: 0 14px 8px">
+          <div id="stability-alert-list"></div>
+        </div>
+      </div>
+
+      <!-- Aircraft list -->
+      <div style="
+            padding: 8px 14px 4px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid #30363d;
+            flex-shrink: 0;
+          ">
+        <span class="panel-title" style="margin-bottom: 0">Aircraft (<span id="ac-count">0</span>)</span>
+        <span class="info-icon" data-tip="Live aircraft list. Click to focus. Color = GDOP quality tier.">i</span>
+      </div>
+      <div id="aircraft-list"></div>
+
+      <!-- Heatmap Coverage: unified color key + live stats (visible only when GDOP heatmap active) -->
+      <div class="panel" id="heatmap-coverage" style="display: none">
+        <div class="panel-header">
+          <span class="panel-title" style="margin-bottom: 0">GDOP Coverage
+            <span class="info-icon"
+              data-tip="Each tier shows its GDOP range and the % of monitored airspace at that quality. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
+            <span id="planning-badge" style="
+                  display: none;
+                  background: #78350f;
+                  color: #fbbf24;
+                  border: 1px solid #d97706;
+                  border-radius: 4px;
+                  padding: 2px 7px;
+                  font-size: 0.64rem;
+                  font-weight: 700;
+                  letter-spacing: 0.06em;
+                  font-family: monospace;
+                  margin-left: 4px;
+                "></span>
+          </span>
+          <button class="collapse-btn" id="heatmap-coverage-toggle"
+            onclick="togglePanel('heatmap-coverage-body','heatmap-coverage-toggle')">
+            &#8963;
+          </button>
+        </div>
+        <div class="panel-body" id="heatmap-coverage-body"></div>
+      </div>
+
+      <div id="status-bar">
+        <span id="stat-count">0 aircraft</span>
+        <span id="stat-time">—</span>
       </div>
     </div>
   </div>
-  <div id="sidebar">
-    <header>
-      <span class="dot" id="conn-dot" style="background:#8b949e"></span>
-      Locus MLAT
-    </header>
-    <div id="net-status">
-      <span class="net-dot" id="net-dot" style="background:#6e7681"></span>
-      <span class="net-label" id="net-label" style="color:#6e7681">OFFLINE</span>
-      <span class="net-count" id="net-count">0 / 0 sensors</span>
-    </div>
 
-    <!-- Alerts panel (collapsible) -->
-    <div class="panel" id="alerts-panel">
-      <div class="panel-header">
-        <span class="panel-title" style="margin-bottom:0">Alerts
-          <span class="info-icon" data-tip="GPS spoof and ML anomaly detections from live aircraft data.">i</span>
-        </span>
-        <button class="collapse-btn" id="alerts-toggle" onclick="togglePanel('alert-body','alerts-toggle')">&#8963;</button>
-      </div>
-      <div class="panel-body" id="alert-body" style="max-height:100px;overflow-y:auto;margin-top:6px">
-        <div id="alert-list"><em style="color:#555;font-size:.75rem">No alerts</em></div>
-      </div>
-    </div>
+  <script>
+    // ─── Map setup ───────────────────────────────────────────────────────────────
+    const map = L.map("map", {
+      zoomControl: true,
+      preferCanvas: true,
+    }).setView([50.1, -5.8], 6);
 
-    <!-- Clock Stability panel (collapsible, hidden until first alert) -->
-    <div id="stability-alerts" style="display:none;">
-      <div class="panel-header" style="padding:10px 14px 0">
-        <span class="panel-title" style="margin-bottom:0">Clock Stability
-          <span class="info-icon" data-tip="Sensor clock status transitions — stable/marginal/unstable/disconnected.">i</span>
-        </span>
-        <button class="collapse-btn" id="stability-toggle" onclick="togglePanel('stability-body','stability-toggle')">&#8963;</button>
-      </div>
-      <div class="panel-body collapsed" id="stability-body" style="max-height:150px;overflow-y:auto;padding:0 14px 8px">
-        <div id="stability-alert-list"></div>
-      </div>
-    </div>
+    L.tileLayer(
+      "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+      {
+        attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+        maxZoom: 19,
+      },
+    ).addTo(map);
 
-    <!-- Aircraft list -->
-    <div style="padding:8px 14px 4px;display:flex;align-items:center;border-bottom:1px solid #30363d;flex-shrink:0">
-      <span class="panel-title" style="margin-bottom:0">Aircraft (<span id="ac-count">0</span>)</span>
-      <span class="info-icon" data-tip="Live aircraft list. Click to focus. Color = GDOP quality tier.">i</span>
-    </div>
-    <div id="aircraft-list"></div>
+    // 300 km region of interest around Cornwall sensors
+    L.circle([50.1, -5.8], {
+      radius: 300000,
+      color: "#facc15",
+      fillColor: "#facc15",
+      fillOpacity: 0.04,
+      weight: 1.5,
+      dashArray: "6 4",
+    })
+      .addTo(map)
+      .bindTooltip("300 km sensor coverage (Cornwall)", {permanent: false});
 
-    <!-- Heatmap Coverage: unified color key + live stats (visible only when GDOP heatmap active) -->
-    <div class="panel" id="heatmap-coverage" style="display:none;">
-      <div class="panel-header">
-        <span class="panel-title" style="margin-bottom:0">GDOP Coverage
-          <span class="info-icon" data-tip="Each tier shows its GDOP range and the % of monitored airspace at that quality. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
-        </span>
-        <button class="collapse-btn" id="heatmap-coverage-toggle" onclick="togglePanel('heatmap-coverage-body','heatmap-coverage-toggle')">&#8963;</button>
-      </div>
-      <div class="panel-body" id="heatmap-coverage-body"></div>
-    </div>
+    // ─── WebSocket send helper ─────────────────────────────────────────────────────
+    function wsSend(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify(obj));
+    }
 
-    <div id="status-bar">
-      <span id="stat-count">0 aircraft</span>
-      <span id="stat-time">—</span>
-    </div>
-  </div>
-</div>
+    // ─── Planning mode map click ───────────────────────────────────────────────────
+    map.on("click", (e) => {
+      if (!planningMode) return;
+      wsSend({
+        type: "add_virtual_sensor",
+        lat: e.latlng.lat,
+        lon: e.latlng.lng,
+        alt_m: 15.0,
+      });
+    });
 
-<script>
-// ─── Map setup ───────────────────────────────────────────────────────────────
-const map = L.map("map", { zoomControl: true, preferCanvas: true })
-  .setView([50.1, -5.8], 6);
+    // ─── Debounced list render ────────────────────────────────────────────────────
+    let renderListPending = false;
+    function scheduleRenderList() {
+      if (!renderListPending) {
+        renderListPending = true;
+        requestAnimationFrame(() => {
+          renderListPending = false;
+          renderList();
+        });
+      }
+    }
 
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-  maxZoom: 19,
-}).addTo(map);
+    // ─── State ───────────────────────────────────────────────────────────────────
+    const aircraft = {}; // icao24 → { marker, ellipse, state, lastSeen, idle, trail[] }
+    const IDLE_WARNING_MS = 60_000; // show red triangle after 60 s idle
+    const REMOVE_MS = 300_000; // hard-remove after 5 min
+    let sensorsVisible = false;
+    const sensorMarkers = {}; // sensor_id → L.marker
+    const sensorData = {}; // sensor_id → { lat, lon, alt_m, status, offset_ns, uncertainty_ns, inSolve }
+    let selectedIcao = null;
+    let attributionLines = []; // active L.polyline[] for sensor highlight
 
-// 300 km region of interest around Cornwall sensors
-L.circle([50.1, -5.8], {
-  radius: 300000,
-  color: '#facc15', fillColor: '#facc15',
-  fillOpacity: 0.04, weight: 1.5, dashArray: '6 4'
-}).addTo(map).bindTooltip('300 km sensor coverage (Cornwall)', { permanent: false });
+    // ─── Display mode ─────────────────────────────────────────────────────────────
+    let displayMode = "mlat"; // "mlat" | "adsb"
 
-// ─── Debounced list render ────────────────────────────────────────────────────
-let renderListPending = false;
-function scheduleRenderList() {
-  if (!renderListPending) {
-    renderListPending = true;
-    requestAnimationFrame(() => { renderListPending = false; renderList(); });
-  }
-}
+    // ─── Virtual Sensor / Planning Mode ──────────────────────────────────────────
+    let planningMode = false;
+    const virtualSensors = {}; // id (number) → { lat, lon, alt_m, marker, label }
+    let vsCounter = 0;
+    const planningGdopLayer = L.layerGroup();
 
-// ─── State ───────────────────────────────────────────────────────────────────
-const aircraft = {};          // icao24 → { marker, ellipse, state, lastSeen, idle, trail[] }
-const IDLE_WARNING_MS = 60_000;   // show red triangle after 60 s idle
-const REMOVE_MS       = 300_000;  // hard-remove after 5 min
-let sensorsVisible    = false;
-const sensorMarkers   = {};       // sensor_id → L.marker
-const sensorData      = {};       // sensor_id → { lat, lon, alt_m, status, offset_ns, uncertainty_ns, inSolve }
-let selectedIcao      = null;
-let attributionLines  = [];       // active L.polyline[] for sensor highlight
+    // GDOP quality tiers for MLAT positions
+    // Returns null for ADS-B (gdop === 0)
+    function gdopTier(gdop) {
+      if (!gdop || gdop === 0) return null;
+      if (gdop < 2)
+        return {
+          tier: 1,
+          label: "Excellent",
+          color: "#22c55e",
+          style: "background:#1a7f37;color:#fff",
+        };
+      if (gdop < 5)
+        return {
+          tier: 2,
+          label: "Good",
+          color: "#14b8a6",
+          style: "background:#0f766e;color:#fff",
+        };
+      if (gdop < 10)
+        return {
+          tier: 3,
+          label: "Fair",
+          color: "#eab308",
+          style: "background:#854d0e;color:#fef08a",
+        };
+      return {
+        tier: 4,
+        label: "Poor",
+        color: "#f97316",
+        style: "background:#7c2d12;color:#fed7aa",
+      };
+    }
 
-// ─── Display mode ─────────────────────────────────────────────────────────────
-let displayMode = "mlat"; // "mlat" | "adsb"
+    // Whether to show this aircraft in the current mode
+    function aircraftVisible(state) {
+      return displayMode === "mlat" ? state.gdop > 0 : state.gdop === 0;
+    }
 
-// GDOP quality tiers for MLAT positions
-// Returns null for ADS-B (gdop === 0)
-function gdopTier(gdop) {
-  if (!gdop || gdop === 0) return null;
-  if (gdop < 2)  return { tier: 1, label: "Excellent", color: "#22c55e", style: "background:#1a7f37;color:#fff" };
-  if (gdop < 5)  return { tier: 2, label: "Good",      color: "#14b8a6", style: "background:#0f766e;color:#fff" };
-  if (gdop < 10) return { tier: 3, label: "Fair",      color: "#eab308", style: "background:#854d0e;color:#fef08a" };
-  return           { tier: 4, label: "Poor",     color: "#f97316", style: "background:#7c2d12;color:#fed7aa" };
-}
+    // Add or remove an aircraft's marker + ellipse from the map without deleting state
+    function setAircraftMapVisibility(icao24, visible) {
+      const ac = aircraft[icao24];
+      if (!ac) return;
+      if (visible) {
+        if (!map.hasLayer(ac.marker)) ac.marker.addTo(map);
+        if (ac.ellipse && !map.hasLayer(ac.ellipse)) ac.ellipse.addTo(map);
+      } else {
+        if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
+        if (ac.ellipse && map.hasLayer(ac.ellipse))
+          map.removeLayer(ac.ellipse);
+      }
+    }
+    // Topology visualization
+    const topologyLayer = L.layerGroup();
+    let topologyVisible = false;
+    const sensorNodes = {}; // sensor_id → L.circleMarker
+    const topologyEdges = []; // Array of L.polyline
+    let stabilityAlerts = []; // Ring buffer of alerts (max 10)
+    const MAX_STABILITY_ALERTS = 10;
 
-// Whether to show this aircraft in the current mode
-function aircraftVisible(state) {
-  return displayMode === "mlat" ? state.gdop > 0 : state.gdop === 0;
-}
+    // GDOP heatmap visualization
+    const gdopLayer = L.layerGroup();
+    let gdopVisible = false;
+    let gdopStats = null; // Latest coverage statistics
 
-// Add or remove an aircraft's marker + ellipse from the map without deleting state
-function setAircraftMapVisibility(icao24, visible) {
-  const ac = aircraft[icao24];
-  if (!ac) return;
-  if (visible) {
-    if (!map.hasLayer(ac.marker)) ac.marker.addTo(map);
-    if (ac.ellipse && !map.hasLayer(ac.ellipse)) ac.ellipse.addTo(map);
-  } else {
-    if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
-    if (ac.ellipse && map.hasLayer(ac.ellipse)) map.removeLayer(ac.ellipse);
-  }
-}
-// Topology visualization
-const topologyLayer = L.layerGroup();
-let topologyVisible = false;
-const sensorNodes = {};           // sensor_id → L.circleMarker
-const topologyEdges = [];         // Array of L.polyline
-let stabilityAlerts = [];         // Ring buffer of alerts (max 10)
-const MAX_STABILITY_ALERTS = 10;
+    const MAX_TRAIL_POINTS = 300;
+    const MAX_TRAIL_AGE_MS = 10 * 60 * 1000; // 10 minutes
+    let trailPolylines = []; // active L.polyline[] for the selected trail
 
-// GDOP heatmap visualization
-const gdopLayer = L.layerGroup();
-let gdopVisible = false;
-let gdopStats = null;             // Latest coverage statistics
+    // ─── Marker color ─────────────────────────────────────────────────────────────
+    // Priority: anomaly > spoof > GDOP tier (MLAT mode) > default green
+    function markerColor(state) {
+      if (
+        state.anomaly_label === "anomalous" &&
+        state.anomaly_confidence > 0.75
+      )
+        return "#ef4444";
+      if (state.spoof_flag) return "#f59e0b";
+      if (displayMode === "mlat" && state.gdop > 0) {
+        const tier = gdopTier(state.gdop);
+        if (tier) return tier.color;
+      }
+      return "#22c55e";
+    }
 
-const MAX_TRAIL_POINTS = 300;
-const MAX_TRAIL_AGE_MS = 10 * 60 * 1000;  // 10 minutes
-let trailPolylines = [];  // active L.polyline[] for the selected trail
-
-// ─── Marker color ─────────────────────────────────────────────────────────────
-// Priority: anomaly > spoof > GDOP tier (MLAT mode) > default green
-function markerColor(state) {
-  if (state.anomaly_label === "anomalous" && state.anomaly_confidence > 0.75) return "#ef4444";
-  if (state.spoof_flag) return "#f59e0b";
-  if (displayMode === "mlat" && state.gdop > 0) {
-    const tier = gdopTier(state.gdop);
-    if (tier) return tier.color;
-  }
-  return "#22c55e";
-}
-
-function makeIcon(color) {
-  return L.divIcon({
-    className: "",
-    html: `<svg width="14" height="14" viewBox="0 0 14 14">
+    function makeIcon(color) {
+      return L.divIcon({
+        className: "",
+        html: `<svg width="14" height="14" viewBox="0 0 14 14">
              <circle cx="7" cy="7" r="5" fill="${color}" stroke="#000" stroke-width="1.5"/>
            </svg>`,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
-  });
-}
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+      });
+    }
 
-function makeIdleIcon(color) {
-  return L.divIcon({
-    className: "",
-    html: `<svg width="22" height="22" viewBox="0 0 22 22">
+    function makeIdleIcon(color) {
+      return L.divIcon({
+        className: "",
+        html: `<svg width="22" height="22" viewBox="0 0 22 22">
              <circle cx="7" cy="15" r="5" fill="${color}" stroke="#000" stroke-width="1.5" opacity="0.5"/>
              <polygon points="15,4 8,18 22,18" fill="none" stroke="#ef4444" stroke-width="1.8"/>
              <text x="15" y="17" font-size="8" fill="#ef4444" text-anchor="middle">!</text>
            </svg>`,
-    iconSize: [22, 22], iconAnchor: [7, 15],
-  });
-}
+        iconSize: [22, 22],
+        iconAnchor: [7, 15],
+      });
+    }
 
-function makeSensorIcon(color) {
-  const c = color || "#60a5fa";
-  return L.divIcon({
-    className: "",
-    html: `<svg width="20" height="24" viewBox="0 0 20 24">
+    function makeSensorIcon(color) {
+      const c = color || "#60a5fa";
+      return L.divIcon({
+        className: "",
+        html: `<svg width="20" height="24" viewBox="0 0 20 24">
              <rect x="9" y="12" width="2" height="10" fill="${c}"/>
              <polygon points="10,2 4,13 16,13" fill="${c}" stroke="#1e3a5f" stroke-width="1"/>
            </svg>`,
-    iconSize: [20, 24], iconAnchor: [10, 22],
-  });
-}
-
-// ─── Trail functions ──────────────────────────────────────────────────────────
-function pushTrailPoint(icao24, state) {
-  const ac = aircraft[icao24];
-  if (!ac) return;
-  if (!ac.trail) ac.trail = [];
-
-  const point = {
-    lat: state.lat, lon: state.lon, alt_m: state.alt_m,
-    gdop: state.gdop, anomaly_label: state.anomaly_label,
-    anomaly_confidence: state.anomaly_confidence,
-    spoof_flag: state.spoof_flag, ts: Date.now()
-  };
-
-  // Skip stationary noise (~1m gate in degree space)
-  if (ac.trail.length > 0) {
-    const last = ac.trail[ac.trail.length - 1];
-    const dlat = point.lat - last.lat, dlon = point.lon - last.lon;
-    if (dlat * dlat + dlon * dlon < 1e-10) return;
-  }
-
-  ac.trail.push(point);
-  while (ac.trail.length > MAX_TRAIL_POINTS) ac.trail.shift();
-  const cutoff = Date.now() - MAX_TRAIL_AGE_MS;
-  while (ac.trail.length > 0 && ac.trail[0].ts < cutoff) ac.trail.shift();
-}
-
-function flushTrailSource(icao24) {
-  for (const pl of trailPolylines) map.removeLayer(pl);
-  trailPolylines = [];
-
-  const ac = aircraft[icao24];
-  if (!ac || !ac.trail || ac.trail.length < 2) return;
-
-  const trail = ac.trail;
-  const total = trail.length;
-
-  for (let i = 0; i < total - 1; i++) {
-    const p0 = trail[i], p1 = trail[i + 1];
-    const opacity = 0.1 + (i / (total - 1)) * 0.75;
-
-    let color, dashArray = null;
-    if (p1.spoof_flag || (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)) {
-      color = "#ef4444";
-    } else if (p1.gdop > 0) {
-      // MLAT trail — color by GDOP tier
-      const tier = gdopTier(p1.gdop);
-      color = tier ? tier.color : "#60a5fa";
-    } else {
-      color = "#94a3b8";
-      dashArray = "4 4";
+        iconSize: [20, 24],
+        iconAnchor: [10, 22],
+      });
     }
 
-    trailPolylines.push(
-      L.polyline([[p0.lat, p0.lon], [p1.lat, p1.lon]], {
-        color, opacity, weight: 1.8, dashArray, interactive: false
-      }).addTo(map)
-    );
-  }
-}
+    // ─── Trail functions ──────────────────────────────────────────────────────────
+    function pushTrailPoint(icao24, state) {
+      const ac = aircraft[icao24];
+      if (!ac) return;
+      if (!ac.trail) ac.trail = [];
 
-function clearTrailSource() {
-  for (const pl of trailPolylines) map.removeLayer(pl);
-  trailPolylines = [];
-}
+      const point = {
+        lat: state.lat,
+        lon: state.lon,
+        alt_m: state.alt_m,
+        gdop: state.gdop,
+        anomaly_label: state.anomaly_label,
+        anomaly_confidence: state.anomaly_confidence,
+        spoof_flag: state.spoof_flag,
+        ts: Date.now(),
+      };
 
-// ─── Aircraft update ──────────────────────────────────────────────────────────
-function ellipseFillOpacity(state) {
-  if (state.gdop === 0) return 0.06;
-  const tier = gdopTier(state.gdop);
-  return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
-}
+      // Skip stationary noise (~1m gate in degree space)
+      if (ac.trail.length > 0) {
+        const last = ac.trail[ac.trail.length - 1];
+        const dlat = point.lat - last.lat,
+          dlon = point.lon - last.lon;
+        if (dlat * dlat + dlon * dlon < 1e-10) return;
+      }
 
-function updateAircraft(state) {
-  const { icao24, lat, lon, anomaly_label, spoof_flag } = state;
-  if (lat == null || lon == null) return;
-  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
-  if (lat === 0 && lon === 0) return;
-
-  const color = markerColor(state);
-  const pos = [lat, lon];
-  const visible = aircraftVisible(state);
-  const fillOpacity = ellipseFillOpacity(state);
-
-  if (!aircraft[icao24]) {
-    const tooltipLabel = state.callsign ? `${state.callsign} (${icao24.toUpperCase()})` : icao24.toUpperCase();
-    const marker = L.marker(pos, { icon: makeIcon(color) })
-      .bindTooltip(tooltipLabel, { permanent: false, direction: "top" });
-    marker.on("click", () => focusAircraft(icao24));
-    const ellipse = L.circle(pos, {
-      radius: Math.max(state.confidence_ellipse_m || 200, 100),
-      color, fillColor: color, fillOpacity, weight: 1
-    });
-    aircraft[icao24] = { marker, ellipse, state, lastSeen: Date.now(), idle: false };
-    if (visible) {
-      marker.addTo(map);
-      ellipse.addTo(map);
+      ac.trail.push(point);
+      while (ac.trail.length > MAX_TRAIL_POINTS) ac.trail.shift();
+      const cutoff = Date.now() - MAX_TRAIL_AGE_MS;
+      while (ac.trail.length > 0 && ac.trail[0].ts < cutoff) ac.trail.shift();
     }
-    pushTrailPoint(icao24, state);
-    if (selectedIcao === icao24) flushTrailSource(icao24);
-  } else {
-    const ac = aircraft[icao24];
-    if (visible) {
-      ac.marker.setLatLng(pos).setIcon(makeIcon(color));
-      ac.ellipse.setLatLng(pos)
-        .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
-        .setStyle({ color, fillColor: color, fillOpacity });
-    }
-    setAircraftMapVisibility(icao24, visible);
-    ac.lastSeen = Date.now();
-    ac.state = state;
-    // Update hover tooltip with callsign when enrichment arrives.
-    const newLabel = state.callsign ? `${state.callsign} (${icao24.toUpperCase()})` : icao24.toUpperCase();
-    ac.marker.getTooltip()?.setContent(newLabel);
-    if (ac.idle) {
-      ac.idle = false;
-      if (visible) ac.marker.setIcon(makeIcon(color));
-    }
-    pushTrailPoint(icao24, state);
-    if (selectedIcao === icao24) flushTrailSource(icao24);
-  }
 
-  // Close popup if this aircraft is no longer visible in current mode
-  if (selectedIcao === icao24 && !visible) closePopup();
+    function flushTrailSource(icao24) {
+      for (const pl of trailPolylines) map.removeLayer(pl);
+      trailPolylines = [];
 
-  scheduleRenderList();
+      const ac = aircraft[icao24];
+      if (!ac || !ac.trail || ac.trail.length < 2) return;
 
-  if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
+      const trail = ac.trail;
+      const total = trail.length;
 
-  if (selectedIcao === icao24 && visible) {
-    refreshPopup();
-    drawAttributionLines(icao24);
-  }
-}
+      for (let i = 0; i < total - 1; i++) {
+        const p0 = trail[i],
+          p1 = trail[i + 1];
+        const opacity = 0.1 + (i / (total - 1)) * 0.75;
 
-function addAlert(state) {
-  const el = document.getElementById("alert-list");
-  const em = el.querySelector("em");
-  if (em) em.remove();
-  const row = document.createElement("div");
-  row.className = "alert-entry";
-  const flag = state.spoof_flag ? "GPS-SPOOF" : "ANOMALY";
-  row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24} — ${flag}`;
-  el.insertBefore(row, el.firstChild);
-  if (el.children.length > 40) el.removeChild(el.lastChild);
-}
+        let color,
+          dashArray = null;
+        if (
+          p1.spoof_flag ||
+          (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)
+        ) {
+          color = "#ef4444";
+        } else if (p1.gdop > 0) {
+          // MLAT trail — color by GDOP tier
+          const tier = gdopTier(p1.gdop);
+          color = tier ? tier.color : "#60a5fa";
+        } else {
+          color = "#94a3b8";
+          dashArray = "4 4";
+        }
 
-function focusAircraft(icao24) {
-  const ac = aircraft[icao24];
-  if (!ac || !aircraftVisible(ac.state)) return;
-  map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
-  openPopup(icao24);
-}
-
-function renderList() {
-  const list = document.getElementById("aircraft-list");
-  const sorted = Object.entries(aircraft)
-    .filter(([, ac]) => aircraftVisible(ac.state))
-    .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
-
-  list.innerHTML = "";
-
-  if (sorted.length === 0) {
-    const hint = document.createElement("div");
-    hint.style.cssText = "padding:14px;color:#6b7280;font-size:.78rem;line-height:1.5";
-    hint.textContent = displayMode === "mlat"
-      ? "No MLAT-positioned aircraft — waiting for 3+ sensor correlation."
-      : "No ADS-B-positioned aircraft in current stream.";
-    list.appendChild(hint);
-  }
-
-  for (const [icao, ac] of sorted) {
-    const s = ac.state;
-    const row = document.createElement("div");
-    row.className = "ac-row";
-    row.onclick = () => focusAircraft(icao);
-
-    let badge;
-    if (s.anomaly_label === "anomalous") badge = `<span class="badge badge-anomaly">ANOMALY</span>`;
-    else if (s.anomaly_label === "normal") badge = `<span class="badge badge-normal">NORMAL</span>`;
-    else                            badge = `<span class="badge badge-unknown">—</span>`;
-
-    const spoofBadge = s.spoof_flag
-      ? `<span class="badge" style="background:#92400e;color:#fef3c7">SPOOF</span>` : "";
-
-    const idleBadge = ac.idle
-      ? `<span class="badge badge-idle">IDLE</span>` : "";
-
-    // Show GDOP tier badge for Fair (3) and Poor (4) only — Excellent/Good are clean
-    let gdopBadge = "";
-    if (displayMode === "mlat" && s.gdop > 0) {
-      const tier = gdopTier(s.gdop);
-      if (tier && tier.tier >= 3) {
-        gdopBadge = `<span class="badge" style="${tier.style}" title="GDOP ${s.gdop.toFixed(1)} — lower is better">&#9651; ${tier.label}</span>`;
+        trailPolylines.push(
+          L.polyline(
+            [
+              [p0.lat, p0.lon],
+              [p1.lat, p1.lon],
+            ],
+            {
+              color,
+              opacity,
+              weight: 1.8,
+              dashArray,
+              interactive: false,
+            },
+          ).addTo(map),
+        );
       }
     }
 
-    row.innerHTML = `
+    function clearTrailSource() {
+      for (const pl of trailPolylines) map.removeLayer(pl);
+      trailPolylines = [];
+    }
+
+    // ─── Aircraft update ──────────────────────────────────────────────────────────
+    function ellipseFillOpacity(state) {
+      if (state.gdop === 0) return 0.06;
+      const tier = gdopTier(state.gdop);
+      return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
+    }
+
+    function updateAircraft(state) {
+      const {icao24, lat, lon, anomaly_label, spoof_flag} = state;
+      if (lat == null || lon == null) return;
+      if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
+      if (lat === 0 && lon === 0) return;
+
+      const color = markerColor(state);
+      const pos = [lat, lon];
+      const visible = aircraftVisible(state);
+      const fillOpacity = ellipseFillOpacity(state);
+
+      if (!aircraft[icao24]) {
+        const tooltipLabel = state.callsign
+          ? `${state.callsign} (${icao24.toUpperCase()})`
+          : icao24.toUpperCase();
+        const marker = L.marker(pos, {icon: makeIcon(color)}).bindTooltip(
+          tooltipLabel,
+          {permanent: false, direction: "top"},
+        );
+        marker.on("click", () => focusAircraft(icao24));
+        const ellipse = L.circle(pos, {
+          radius: Math.max(state.confidence_ellipse_m || 200, 100),
+          color,
+          fillColor: color,
+          fillOpacity,
+          weight: 1,
+        });
+        aircraft[icao24] = {
+          marker,
+          ellipse,
+          state,
+          lastSeen: Date.now(),
+          idle: false,
+        };
+        if (visible) {
+          marker.addTo(map);
+          ellipse.addTo(map);
+        }
+        pushTrailPoint(icao24, state);
+        if (selectedIcao === icao24) flushTrailSource(icao24);
+      } else {
+        const ac = aircraft[icao24];
+        if (visible) {
+          ac.marker.setLatLng(pos).setIcon(makeIcon(color));
+          ac.ellipse
+            .setLatLng(pos)
+            .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
+            .setStyle({color, fillColor: color, fillOpacity});
+        }
+        setAircraftMapVisibility(icao24, visible);
+        ac.lastSeen = Date.now();
+        ac.state = state;
+        // Update hover tooltip with callsign when enrichment arrives.
+        const newLabel = state.callsign
+          ? `${state.callsign} (${icao24.toUpperCase()})`
+          : icao24.toUpperCase();
+        ac.marker.getTooltip()?.setContent(newLabel);
+        if (ac.idle) {
+          ac.idle = false;
+          if (visible) ac.marker.setIcon(makeIcon(color));
+        }
+        pushTrailPoint(icao24, state);
+        if (selectedIcao === icao24) flushTrailSource(icao24);
+      }
+
+      // Close popup if this aircraft is no longer visible in current mode
+      if (selectedIcao === icao24 && !visible) closePopup();
+
+      scheduleRenderList();
+
+      if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
+
+      if (selectedIcao === icao24 && visible) {
+        refreshPopup();
+        drawAttributionLines(icao24);
+      }
+    }
+
+    function addAlert(state) {
+      const el = document.getElementById("alert-list");
+      const em = el.querySelector("em");
+      if (em) em.remove();
+      const row = document.createElement("div");
+      row.className = "alert-entry";
+      const flag = state.spoof_flag ? "GPS-SPOOF" : "ANOMALY";
+      row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24} — ${flag}`;
+      el.insertBefore(row, el.firstChild);
+      if (el.children.length > 40) el.removeChild(el.lastChild);
+    }
+
+    function focusAircraft(icao24) {
+      const ac = aircraft[icao24];
+      if (!ac || !aircraftVisible(ac.state)) return;
+      map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
+      openPopup(icao24);
+    }
+
+    function renderList() {
+      const list = document.getElementById("aircraft-list");
+      const sorted = Object.entries(aircraft)
+        .filter(([, ac]) => aircraftVisible(ac.state))
+        .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
+
+      list.innerHTML = "";
+
+      if (sorted.length === 0) {
+        const hint = document.createElement("div");
+        hint.style.cssText =
+          "padding:14px;color:#6b7280;font-size:.78rem;line-height:1.5";
+        hint.textContent =
+          displayMode === "mlat"
+            ? "No MLAT-positioned aircraft — waiting for 3+ sensor correlation."
+            : "No ADS-B-positioned aircraft in current stream.";
+        list.appendChild(hint);
+      }
+
+      for (const [icao, ac] of sorted) {
+        const s = ac.state;
+        const row = document.createElement("div");
+        row.className = "ac-row";
+        row.onclick = () => focusAircraft(icao);
+
+        let badge;
+        if (s.anomaly_label === "anomalous")
+          badge = `<span class="badge badge-anomaly">ANOMALY</span>`;
+        else if (s.anomaly_label === "normal")
+          badge = `<span class="badge badge-normal">NORMAL</span>`;
+        else badge = `<span class="badge badge-unknown">—</span>`;
+
+        const spoofBadge = s.spoof_flag
+          ? `<span class="badge" style="background:#92400e;color:#fef3c7">SPOOF</span>`
+          : "";
+
+        const idleBadge = ac.idle
+          ? `<span class="badge badge-idle">IDLE</span>`
+          : "";
+
+        // Show GDOP tier badge for Fair (3) and Poor (4) only — Excellent/Good are clean
+        let gdopBadge = "";
+        if (displayMode === "mlat" && s.gdop > 0) {
+          const tier = gdopTier(s.gdop);
+          if (tier && tier.tier >= 3) {
+            gdopBadge = `<span class="badge" style="${tier.style}" title="GDOP ${s.gdop.toFixed(1)} — lower is better">&#9651; ${tier.label}</span>`;
+          }
+        }
+
+        row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
       <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
       ${badge}${spoofBadge}${gdopBadge}${idleBadge}`;
-    list.appendChild(row);
-  }
-  document.getElementById("ac-count").textContent = sorted.length;
-  document.getElementById("stat-count").textContent = `${sorted.length} aircraft`;
-}
+        list.appendChild(row);
+      }
+      document.getElementById("ac-count").textContent = sorted.length;
+      document.getElementById("stat-count").textContent =
+        `${sorted.length} aircraft`;
+    }
 
-// ─── Stale / idle cleanup ────────────────────────────────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  for (const [icao, ac] of Object.entries(aircraft)) {
-    const age = now - ac.lastSeen;
-    if (age > REMOVE_MS) {
-      if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
-      if (ac.ellipse && map.hasLayer(ac.ellipse)) map.removeLayer(ac.ellipse);
-      if (selectedIcao === icao) {
-        clearTrailSource();
+    // ─── Stale / idle cleanup ────────────────────────────────────────────────────
+    setInterval(() => {
+      const now = Date.now();
+      for (const [icao, ac] of Object.entries(aircraft)) {
+        const age = now - ac.lastSeen;
+        if (age > REMOVE_MS) {
+          if (map.hasLayer(ac.marker)) map.removeLayer(ac.marker);
+          if (ac.ellipse && map.hasLayer(ac.ellipse))
+            map.removeLayer(ac.ellipse);
+          if (selectedIcao === icao) {
+            clearTrailSource();
+            closePopup();
+          }
+          delete aircraft[icao];
+          continue;
+        }
+        const shouldBeIdle = age > IDLE_WARNING_MS;
+        if (shouldBeIdle !== ac.idle) {
+          ac.idle = shouldBeIdle;
+          const color = markerColor(ac.state);
+          if (aircraftVisible(ac.state)) {
+            ac.marker.setIcon(
+              shouldBeIdle ? makeIdleIcon(color) : makeIcon(color),
+            );
+          }
+        }
+      }
+      scheduleRenderList();
+      if (selectedIcao && aircraft[selectedIcao]) refreshPopupIdleStrip();
+    }, 5000);
+
+    // ─── Sensor toggle ────────────────────────────────────────────────────────────
+    function toggleSensors() {
+      sensorsVisible = !sensorsVisible;
+      document
+        .getElementById("sensor-toggle")
+        .classList.toggle("active", sensorsVisible);
+      if (sensorsVisible) {
+        for (const [id, sd] of Object.entries(sensorData)) {
+          if (!sensorMarkers[id]) createSensorMarker(id, sd);
+        }
+        // Show topology if available
+        if (!topologyVisible) {
+          topologyLayer.addTo(map);
+          topologyVisible = true;
+        }
+      } else {
+        for (const m of Object.values(sensorMarkers)) map.removeLayer(m);
+        for (const k of Object.keys(sensorMarkers)) delete sensorMarkers[k];
+        // Hide topology
+        if (topologyVisible) {
+          map.removeLayer(topologyLayer);
+          topologyVisible = false;
+        }
+      }
+    }
+
+    // ─── Display mode toggle ──────────────────────────────────────────────────────
+    function toggleDisplayMode() {
+      displayMode = displayMode === "mlat" ? "adsb" : "mlat";
+      const lbl = document.getElementById("ctrl-mode-label");
+      if (lbl) lbl.textContent = displayMode === "mlat" ? "MLAT" : "ADS-B";
+
+      if (displayMode === "mlat") {
+        document.getElementById("marker-legend").style.display = "block";
+      } else {
+        document.getElementById("marker-legend").style.display = "none";
+      }
+
+      // Reapply visibility and recolor every tracked aircraft
+      for (const [icao, ac] of Object.entries(aircraft)) {
+        const visible = aircraftVisible(ac.state);
+        setAircraftMapVisibility(icao, visible);
+        if (visible) {
+          const color = markerColor(ac.state);
+          ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color));
+          if (ac.ellipse) {
+            ac.ellipse.setStyle({
+              color,
+              fillColor: color,
+              fillOpacity: ellipseFillOpacity(ac.state),
+            });
+          }
+        }
+      }
+
+      // Close popup if selected aircraft is not visible in new mode
+      if (selectedIcao && !aircraftVisible(aircraft[selectedIcao]?.state))
         closePopup();
-      }
-      delete aircraft[icao];
-      continue;
+
+      scheduleRenderList();
     }
-    const shouldBeIdle = age > IDLE_WARNING_MS;
-    if (shouldBeIdle !== ac.idle) {
-      ac.idle = shouldBeIdle;
-      const color = markerColor(ac.state);
-      if (aircraftVisible(ac.state)) {
-        ac.marker.setIcon(shouldBeIdle ? makeIdleIcon(color) : makeIcon(color));
-      }
-    }
-  }
-  scheduleRenderList();
-  if (selectedIcao && aircraft[selectedIcao]) refreshPopupIdleStrip();
-}, 5000);
 
-// ─── Sensor toggle ────────────────────────────────────────────────────────────
-function toggleSensors() {
-  sensorsVisible = !sensorsVisible;
-  document.getElementById("sensor-toggle").classList.toggle("active", sensorsVisible);
-  if (sensorsVisible) {
-    for (const [id, sd] of Object.entries(sensorData)) {
-      if (!sensorMarkers[id]) createSensorMarker(id, sd);
-    }
-    // Show topology if available
-    if (!topologyVisible) {
-      topologyLayer.addTo(map);
-      topologyVisible = true;
-    }
-  } else {
-    for (const m of Object.values(sensorMarkers)) map.removeLayer(m);
-    for (const k of Object.keys(sensorMarkers)) delete sensorMarkers[k];
-    // Hide topology
-    if (topologyVisible) {
-      map.removeLayer(topologyLayer);
-      topologyVisible = false;
-    }
-  }
-}
+    function buildSensorPopupHtml(id, sd) {
+      const status = sd.status || "unknown";
+      const statusColor = sensorStatusColor(status);
+      const offsetStr =
+        sd.offset_ns != null ? sd.offset_ns.toFixed(1) + " ns" : "—";
+      const uncertStr =
+        sd.uncertainty_ns != null
+          ? "\u00b1" + sd.uncertainty_ns.toFixed(1) + " ns"
+          : "—";
+      const inSolveStr = sd.inSolve ? "Yes" : "No";
 
-// ─── Display mode toggle ──────────────────────────────────────────────────────
-function toggleDisplayMode() {
-  displayMode = displayMode === "mlat" ? "adsb" : "mlat";
-  const btn = document.getElementById("mode-toggle");
+      // [PAIRWISE DISABLED] const offsets = (sd.offsets || []).map(o => { ... }).join("");
 
-  if (displayMode === "mlat") {
-    btn.style.background   = "#6b21a8";
-    btn.style.borderColor  = "#7c3aed";
-    btn.innerHTML          = "&#128994; MLAT";
-    document.getElementById("marker-legend").style.display = "block";
-  } else {
-    btn.style.background   = "#1d4ed8";
-    btn.style.borderColor  = "#2563eb";
-    btn.innerHTML          = "&#128998; ADS-B";
-    document.getElementById("marker-legend").style.display = "none";
-  }
-
-  // Reapply visibility and recolor every tracked aircraft
-  for (const [icao, ac] of Object.entries(aircraft)) {
-    const visible = aircraftVisible(ac.state);
-    setAircraftMapVisibility(icao, visible);
-    if (visible) {
-      const color = markerColor(ac.state);
-      ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color));
-      if (ac.ellipse) {
-        ac.ellipse.setStyle({ color, fillColor: color, fillOpacity: ellipseFillOpacity(ac.state) });
-      }
-    }
-  }
-
-  // Close popup if selected aircraft is not visible in new mode
-  if (selectedIcao && !aircraftVisible(aircraft[selectedIcao]?.state)) closePopup();
-
-  scheduleRenderList();
-}
-
-function buildSensorPopupHtml(id, sd) {
-  const status      = sd.status || "unknown";
-  const statusColor = sensorStatusColor(status);
-  const offsetStr   = (sd.offset_ns != null) ? sd.offset_ns.toFixed(1) + " ns" : "—";
-  const uncertStr   = (sd.uncertainty_ns != null) ? "\u00b1" + sd.uncertainty_ns.toFixed(1) + " ns" : "—";
-  const inSolveStr  = sd.inSolve ? "Yes" : "No";
-
-  // [PAIRWISE DISABLED] const offsets = (sd.offsets || []).map(o => { ... }).join("");
-
-  return `
+      return `
     <div style="font-family:monospace;font-size:.8rem;color:#c9d1d9;min-width:200px">
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
         <b>Sensor ${id}</b>
@@ -742,196 +1362,221 @@ function buildSensorPopupHtml(id, sd) {
         <tr><td style="color:#8b949e">Clock offset</td><td style="text-align:right">${offsetStr}</td></tr>
         <tr><td style="color:#8b949e">Uncertainty</td><td style="text-align:right">${uncertStr}</td></tr>
         <tr><td style="color:#8b949e">In clock solve</td>
-            <td style="text-align:right;color:${sd.inSolve ? '#22c55e' : '#6e7681'}">${inSolveStr}</td></tr>
+            <td style="text-align:right;color:${sd.inSolve ? "#22c55e" : "#6e7681"}">${inSolveStr}</td></tr>
       </table>
       <!-- [PAIRWISE DISABLED] per-peer offset table removed -->
     </div>`;
-}
-
-function createSensorMarker(id, sd) {
-  if (sd.lat == null || sd.lon == null) return;
-  const color  = sensorStatusColor(sd.status);
-  const marker = L.marker([sd.lat, sd.lon], { icon: makeSensorIcon(color) })
-    .bindPopup(buildSensorPopupHtml(id, sd))
-    .addTo(map);
-  sensorMarkers[id] = marker;
-}
-
-function refreshSensorMarkerPopup(id) {
-  const marker = sensorMarkers[id];
-  const sd     = sensorData[id];
-  if (!marker || !sd) return;
-  if (marker.isPopupOpen()) {
-    marker.setPopupContent(buildSensorPopupHtml(id, sd));
-  }
-}
-
-// ─── GDOP Heatmap ─────────────────────────────────────────────────────────────
-function qualityColor(quality) {
-  const colors = {
-    excellent: "#22c55e",     // Green
-    good: "#84cc16",          // Chartreuse
-    moderate: "#eab308",      // Yellow
-    poor: "#f97316",          // Orange
-    unacceptable: "#ef4444",  // Red
-    degenerate: "#18181b"     // Black
-  };
-  return colors[quality] || "#6b7280";
-}
-
-// Helper function: Group GDOP points by quality category for z-index ordering
-function groupPointsByQuality(points) {
-  const groups = {
-    excellent: [],
-    good: [],
-    moderate: [],
-    poor: [],
-    unacceptable: [],
-    degenerate: []
-  };
-  points.forEach(p => {
-    if (groups[p.quality]) {
-      groups[p.quality].push(p);
     }
-  });
-  return groups;
-}
 
-// Helper function: Render quality points as grid rectangles
-function renderQualityRectangles(points, quality, color, resolutionDeg) {
-  // Calculate half-resolution for rectangle bounds
-  const halfRes = resolutionDeg / 2;
+    function createSensorMarker(id, sd) {
+      if (sd.lat == null || sd.lon == null) return;
+      const color = sensorStatusColor(sd.status);
+      const marker = L.marker([sd.lat, sd.lon], {
+        icon: makeSensorIcon(color),
+      })
+        .bindPopup(buildSensorPopupHtml(id, sd))
+        .addTo(map);
+      sensorMarkers[id] = marker;
+    }
 
-  points.forEach(point => {
-    const gdopStr = Number.isFinite(point.gdop)
-      ? point.gdop.toFixed(2)
-      : "∞";
+    function refreshSensorMarkerPopup(id) {
+      const marker = sensorMarkers[id];
+      const sd = sensorData[id];
+      if (!marker || !sd) return;
+      if (marker.isPopupOpen()) {
+        marker.setPopupContent(buildSensorPopupHtml(id, sd));
+      }
+    }
 
-    const condStr = (point.condition_number != null && Number.isFinite(point.condition_number))
-      ? point.condition_number.toFixed(1)
-      : "—";
+    // ─── GDOP Heatmap ─────────────────────────────────────────────────────────────
+    function qualityColor(quality) {
+      const colors = {
+        excellent: "#22c55e", // Green
+        good: "#84cc16", // Chartreuse
+        moderate: "#eab308", // Yellow
+        poor: "#f97316", // Orange
+        unacceptable: "#ef4444", // Red
+        degenerate: "#18181b", // Black
+      };
+      return colors[quality] || "#6b7280";
+    }
 
-    // Create rectangle bounds: [[south, west], [north, east]]
-    const bounds = [
-      [point.lat - halfRes, point.lon - halfRes],
-      [point.lat + halfRes, point.lon + halfRes]
-    ];
+    // Helper function: Group GDOP points by quality category for z-index ordering
+    function groupPointsByQuality(points) {
+      const groups = {
+        excellent: [],
+        good: [],
+        moderate: [],
+        poor: [],
+        unacceptable: [],
+        degenerate: [],
+      };
+      points.forEach((p) => {
+        if (groups[p.quality]) {
+          groups[p.quality].push(p);
+        }
+      });
+      return groups;
+    }
 
-    L.rectangle(bounds, {
-      fillColor: color,
-      fillOpacity: 0.5,
-      color: color,
-      weight: 0,
-      stroke: false,
-      interactive: true
-    })
-    .bindTooltip(
-      `<b>GDOP: ${gdopStr}</b><br>` +
-      `Quality: ${point.quality}<br>` +
-      `Sensors: ${point.num_sensors}<br>` +
-      `Condition: ${condStr}`,
-      { sticky: true }
-    )
-    .addTo(gdopLayer);
-  });
-}
+    // Helper function: Render quality points as grid rectangles
+    function renderQualityRectangles(points, quality, color, resolutionDeg) {
+      // Calculate half-resolution for rectangle bounds
+      const halfRes = resolutionDeg / 2;
 
-function updateGdopHeatmap(data) {
-  gdopLayer.clearLayers();
+      points.forEach((point) => {
+        const gdopStr = Number.isFinite(point.gdop)
+          ? point.gdop.toFixed(2)
+          : "∞";
 
-  if (!data.points || data.points.length === 0) {
+        const condStr =
+          point.condition_number != null &&
+            Number.isFinite(point.condition_number)
+            ? point.condition_number.toFixed(1)
+            : "—";
 
-    // Show color key + no-data warning if layer is visible
-    if (gdopVisible) {
-      const panel = document.getElementById("heatmap-coverage");
-      if (panel) panel.style.display = "block";
-      updateCoverageStats();
-      const body = document.getElementById("heatmap-coverage-body");
-      if (body) body.innerHTML += `
+        // Create rectangle bounds: [[south, west], [north, east]]
+        const bounds = [
+          [point.lat - halfRes, point.lon - halfRes],
+          [point.lat + halfRes, point.lon + halfRes],
+        ];
+
+        L.rectangle(bounds, {
+          fillColor: color,
+          fillOpacity: 0.5,
+          color: color,
+          weight: 0,
+          stroke: false,
+          interactive: true,
+        })
+          .bindTooltip(
+            `<b>GDOP: ${gdopStr}</b><br>` +
+            `Quality: ${point.quality}<br>` +
+            `Sensors: ${point.num_sensors}<br>` +
+            `Condition: ${condStr}`,
+            {sticky: true},
+          )
+          .addTo(gdopLayer);
+      });
+    }
+
+    function updateGdopHeatmap(data) {
+      gdopLayer.clearLayers();
+
+      if (!data.points || data.points.length === 0) {
+        // Show color key + no-data warning if layer is visible
+        if (gdopVisible) {
+          const panel = document.getElementById("heatmap-coverage");
+          if (panel) panel.style.display = "block";
+          updateCoverageStats();
+          const body = document.getElementById("heatmap-coverage-body");
+          if (body)
+            body.innerHTML += `
         <div style="font-size:.72rem;color:#f59e0b;padding:6px 0;text-align:center;border-top:1px solid #30363d;margin-top:4px">
           No coverage data &mdash; requires ≥3 active sensors
         </div>`;
+        }
+        return;
+      }
+
+      // Group points by quality for proper z-index layering (worst to best)
+      const groups = groupPointsByQuality(data.points);
+
+      // Define rendering order (worst to best quality, back-to-front z-index)
+      const qualityOrder = [
+        {name: "degenerate", color: "#18181b"},
+        {name: "unacceptable", color: "#ef4444"},
+        {name: "poor", color: "#f97316"},
+        {name: "moderate", color: "#eab308"},
+        {name: "good", color: "#84cc16"},
+        {name: "excellent", color: "#22c55e"},
+      ];
+
+      // Render each quality group as grid rectangles
+      qualityOrder.forEach(({name, color}) => {
+        const points = groups[name];
+        if (!points || points.length === 0) return;
+
+        renderQualityRectangles(points, name, color, data.resolution_deg);
+      });
+
+      // Store statistics
+      gdopStats = data.stats;
+      updateCoverageStats();
     }
-    return;
-  }
 
-  // Group points by quality for proper z-index layering (worst to best)
-  const groups = groupPointsByQuality(data.points);
+    function toggleGdopHeatmap() {
+      gdopVisible = !gdopVisible;
+      const btn = document.getElementById("gdop-toggle");
+      const panel = document.getElementById("heatmap-coverage");
+      btn.classList.toggle("active", gdopVisible);
 
-  // Define rendering order (worst to best quality, back-to-front z-index)
-  const qualityOrder = [
-    { name: 'degenerate', color: '#18181b' },
-    { name: 'unacceptable', color: '#ef4444' },
-    { name: 'poor', color: '#f97316' },
-    { name: 'moderate', color: '#eab308' },
-    { name: 'good', color: '#84cc16' },
-    { name: 'excellent', color: '#22c55e' }
-  ];
-
-  // Render each quality group as grid rectangles
-  qualityOrder.forEach(({ name, color }) => {
-    const points = groups[name];
-    if (!points || points.length === 0) return;
-
-    renderQualityRectangles(points, name, color, data.resolution_deg);
-  });
-
-  // Store statistics
-  gdopStats = data.stats;
-  updateCoverageStats();
-}
-
-function toggleGdopHeatmap() {
-  gdopVisible = !gdopVisible;
-  const btn   = document.getElementById("gdop-toggle");
-  const panel = document.getElementById("heatmap-coverage");
-  btn.classList.toggle("active", gdopVisible);
-
-  if (gdopVisible) {
-    gdopLayer.addTo(map);
-    if (panel) panel.style.display = "block";
-    updateCoverageStats(); // renders color key immediately; stats section when data is ready
-    if (!gdopStats) {
-      const body = document.getElementById("heatmap-coverage-body");
-      if (body) body.innerHTML += `
+      if (gdopVisible) {
+        gdopLayer.addTo(map);
+        if (panel) panel.style.display = "block";
+        updateCoverageStats(); // renders color key immediately; stats section when data is ready
+        if (!gdopStats) {
+          const body = document.getElementById("heatmap-coverage-body");
+          if (body)
+            body.innerHTML += `
         <div style="font-size:.72rem;color:#8b949e;padding:6px 0;text-align:center;border-top:1px solid #30363d;margin-top:4px">
           ⏳ Awaiting first heatmap update&hellip;<br>
           <span style="font-size:.63rem;color:#6e7681">Updates every 60s</span>
         </div>`;
+        }
+      } else {
+        map.removeLayer(gdopLayer);
+        if (panel) panel.style.display = "none";
+      }
     }
-  } else {
-    map.removeLayer(gdopLayer);
-    if (panel) panel.style.display = "none";
-  }
-}
 
-function updateCoverageStats() {
-  const body = document.getElementById("heatmap-coverage-body");
-  if (!body) return;
+    function updateCoverageStats() {
+      const body = document.getElementById("heatmap-coverage-body");
+      if (!body) return;
 
-  // Merged color key + coverage% in one compact table.
-  const tiers = [
-    { color: "#22c55e", label: "Excellent",    range: "< 2",   key: "excellent"    },
-    { color: "#84cc16", label: "Good",         range: "2–5",   key: "good"         },
-    { color: "#eab308", label: "Moderate",     range: "5–10",  key: "moderate"     },
-    { color: "#f97316", label: "Poor",         range: "10–20", key: "poor"         },
-    { color: "#ef4444", label: "Unacceptable", range: "≥ 20",  key: "unacceptable" },
-  ];
+      // Merged color key + coverage% in one compact table.
+      const tiers = [
+        {
+          color: "#22c55e",
+          label: "Excellent",
+          range: "< 2",
+          key: "excellent",
+        },
+        {color: "#84cc16", label: "Good", range: "2–5", key: "good"},
+        {
+          color: "#eab308",
+          label: "Moderate",
+          range: "5–10",
+          key: "moderate",
+        },
+        {color: "#f97316", label: "Poor", range: "10–20", key: "poor"},
+        {
+          color: "#ef4444",
+          label: "Unacceptable",
+          range: "≥ 20",
+          key: "unacceptable",
+        },
+      ];
 
-  const hasStats = gdopStats && gdopStats.total_points > 0;
-  const pct = (key) => hasStats
-    ? `<span style="color:#c9d1d9">${((gdopStats[key] / gdopStats.total_points) * 100).toFixed(1)}%</span>`
-    : `<span style="color:#30363d">—</span>`;
+      const hasStats = gdopStats && gdopStats.total_points > 0;
+      const pct = (key) =>
+        hasStats
+          ? `<span style="color:#c9d1d9">${((gdopStats[key] / gdopStats.total_points) * 100).toFixed(1)}%</span>`
+          : `<span style="color:#30363d">—</span>`;
 
-  const rows = tiers.map(t => `
+      const rows = tiers
+        .map(
+          (t) => `
     <div style="display:grid;grid-template-columns:10px 1fr auto auto;align-items:center;gap:5px;margin-bottom:2px">
       <span style="width:8px;height:8px;border-radius:50%;background:${t.color};display:inline-block"></span>
       <span style="color:#c9d1d9">${t.label}</span>
       <span style="color:#6e7681;font-size:.66rem;text-align:right">${t.range}</span>
       <span style="min-width:36px;text-align:right;font-size:.72rem">${pct(t.key)}</span>
-    </div>`).join('');
+    </div>`,
+        )
+        .join("");
 
-  const noDataRow = `
+      const noDataRow = `
     <div style="display:grid;grid-template-columns:10px 1fr auto auto;align-items:center;gap:5px;margin-bottom:2px">
       <span style="width:8px;height:8px;border-radius:50%;background:#18181b;border:1px solid #30363d;display:inline-block"></span>
       <span style="color:#8b949e">No data</span>
@@ -939,692 +1584,1034 @@ function updateCoverageStats() {
       <span style="min-width:36px"></span>
     </div>`;
 
-  const meanRow = hasStats ? `
+      const meanRow = hasStats
+        ? `
     <div style="display:flex;justify-content:space-between;margin-top:5px;padding-top:4px;border-top:1px solid #21262d">
       <span style="color:#8b949e">Mean GDOP</span>
       <span style="color:#c9d1d9">${gdopStats.mean_gdop.toFixed(2)}</span>
-    </div>` : '';
+    </div>`
+        : "";
 
-  const header = `<div style="display:grid;grid-template-columns:10px 1fr auto auto;gap:5px;margin-bottom:3px;padding-bottom:3px;border-bottom:1px solid #21262d">
+      const header = `<div style="display:grid;grid-template-columns:10px 1fr auto auto;gap:5px;margin-bottom:3px;padding-bottom:3px;border-bottom:1px solid #21262d">
     <span></span>
     <span style="color:#6e7681;font-size:.65rem;text-transform:uppercase;letter-spacing:.05em">Tier</span>
     <span style="color:#6e7681;font-size:.65rem;text-align:right">GDOP</span>
     <span style="color:#6e7681;font-size:.65rem;text-align:right;min-width:36px">Cover</span>
   </div>`;
 
-  body.innerHTML = `<div style="font-size:.72rem;line-height:1.5;padding-top:4px">${header}${rows}${noDataRow}${meanRow}</div>`;
-}
+      body.innerHTML = `<div style="font-size:.72rem;line-height:1.5;padding-top:4px">${header}${rows}${noDataRow}${meanRow}</div>`;
+    }
 
-// ─── Sensor health chart (time-series) ───────────────────────────────────────
-// Fixed identity colors per sensor — line color never changes regardless of status
-const SENSOR_PALETTE = [
-  "#60a5fa", // blue     S1
-  "#a78bfa", // purple   S2
-  "#34d399", // emerald  S3
-  "#f472b6", // pink     S4
-  "#fb923c", // orange   S5
-  "#facc15", // yellow   S6
-  "#22d3ee", // cyan     S7
-  "#e879f9", // fuchsia  S8
-];
+    // ─── Sensor health chart (time-series) ───────────────────────────────────────
+    // Fixed identity colors per sensor — line color never changes regardless of status
+    const SENSOR_PALETTE = [
+      "#60a5fa", // blue     S1
+      "#a78bfa", // purple   S2
+      "#34d399", // emerald  S3
+      "#f472b6", // pink     S4
+      "#fb923c", // orange   S5
+      "#facc15", // yellow   S6
+      "#22d3ee", // cyan     S7
+      "#e879f9", // fuchsia  S8
+    ];
 
-// Status → per-point dot color (reflects stability at that exact timestamp)
-function statusDotColor(status) {
-  if (status === "stable")   return "#22c55e"; // green
-  if (status === "marginal") return "#f59e0b"; // amber
-  if (status === "unstable") return "#ef4444"; // red
-  return "#6e7681";                            // gray (disconnected / unknown)
-}
+    // Status → per-point dot color (reflects stability at that exact timestamp)
+    function statusDotColor(status) {
+      if (status === "stable") return "#22c55e"; // green
+      if (status === "marginal") return "#f59e0b"; // amber
+      if (status === "unstable") return "#ef4444"; // red
+      return "#6e7681"; // gray (disconnected / unknown)
+    }
 
-// Status → sensor map icon / network health color
-function sensorStatusColor(status) {
-  if (status === "stable")   return "#22c55e";
-  if (status === "marginal") return "#f59e0b";
-  if (status === "unstable") return "#ef4444";
-  return "#6e7681"; // disconnected / unknown
-}
+    // Status → sensor map icon / network health color
+    function sensorStatusColor(status) {
+      if (status === "stable") return "#22c55e";
+      if (status === "marginal") return "#f59e0b";
+      if (status === "unstable") return "#ef4444";
+      return "#6e7681"; // disconnected / unknown
+    }
 
-const healthData = { labels: [], datasets: [] };
-const MAX_CHART_POINTS = 60; // 60 data points at 5s intervals = 5 minutes
+    const healthData = {labels: [], datasets: []};
+    const MAX_CHART_POINTS = 60; // 60 data points at 5s intervals = 5 minutes
 
-const healthChart = new Chart(document.getElementById("health-chart"), {
-  type: "line",
-  data: healthData,
-  options: {
-    animation: false,
-    responsive: true,
-    maintainAspectRatio: false,
-    interaction: { mode: 'index', intersect: false },
-    plugins: {
-      legend: { display: false },
-      tooltip: {
-        mode: 'index',
-        intersect: false,
-        backgroundColor: '#1c2128',
-        borderColor: '#30363d',
-        borderWidth: 1,
-        padding: { top: 8, bottom: 8, left: 12, right: 14 },
-        titleColor: '#8b949e',
-        bodyColor: '#c9d1d9',
-        titleFont:  { family: 'monospace', size: 11 },
-        bodyFont:   { family: 'monospace', size: 11 },
-        boxWidth: 10,
-        boxHeight: 10,
-        callbacks: {
-          title: (items) => items[0]?.label ?? "",
-          label: (context) => {
-            const sensorId = context.dataset.sensorId;
-            const offset   = context.parsed.y;
-            if (!sensorId) return ` ${offset.toFixed(1)} ns`;
+    const healthChart = new Chart(document.getElementById("health-chart"), {
+      type: "line",
+      data: healthData,
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {mode: "index", intersect: false},
+        plugins: {
+          legend: {display: false},
+          tooltip: {
+            mode: "index",
+            intersect: false,
+            backgroundColor: "#1c2128",
+            borderColor: "#30363d",
+            borderWidth: 1,
+            padding: {top: 8, bottom: 8, left: 12, right: 14},
+            titleColor: "#8b949e",
+            bodyColor: "#c9d1d9",
+            titleFont: {family: "monospace", size: 11},
+            bodyFont: {family: "monospace", size: 11},
+            boxWidth: 10,
+            boxHeight: 10,
+            callbacks: {
+              title: (items) => items[0]?.label ?? "",
+              label: (context) => {
+                const sensorId = context.dataset.sensorId;
+                const offset = context.parsed.y;
+                if (!sensorId) return ` ${offset.toFixed(1)} ns`;
 
-            const sensor = context.dataset.latestSensor;
-            if (!sensor) return ` S${sensorId}: ${offset.toFixed(1)} ns`;
+                const sensor = context.dataset.latestSensor;
+                if (!sensor) return ` S${sensorId}: ${offset.toFixed(1)} ns`;
 
-            const sign   = offset >= 0 ? "+" : "";
-            const uncert = sensor.uncertainty_ns != null ? ` ±${sensor.uncertainty_ns.toFixed(1)}` : "";
-            const status = sensor.status ? `  ${sensor.status.toUpperCase()}` : "";
-            return ` S${sensorId}  ${sign}${offset.toFixed(1)} ns${uncert}${status}`;
+                const sign = offset >= 0 ? "+" : "";
+                const uncert =
+                  sensor.uncertainty_ns != null
+                    ? ` ±${sensor.uncertainty_ns.toFixed(1)}`
+                    : "";
+                const status = sensor.status
+                  ? `  ${sensor.status.toUpperCase()}`
+                  : "";
+                return ` S${sensorId}  ${sign}${offset.toFixed(1)} ns${uncert}${status}`;
+              },
+              // Swatch color matches sensor's identity line color
+              labelColor: (context) => ({
+                borderColor: context.dataset.paletteColor || "#8b949e",
+                backgroundColor: context.dataset.paletteColor || "#8b949e",
+                borderWidth: 2,
+                borderRadius: 2,
+              }),
+            },
           },
-          // Swatch color matches sensor's identity line color
-          labelColor: (context) => ({
-            borderColor: context.dataset.paletteColor || "#8b949e",
-            backgroundColor: context.dataset.paletteColor || "#8b949e",
+        },
+        scales: {
+          x: {
+            display: true,
+            title: {display: true, text: "Time", color: "#8b949e"},
+            ticks: {
+              color: "#8b949e",
+              font: {size: 9},
+              maxRotation: 0,
+              autoSkip: true,
+              maxTicksLimit: 8,
+            },
+            grid: {display: false},
+          },
+          y: {
+            display: true,
+            title: {
+              display: true,
+              text: "Clock Offset (ns)",
+              color: "#8b949e",
+            },
+            ticks: {color: "#8b949e", font: {size: 10}},
+            grid: {color: "#21262d"},
+          },
+        },
+      },
+    });
+
+    function updateSensorHealthChart(clockData) {
+      if (!clockData || !clockData.sensors) return;
+
+      // Add timestamp label
+      healthData.labels.push(new Date().toLocaleTimeString());
+      if (healthData.labels.length > MAX_CHART_POINTS)
+        healthData.labels.shift();
+
+      const seenSensors = new Set();
+
+      for (const sensor of clockData.sensors) {
+        seenSensors.add(sensor.sensor_id);
+
+        let dataset = healthData.datasets.find(
+          (ds) => ds.sensorId === sensor.sensor_id,
+        );
+
+        if (!dataset) {
+          // First time seeing this sensor — assign a fixed palette color (identity)
+          const paletteIndex = healthData.datasets.length;
+          const paletteColor =
+            SENSOR_PALETTE[paletteIndex % SENSOR_PALETTE.length];
+          const backfill = new Array(healthData.labels.length - 1).fill(null);
+
+          dataset = {
+            label: `S${sensor.sensor_id}`,
+            sensorId: sensor.sensor_id,
+            paletteColor, // fixed identity color — never changes
+            data: backfill,
+            borderColor: paletteColor,
+            backgroundColor: paletteColor + "18",
             borderWidth: 2,
-            borderRadius: 2,
-          })
+            pointRadius: 0, // no dots — clean lines only
+            pointHoverRadius: 3, // subtle hover indicator
+            tension: 0.3,
+            latestSensor: sensor,
+          };
+          healthData.datasets.push(dataset);
+        } else {
+          // Existing sensor — update metadata only, never mutate borderColor
+          dataset.latestSensor = sensor;
+        }
+
+        // Append new data point
+        dataset.data.push(sensor.offset_ns);
+        if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
+      }
+
+      // Null-pad sensors absent from this update (maintains time alignment)
+      for (const dataset of healthData.datasets) {
+        if (!seenSensors.has(dataset.sensorId)) {
+          dataset.data.push(null);
+          if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
         }
       }
-    },
-    scales: {
-      x: {
-        display: true,
-        title: { display: true, text: 'Time', color: "#8b949e" },
-        ticks: {
-          color: "#8b949e",
-          font: { size: 9 },
-          maxRotation: 0,
-          autoSkip: true,
-          maxTicksLimit: 8
-        },
-        grid: { display: false }
-      },
-      y: {
-        display: true,
-        title: { display: true, text: 'Clock Offset (ns)', color: "#8b949e" },
-        ticks: { color: "#8b949e", font: { size: 10 } },
-        grid: { color: "#21262d" }
-        
-      },
-    },
-  },
-});
 
-function updateSensorHealthChart(clockData) {
-  if (!clockData || !clockData.sensors) return;
-
-  // Add timestamp label
-  healthData.labels.push(new Date().toLocaleTimeString());
-  if (healthData.labels.length > MAX_CHART_POINTS) healthData.labels.shift();
-
-  const seenSensors = new Set();
-
-  for (const sensor of clockData.sensors) {
-    seenSensors.add(sensor.sensor_id);
-
-    let dataset = healthData.datasets.find(ds => ds.sensorId === sensor.sensor_id);
-
-    if (!dataset) {
-      // First time seeing this sensor — assign a fixed palette color (identity)
-      const paletteIndex = healthData.datasets.length;
-      const paletteColor = SENSOR_PALETTE[paletteIndex % SENSOR_PALETTE.length];
-      const backfill = new Array(healthData.labels.length - 1).fill(null);
-
-      dataset = {
-        label: `S${sensor.sensor_id}`,
-        sensorId: sensor.sensor_id,
-        paletteColor,               // fixed identity color — never changes
-        data: backfill,
-        borderColor: paletteColor,
-        backgroundColor: paletteColor + "18",
-        borderWidth: 2,
-        pointRadius: 0,             // no dots — clean lines only
-        pointHoverRadius: 3,        // subtle hover indicator
-        tension: 0.3,
-        latestSensor: sensor,
-      };
-      healthData.datasets.push(dataset);
-    } else {
-      // Existing sensor — update metadata only, never mutate borderColor
-      dataset.latestSensor = sensor;
+      healthChart.update();
     }
 
-    // Append new data point
-    dataset.data.push(sensor.offset_ns);
-    if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
-  }
+    // [PAIRWISE DISABLED] updateSensorHealth handled pairwise sensor_health messages.
+    // sensorData is now populated exclusively via processClockSyncGlobal (clock_sync_global).
+    // function updateSensorHealth(offsets, sensors) {
+    //   if (sensors) {
+    //     for (const s of sensors) {
+    //       sensorData[s.sensor_id] = { ...sensorData[s.sensor_id], ...s, offsets: [] };
+    //     }
+    //   }
+    //   for (const o of offsets) {
+    //     if (sensorData[o.sensor_i]) sensorData[o.sensor_i].offsets = [...(sensorData[o.sensor_i].offsets || []), o];
+    //     if (sensorData[o.sensor_j]) sensorData[o.sensor_j].offsets = [...(sensorData[o.sensor_j].offsets || []), o];
+    //   }
+    //   if (selectedIcao) refreshPopupIdleStrip();
+    // }
 
-  // Null-pad sensors absent from this update (maintains time alignment)
-  for (const dataset of healthData.datasets) {
-    if (!seenSensors.has(dataset.sensorId)) {
-      dataset.data.push(null);
-      if (dataset.data.length > MAX_CHART_POINTS) dataset.data.shift();
+    // ─── Aircraft click popup ─────────────────────────────────────────────────────
+    function openPopup(icao24) {
+      selectedIcao = icao24;
+      refreshPopup();
+      document.getElementById("ac-popup-wrapper").style.display = "flex";
+      drawAttributionLines(icao24);
+      flushTrailSource(icao24);
     }
-  }
 
-  healthChart.update();
-}
+    function refreshPopup() {
+      if (!selectedIcao || !aircraft[selectedIcao]) return;
+      const ac = aircraft[selectedIcao];
+      const s = ac.state;
+      const age = Date.now() - ac.lastSeen;
 
-// [PAIRWISE DISABLED] updateSensorHealth handled pairwise sensor_health messages.
-// sensorData is now populated exclusively via processClockSyncGlobal (clock_sync_global).
-// function updateSensorHealth(offsets, sensors) {
-//   if (sensors) {
-//     for (const s of sensors) {
-//       sensorData[s.sensor_id] = { ...sensorData[s.sensor_id], ...s, offsets: [] };
-//     }
-//   }
-//   for (const o of offsets) {
-//     if (sensorData[o.sensor_i]) sensorData[o.sensor_i].offsets = [...(sensorData[o.sensor_i].offsets || []), o];
-//     if (sensorData[o.sensor_j]) sensorData[o.sensor_j].offsets = [...(sensorData[o.sensor_j].offsets || []), o];
-//   }
-//   if (selectedIcao) refreshPopupIdleStrip();
-// }
+      // Source badge + GDOP tier badge
+      const isAdsb = s.gdop === 0;
+      let srcBadge;
+      if (isAdsb) {
+        srcBadge = `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`;
+      } else {
+        const tier = gdopTier(s.gdop);
+        const tierBadge =
+          tier && tier.tier >= 3
+            ? ` <span class="badge" style="${tier.style}" title="Geometric Dilution of Precision — lower is better">&#9651; GDOP ${tier.label}</span>`
+            : "";
+        srcBadge = `<span class="badge" style="background:#6b21a8;color:#fff">MLAT</span>${tierBadge}`;
+      }
+      document.getElementById("popup-icao").innerHTML =
+        `${s.icao24.toUpperCase()} ${srcBadge}`;
 
-// ─── Aircraft click popup ─────────────────────────────────────────────────────
-function openPopup(icao24) {
-  selectedIcao = icao24;
-  refreshPopup();
-  document.getElementById("ac-popup-wrapper").style.display = "flex";
-  drawAttributionLines(icao24);
-  flushTrailSource(icao24);
-}
+      const speedKts =
+        Math.sqrt((s.vel_lat || 0) ** 2 + (s.vel_lon || 0) ** 2) *
+        111000 *
+        1.944;
+      const headingDeg =
+        ((Math.atan2(s.vel_lon || 0, s.vel_lat || 0) * 180) / Math.PI + 360) %
+        360;
+      const trail = ac.trail || [];
+      const trailStart = trail.length > 0 ? trail[0].ts : Date.now();
+      const durationMs = Date.now() - trailStart;
+      const durationStr =
+        durationMs < 60000
+          ? `${Math.round(durationMs / 1000)}s`
+          : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
 
-function refreshPopup() {
-  if (!selectedIcao || !aircraft[selectedIcao]) return;
-  const ac = aircraft[selectedIcao];
-  const s = ac.state;
-  const age = Date.now() - ac.lastSeen;
+      // GDOP row — show numeric + tier label for MLAT, N/A for ADS-B
+      const gdopCell = (() => {
+        if (s.gdop === 0) return "N/A (ADS-B)";
+        const tier = gdopTier(s.gdop);
+        const tierHtml = tier
+          ? ` <span style="${tier.style};padding:1px 5px;border-radius:8px;font-size:.68rem">${tier.label}</span>`
+          : "";
+        return `${s.gdop.toFixed(2)}${tierHtml}`;
+      })();
 
-  // Source badge + GDOP tier badge
-  const isAdsb = s.gdop === 0;
-  let srcBadge;
-  if (isAdsb) {
-    srcBadge = `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`;
-  } else {
-    const tier = gdopTier(s.gdop);
-    const tierBadge = tier && tier.tier >= 3
-      ? ` <span class="badge" style="${tier.style}" title="Geometric Dilution of Precision — lower is better">&#9651; GDOP ${tier.label}</span>`
-      : "";
-    srcBadge = `<span class="badge" style="background:#6b21a8;color:#fff">MLAT</span>${tierBadge}`;
-  }
-  document.getElementById("popup-icao").innerHTML = `${s.icao24.toUpperCase()} ${srcBadge}`;
+      const sensorsCell =
+        s.calibrated_sensor_count != null &&
+          s.calibrated_sensor_count < s.sensor_count
+          ? `${s.sensor_count} <span style="color:#f59e0b;font-size:.68rem">(${s.calibrated_sensor_count} cal)</span>`
+          : s.sensor_count;
 
-  const speedKts = Math.sqrt((s.vel_lat || 0) ** 2 + (s.vel_lon || 0) ** 2) * 111000 * 1.944;
-  const headingDeg = ((Math.atan2(s.vel_lon || 0, s.vel_lat || 0) * 180 / Math.PI) + 360) % 360;
-  const trail = ac.trail || [];
-  const trailStart = trail.length > 0 ? trail[0].ts : Date.now();
-  const durationMs = Date.now() - trailStart;
-  const durationStr = durationMs < 60000
-    ? `${Math.round(durationMs / 1000)}s`
-    : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
+      // LEFT card (ac-popup-right, DOM 1st): quality + tracking
+      const qualityRows = [
+        ["GDOP", gdopCell],
+        [
+          "Accuracy",
+          `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`,
+        ],
+        ["Sensors", sensorsCell],
+        [
+          "Anomaly",
+          `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`,
+        ],
+        [
+          "Spoof",
+          s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m` : "No",
+        ],
+        ["DoF", s.dof],
+        [
+          "Last seen",
+          `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`,
+        ],
+        ["Tracked", durationStr],
+        ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
+      ];
+      document.getElementById("popup-table-right").innerHTML = qualityRows
+        .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
+        .join("");
 
-  // GDOP row — show numeric + tier label for MLAT, N/A for ADS-B
-  const gdopCell = (() => {
-    if (s.gdop === 0) return "N/A (ADS-B)";
-    const tier = gdopTier(s.gdop);
-    const tierHtml = tier
-      ? ` <span style="${tier.style};padding:1px 5px;border-radius:8px;font-size:.68rem">${tier.label}</span>`
-      : "";
-    return `${s.gdop.toFixed(2)}${tierHtml}`;
-  })();
-
-  const sensorsCell = (s.calibrated_sensor_count != null && s.calibrated_sensor_count < s.sensor_count)
-    ? `${s.sensor_count} <span style="color:#f59e0b;font-size:.68rem">(${s.calibrated_sensor_count} cal)</span>`
-    : s.sensor_count;
-
-  // LEFT card (ac-popup-right, DOM 1st): quality + tracking
-  const qualityRows = [
-    ["GDOP",      gdopCell],
-    ["Accuracy",  `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`],
-    ["Sensors",   sensorsCell],
-    ["Anomaly",   `${s.anomaly_label} (${((s.anomaly_confidence || 0) * 100).toFixed(0)}%)`],
-    ["Spoof",     s.spoof_flag ? `Yes \u2014 ${Math.round(s.divergence_m)}m` : "No"],
-    ["DoF",       s.dof],
-    ["Last seen", `${((Date.now() - ac.lastSeen) / 1000).toFixed(0)}s ago`],
-    ["Tracked",   durationStr],
-    ["Trail pts", `${trail.length} / ${MAX_TRAIL_POINTS}`],
-  ];
-  document.getElementById("popup-table-right").innerHTML =
-    qualityRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
-
-  // RIGHT card (ac-popup, DOM 2nd): identity + flight state
-  const identityRows = [];
-  if (s.callsign)       identityRows.push(["Callsign", `<b>${s.callsign}</b>`]);
-  if (s.squawk)         identityRows.push(["Squawk",   s.squawk]);
-  if (s.origin_country) identityRows.push(["Country",  s.origin_country]);
-  identityRows.push(
-    ["Alt",     `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
-    ["Speed",   `${speedKts.toFixed(0)} kts`],
-    ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
-  );
-  document.getElementById("popup-table").innerHTML =
-    identityRows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
-
-  refreshPopupIdleStrip(age);
-}
-
-function refreshPopupIdleStrip(age) {
-  age = age ?? (selectedIcao ? Date.now() - (aircraft[selectedIcao]?.lastSeen ?? Date.now()) : 0);
-  const strip = document.getElementById("popup-idle");
-  if (age > IDLE_WARNING_MS) {
-    strip.style.display = "block";
-    document.getElementById("popup-idle-time").textContent = `${Math.round(age / 1000)}s`;
-  } else {
-    strip.style.display = "none";
-  }
-}
-
-function closePopup() {
-  selectedIcao = null;
-  document.getElementById("ac-popup-wrapper").style.display = "none";
-  clearAttributionLines();
-  clearTrailSource();
-}
-
-map.on("click", closePopup);
-
-// ─── Sensor attribution lines ─────────────────────────────────────────────────
-function drawAttributionLines(icao24) {
-  clearAttributionLines();
-  const ac = aircraft[icao24];
-  if (!ac || !ac.state.sensor_ids?.length || ac.state.gdop === 0) return;
-  for (const sid of ac.state.sensor_ids) {
-    const sd = sensorData[sid];
-    if (!sd) continue;
-    const line = L.polyline(
-      [[sd.lat, sd.lon], [ac.state.lat, ac.state.lon]],
-      { color: "#60a5fa", weight: 1.5, opacity: 0.7, dashArray: "5 4" }
-    ).addTo(map);
-    attributionLines.push(line);
-    // Highlight sensor marker to yellow if visible
-    if (sensorMarkers[sid]) {
-      sensorMarkers[sid].getElement()?.querySelector("polygon")?.setAttribute("fill", "#facc15");
-    }
-  }
-}
-
-function clearAttributionLines() {
-  for (const l of attributionLines) map.removeLayer(l);
-  attributionLines = [];
-  // Reset all sensor marker icons to their current status color
-  for (const [id, m] of Object.entries(sensorMarkers)) {
-    const status = sensorData[id]?.status;
-    m.setIcon(makeSensorIcon(sensorStatusColor(status)));
-  }
-}
-
-// ─── Topology visualization ──────────────────────────────────────────────────
-function updateTopology(clockData) {
-  // Clear existing topology
-  topologyLayer.clearLayers();
-  for (const k of Object.keys(sensorNodes)) delete sensorNodes[k];
-
-  if (!clockData || !clockData.success) return;
-
-  // Draw edges first (so they're behind nodes)
-  if (clockData.edges) {
-    for (const edge of clockData.edges) {
-      const s_i = sensorData[edge.sensor_i];
-      const s_j = sensorData[edge.sensor_j];
-      if (!s_i || !s_j) continue;
-
-      // Edge color by MAD: Green (<50ns), Yellow (50-100ns), Red (>100ns)
-      let edgeColor = "#22c55e";
-      if (edge.mad_ns > 100) edgeColor = "#ef4444";
-      else if (edge.mad_ns > 50) edgeColor = "#f59e0b";
-
-      // Opacity proportional to weight (normalized, clamped to 0.3-0.9)
-      const opacity = Math.min(0.9, Math.max(0.3, edge.weight));
-
-      // Width proportional to obs_count (log scale)
-      const width = 1 + Math.log10(edge.obs_count + 1);
-
-      const polyline = L.polyline(
-        [[s_i.lat, s_i.lon], [s_j.lat, s_j.lon]],
-        { color: edgeColor, opacity, weight: width }
+      // RIGHT card (ac-popup, DOM 2nd): identity + flight state
+      const identityRows = [];
+      if (s.callsign) identityRows.push(["Callsign", `<b>${s.callsign}</b>`]);
+      if (s.squawk) identityRows.push(["Squawk", s.squawk]);
+      if (s.origin_country) identityRows.push(["Country", s.origin_country]);
+      identityRows.push(
+        ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
+        ["Speed", `${speedKts.toFixed(0)} kts`],
+        ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
       );
+      document.getElementById("popup-table").innerHTML = identityRows
+        .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
+        .join("");
 
-      polyline.bindTooltip(
-        `Baseline: ${(edge.baseline_m / 1000).toFixed(1)} km<br>` +
-        `Obs: ${edge.obs_count}<br>` +
-        `MAD: ${edge.mad_ns.toFixed(1)} ns`,
-        { permanent: false }
-      );
-
-      polyline.addTo(topologyLayer);
+      refreshPopupIdleStrip(age);
     }
-  }
 
-  // Draw sensor nodes
-  if (clockData.sensors) {
-    for (const sensor of clockData.sensors) {
-      const sd = sensorData[sensor.sensor_id];
-      if (!sd) continue;
+    function refreshPopupIdleStrip(age) {
+      age =
+        age ??
+        (selectedIcao
+          ? Date.now() - (aircraft[selectedIcao]?.lastSeen ?? Date.now())
+          : 0);
+      const strip = document.getElementById("popup-idle");
+      if (age > IDLE_WARNING_MS) {
+        strip.style.display = "block";
+        document.getElementById("popup-idle-time").textContent =
+          `${Math.round(age / 1000)}s`;
+      } else {
+        strip.style.display = "none";
+      }
+    }
 
-      // Node color by status
-      let nodeColor = "#6e7681"; // Disconnected
-      if (sensor.status === "stable") nodeColor = "#22c55e";
-      else if (sensor.status === "marginal") nodeColor = "#f59e0b";
-      else if (sensor.status === "unstable") nodeColor = "#ef4444";
+    function closePopup() {
+      selectedIcao = null;
+      document.getElementById("ac-popup-wrapper").style.display = "none";
+      clearAttributionLines();
+      clearTrailSource();
+    }
 
-      // Radius proportional to uncertainty (capped)
-      const radius = 10 + Math.min(50, sensor.uncertainty_ns / 50);
+    map.on("click", closePopup);
 
-      const circle = L.circleMarker([sd.lat, sd.lon], {
-        radius,
-        fillColor: nodeColor,
-        color: "#fff",
-        weight: 2,
-        fillOpacity: 0.6
-      });
+    // ─── Sensor attribution lines ─────────────────────────────────────────────────
+    function drawAttributionLines(icao24) {
+      clearAttributionLines();
+      const ac = aircraft[icao24];
+      if (!ac || !ac.state.sensor_ids?.length || ac.state.gdop === 0) return;
+      for (const sid of ac.state.sensor_ids) {
+        const sd = sensorData[sid];
+        if (!sd) continue;
+        const line = L.polyline(
+          [
+            [sd.lat, sd.lon],
+            [ac.state.lat, ac.state.lon],
+          ],
+          {color: "#60a5fa", weight: 1.5, opacity: 0.7, dashArray: "5 4"},
+        ).addTo(map);
+        attributionLines.push(line);
+        // Highlight sensor marker to yellow if visible
+        if (sensorMarkers[sid]) {
+          sensorMarkers[sid]
+            .getElement()
+            ?.querySelector("polygon")
+            ?.setAttribute("fill", "#facc15");
+        }
+      }
+    }
 
-      // Tooltip with full stats
-      const offsetStr = (sensor.offset_ns != null) ? sensor.offset_ns.toFixed(1) : "—";
-      const driftStr = (sensor.drift_ns_per_s != null) ? sensor.drift_ns_per_s.toFixed(3) : "—";
-      const uncertaintyStr = (sensor.uncertainty_ns != null) ? sensor.uncertainty_ns.toFixed(1) : "—";
+    function clearAttributionLines() {
+      for (const l of attributionLines) map.removeLayer(l);
+      attributionLines = [];
+      // Reset all sensor marker icons to their current status color
+      for (const [id, m] of Object.entries(sensorMarkers)) {
+        const status = sensorData[id]?.status;
+        m.setIcon(makeSensorIcon(sensorStatusColor(status)));
+      }
+    }
 
-      let tooltipHtml = `<b>Sensor ${sensor.sensor_id}</b><br>` +
-        `Offset: ${offsetStr} ns<br>` +
-        `Drift: ${driftStr} ns/s<br>` +
-        `Uncertainty: ±${uncertaintyStr} ns<br>` +
-        `Status: ${sensor.status ? sensor.status.toUpperCase() : 'UNKNOWN'}`;
+    // ─── Topology visualization ──────────────────────────────────────────────────
+    function updateTopology(clockData) {
+      // Clear existing topology
+      topologyLayer.clearLayers();
+      for (const k of Object.keys(sensorNodes)) delete sensorNodes[k];
 
-      if (sensor.allan_deviation) {
-        const ad = sensor.allan_deviation;
+      if (!clockData || !clockData.success) return;
 
-        // Null-safe formatting matching updateGdopHeatmap pattern
-        const adev1sStr = (ad.adev_1s != null && Number.isFinite(ad.adev_1s))
-          ? ad.adev_1s.toFixed(1)
-          : "—";
+      // Draw edges first (so they're behind nodes)
+      if (clockData.edges) {
+        for (const edge of clockData.edges) {
+          const s_i = sensorData[edge.sensor_i];
+          const s_j = sensorData[edge.sensor_j];
+          if (!s_i || !s_j) continue;
 
-        const adev60sStr = (ad.adev_60s != null && Number.isFinite(ad.adev_60s))
-          ? ad.adev_60s.toFixed(1)
-          : "—";
+          // Edge color by MAD: Green (<50ns), Yellow (50-100ns), Red (>100ns)
+          let edgeColor = "#22c55e";
+          if (edge.mad_ns > 100) edgeColor = "#ef4444";
+          else if (edge.mad_ns > 50) edgeColor = "#f59e0b";
 
-        const classStr = ad.oscillator_class
-          ? ad.oscillator_class.replace(/_/g, ' ')
-          : "Unknown";
+          // Opacity proportional to weight (normalized, clamped to 0.3-0.9)
+          const opacity = Math.min(0.9, Math.max(0.3, edge.weight));
 
-        tooltipHtml += `<br><br><b>Allan Deviation:</b><br>` +
-          `ADEV(1s): ${adev1sStr} ns<br>` +
-          `ADEV(60s): ${adev60sStr} ns<br>` +
-          `Class: ${classStr}`;
+          // Width proportional to obs_count (log scale)
+          const width = 1 + Math.log10(edge.obs_count + 1);
+
+          const polyline = L.polyline(
+            [
+              [s_i.lat, s_i.lon],
+              [s_j.lat, s_j.lon],
+            ],
+            {color: edgeColor, opacity, weight: width},
+          );
+
+          polyline.bindTooltip(
+            `Baseline: ${(edge.baseline_m / 1000).toFixed(1)} km<br>` +
+            `Obs: ${edge.obs_count}<br>` +
+            `MAD: ${edge.mad_ns.toFixed(1)} ns`,
+            {permanent: false},
+          );
+
+          polyline.addTo(topologyLayer);
+        }
       }
 
-      circle.bindTooltip(tooltipHtml, { permanent: false });
-      circle.addTo(topologyLayer);
-      sensorNodes[sensor.sensor_id] = circle;
+      // Draw sensor nodes
+      if (clockData.sensors) {
+        for (const sensor of clockData.sensors) {
+          const sd = sensorData[sensor.sensor_id];
+          if (!sd) continue;
+
+          // Node color by status
+          let nodeColor = "#6e7681"; // Disconnected
+          if (sensor.status === "stable") nodeColor = "#22c55e";
+          else if (sensor.status === "marginal") nodeColor = "#f59e0b";
+          else if (sensor.status === "unstable") nodeColor = "#ef4444";
+
+          // Radius proportional to uncertainty (capped)
+          const radius = 10 + Math.min(50, sensor.uncertainty_ns / 50);
+
+          const circle = L.circleMarker([sd.lat, sd.lon], {
+            radius,
+            fillColor: nodeColor,
+            color: "#fff",
+            weight: 2,
+            fillOpacity: 0.6,
+          });
+
+          // Tooltip with full stats
+          const offsetStr =
+            sensor.offset_ns != null ? sensor.offset_ns.toFixed(1) : "—";
+          const driftStr =
+            sensor.drift_ns_per_s != null
+              ? sensor.drift_ns_per_s.toFixed(3)
+              : "—";
+          const uncertaintyStr =
+            sensor.uncertainty_ns != null
+              ? sensor.uncertainty_ns.toFixed(1)
+              : "—";
+
+          let tooltipHtml =
+            `<b>Sensor ${sensor.sensor_id}</b><br>` +
+            `Offset: ${offsetStr} ns<br>` +
+            `Drift: ${driftStr} ns/s<br>` +
+            `Uncertainty: ±${uncertaintyStr} ns<br>` +
+            `Status: ${sensor.status ? sensor.status.toUpperCase() : "UNKNOWN"}`;
+
+          if (sensor.allan_deviation) {
+            const ad = sensor.allan_deviation;
+
+            // Null-safe formatting matching updateGdopHeatmap pattern
+            const adev1sStr =
+              ad.adev_1s != null && Number.isFinite(ad.adev_1s)
+                ? ad.adev_1s.toFixed(1)
+                : "—";
+
+            const adev60sStr =
+              ad.adev_60s != null && Number.isFinite(ad.adev_60s)
+                ? ad.adev_60s.toFixed(1)
+                : "—";
+
+            const classStr = ad.oscillator_class
+              ? ad.oscillator_class.replace(/_/g, " ")
+              : "Unknown";
+
+            tooltipHtml +=
+              `<br><br><b>Allan Deviation:</b><br>` +
+              `ADEV(1s): ${adev1sStr} ns<br>` +
+              `ADEV(60s): ${adev60sStr} ns<br>` +
+              `Class: ${classStr}`;
+          }
+
+          circle.bindTooltip(tooltipHtml, {permanent: false});
+          circle.addTo(topologyLayer);
+          sensorNodes[sensor.sensor_id] = circle;
+        }
+      }
     }
-  }
-}
 
-function addStabilityAlert(level, message) {
-  const timestamp = new Date().toLocaleTimeString();
-  stabilityAlerts.unshift({ level, message, timestamp });
-  if (stabilityAlerts.length > MAX_STABILITY_ALERTS) {
-    stabilityAlerts.pop();
-  }
-  renderStabilityAlerts();
-  // Auto-expand stability body on first alert
-  const body = document.getElementById("stability-body");
-  if (body && body.classList.contains("collapsed")) {
-    body.classList.remove("collapsed");
-    const btn = document.getElementById("stability-toggle");
-    if (btn) btn.innerHTML = "&#8963;";
-  }
-}
-
-function renderStabilityAlerts() {
-  const container = document.getElementById("stability-alert-list");
-  const panel = document.getElementById("stability-alerts");
-
-  if (stabilityAlerts.length === 0) {
-    panel.style.display = "none";
-    return;
-  }
-
-  panel.style.display = "block";
-  container.innerHTML = stabilityAlerts.map(alert => {
-    let icon = "";
-    let className = "";
-    if (alert.level === "critical") {
-      icon = "⚠";
-      className = "alert-critical";
-    } else if (alert.level === "warning") {
-      icon = "⚠";
-      className = "alert-warning";
-    } else {
-      icon = "ℹ";
-      className = "alert-info";
+    function addStabilityAlert(level, message) {
+      const timestamp = new Date().toLocaleTimeString();
+      stabilityAlerts.unshift({level, message, timestamp});
+      if (stabilityAlerts.length > MAX_STABILITY_ALERTS) {
+        stabilityAlerts.pop();
+      }
+      renderStabilityAlerts();
+      // Auto-expand stability body on first alert
+      const body = document.getElementById("stability-body");
+      if (body && body.classList.contains("collapsed")) {
+        body.classList.remove("collapsed");
+        const btn = document.getElementById("stability-toggle");
+        if (btn) btn.innerHTML = "&#8963;";
+      }
     }
 
-    return `<div class="stability-alert-entry ${className}">
+    function renderStabilityAlerts() {
+      const container = document.getElementById("stability-alert-list");
+      const panel = document.getElementById("stability-alerts");
+
+      if (stabilityAlerts.length === 0) {
+        panel.style.display = "none";
+        return;
+      }
+
+      panel.style.display = "block";
+      container.innerHTML = stabilityAlerts
+        .map((alert) => {
+          let icon = "";
+          let className = "";
+          if (alert.level === "critical") {
+            icon = "⚠";
+            className = "alert-critical";
+          } else if (alert.level === "warning") {
+            icon = "⚠";
+            className = "alert-warning";
+          } else {
+            icon = "ℹ";
+            className = "alert-info";
+          }
+
+          return `<div class="stability-alert-entry ${className}">
       <span class="alert-time">${alert.timestamp}</span>
       <span>${icon} ${alert.message}</span>
     </div>`;
-  }).join("");
-}
-
-// Track previous sensor statuses for change detection
-let prevSensorStatuses = {};
-
-function processClockSyncGlobal(clockData) {
-  updateTopology(clockData);
-
-  // ── Sync status into sensorData + update map marker colors ───────────────
-  const seenInSolve = new Set();
-
-  if (clockData.sensors) {
-    for (const sensor of clockData.sensors) {
-      seenInSolve.add(sensor.sensor_id);
-
-      if (!sensorData[sensor.sensor_id]) sensorData[sensor.sensor_id] = {};
-      sensorData[sensor.sensor_id].status         = sensor.status;
-      sensorData[sensor.sensor_id].offset_ns      = sensor.offset_ns;
-      sensorData[sensor.sensor_id].uncertainty_ns = sensor.uncertainty_ns;
-      sensorData[sensor.sensor_id].inSolve        = true;
-
-      if (sensorMarkers[sensor.sensor_id]) {
-        sensorMarkers[sensor.sensor_id].setIcon(makeSensorIcon(sensorStatusColor(sensor.status)));
-        refreshSensorMarkerPopup(sensor.sensor_id);
-      }
+        })
+        .join("");
     }
-  }
 
-  // Mark sensors absent from this solve as disconnected
-  for (const id of Object.keys(sensorData)) {
-    if (!seenInSolve.has(Number(id)) && !seenInSolve.has(id)) {
-      sensorData[id].status  = "disconnected";
-      sensorData[id].inSolve = false;
-      if (sensorMarkers[id]) {
-        sensorMarkers[id].setIcon(makeSensorIcon(sensorStatusColor("disconnected")));
-      }
-    }
-  }
+    // Track previous sensor statuses for change detection
+    let prevSensorStatuses = {};
 
-  // Detect sensor status changes and generate alerts
-  if (clockData.sensors) {
-    for (const sensor of clockData.sensors) {
-      const prevStatus = prevSensorStatuses[sensor.sensor_id];
-      const newStatus  = sensor.status;
+    function processClockSyncGlobal(clockData) {
+      updateTopology(clockData);
 
-      if (prevStatus !== newStatus) {
-        if (newStatus === "unstable") {
-          const reason = sensor.allan_deviation && sensor.allan_deviation.adev_60s > 1000
-            ? `σ=${sensor.uncertainty_ns.toFixed(0)}ns, ADEV(60s)=${sensor.allan_deviation.adev_60s.toFixed(0)}ns`
-            : `σ=${sensor.uncertainty_ns.toFixed(0)}ns`;
-          addStabilityAlert("critical", `Sensor ${sensor.sensor_id} → UNSTABLE (${reason})`);
-        } else if (newStatus === "disconnected") {
-          addStabilityAlert("critical", `Sensor ${sensor.sensor_id} → DISCONNECTED`);
-        } else if (newStatus === "marginal" && prevStatus === "stable") {
-          addStabilityAlert("warning", `Sensor ${sensor.sensor_id} → MARGINAL`);
-        } else if (newStatus === "stable" && prevStatus && prevStatus !== "stable") {
-          addStabilityAlert("info", `Sensor ${sensor.sensor_id} → STABLE`);
+      // ── Sync status into sensorData + update map marker colors ───────────────
+      const seenInSolve = new Set();
+
+      if (clockData.sensors) {
+        for (const sensor of clockData.sensors) {
+          seenInSolve.add(sensor.sensor_id);
+
+          if (!sensorData[sensor.sensor_id])
+            sensorData[sensor.sensor_id] = {};
+          sensorData[sensor.sensor_id].status = sensor.status;
+          sensorData[sensor.sensor_id].offset_ns = sensor.offset_ns;
+          sensorData[sensor.sensor_id].uncertainty_ns = sensor.uncertainty_ns;
+          sensorData[sensor.sensor_id].inSolve = true;
+
+          if (sensorMarkers[sensor.sensor_id]) {
+            sensorMarkers[sensor.sensor_id].setIcon(
+              makeSensorIcon(sensorStatusColor(sensor.status)),
+            );
+            refreshSensorMarkerPopup(sensor.sensor_id);
+          }
         }
       }
-      prevSensorStatuses[sensor.sensor_id] = newStatus;
+
+      // Mark sensors absent from this solve as disconnected
+      for (const id of Object.keys(sensorData)) {
+        if (!seenInSolve.has(Number(id)) && !seenInSolve.has(id)) {
+          sensorData[id].status = "disconnected";
+          sensorData[id].inSolve = false;
+          if (sensorMarkers[id]) {
+            sensorMarkers[id].setIcon(
+              makeSensorIcon(sensorStatusColor("disconnected")),
+            );
+          }
+        }
+      }
+
+      // Detect sensor status changes and generate alerts
+      if (clockData.sensors) {
+        for (const sensor of clockData.sensors) {
+          const prevStatus = prevSensorStatuses[sensor.sensor_id];
+          const newStatus = sensor.status;
+
+          if (prevStatus !== newStatus) {
+            if (newStatus === "unstable") {
+              const reason =
+                sensor.allan_deviation &&
+                  sensor.allan_deviation.adev_60s > 1000
+                  ? `σ=${sensor.uncertainty_ns.toFixed(0)}ns, ADEV(60s)=${sensor.allan_deviation.adev_60s.toFixed(0)}ns`
+                  : `σ=${sensor.uncertainty_ns.toFixed(0)}ns`;
+              addStabilityAlert(
+                "critical",
+                `Sensor ${sensor.sensor_id} → UNSTABLE (${reason})`,
+              );
+            } else if (newStatus === "disconnected") {
+              addStabilityAlert(
+                "critical",
+                `Sensor ${sensor.sensor_id} → DISCONNECTED`,
+              );
+            } else if (newStatus === "marginal" && prevStatus === "stable") {
+              addStabilityAlert(
+                "warning",
+                `Sensor ${sensor.sensor_id} → MARGINAL`,
+              );
+            } else if (
+              newStatus === "stable" &&
+              prevStatus &&
+              prevStatus !== "stable"
+            ) {
+              addStabilityAlert(
+                "info",
+                `Sensor ${sensor.sensor_id} → STABLE`,
+              );
+            }
+          }
+          prevSensorStatuses[sensor.sensor_id] = newStatus;
+        }
+      }
+
+      if (clockData.condition_number > 1e7) {
+        addStabilityAlert(
+          "warning",
+          `System ill-conditioned (κ=${clockData.condition_number.toExponential(1)})`,
+        );
+      }
+
+      updateSensorHealthChart(clockData);
+      updateClockPanelHeader(clockData);
     }
-  }
 
-  if (clockData.condition_number > 1e7) {
-    addStabilityAlert("warning", `System ill-conditioned (κ=${clockData.condition_number.toExponential(1)})`);
-  }
+    // ─── Panel collapse helpers ───────────────────────────────────────────────────
+    function togglePanel(bodyId, btnId) {
+      const body = document.getElementById(bodyId);
+      const btn = document.getElementById(btnId);
+      if (!body || !btn) return;
+      const isCollapsed = body.classList.toggle("collapsed");
+      btn.innerHTML = isCollapsed ? "&#8964;" : "&#8963;"; // ⌄ / ⌃
+    }
 
-  updateSensorHealthChart(clockData);
-  updateClockPanelHeader(clockData);
-}
+    // ─── Marker legend toggle ─────────────────────────────────────────────────────
+    let markerLegendCollapsed = false;
+    function toggleMarkerLegend() {
+      markerLegendCollapsed = !markerLegendCollapsed;
+      document
+        .getElementById("marker-legend-body")
+        .classList.toggle("collapsed", markerLegendCollapsed);
+      document.getElementById("marker-legend-toggle").innerHTML =
+        markerLegendCollapsed ? "&#8964;" : "&#8963;";
+    }
 
-// ─── Panel collapse helpers ───────────────────────────────────────────────────
-function togglePanel(bodyId, btnId) {
-  const body = document.getElementById(bodyId);
-  const btn  = document.getElementById(btnId);
-  if (!body || !btn) return;
-  const isCollapsed = body.classList.toggle("collapsed");
-  btn.innerHTML = isCollapsed ? "&#8964;" : "&#8963;"; // ⌄ / ⌃
-}
+    // ─── Clock panel toggle ───────────────────────────────────────────────────────
+    let clockPanelCollapsed = false;
+    function toggleClockPanel() {
+      clockPanelCollapsed = !clockPanelCollapsed;
+      document
+        .getElementById("clock-panel-body")
+        .classList.toggle("collapsed", clockPanelCollapsed);
+      document.getElementById("clock-panel-toggle").innerHTML =
+        clockPanelCollapsed ? "&#8964;" : "&#8963;";
+    }
 
-// ─── Marker legend toggle ─────────────────────────────────────────────────────
-let markerLegendCollapsed = false;
-function toggleMarkerLegend() {
-  markerLegendCollapsed = !markerLegendCollapsed;
-  document.getElementById("marker-legend-body").classList.toggle("collapsed", markerLegendCollapsed);
-  document.getElementById("marker-legend-toggle").innerHTML = markerLegendCollapsed ? "&#8964;" : "&#8963;";
-}
+    // ─── Clock panel live stats ───────────────────────────────────────────────────
+    // ─── Network health indicator ─────────────────────────────────────────────────
+    function updateNetworkHealth(sensors) {
+      const dotEl = document.getElementById("net-dot");
+      const labelEl = document.getElementById("net-label");
+      const countEl = document.getElementById("net-count");
+      if (!dotEl || !labelEl || !countEl) return;
 
-// ─── Clock panel toggle ───────────────────────────────────────────────────────
-let clockPanelCollapsed = false;
-function toggleClockPanel() {
-  clockPanelCollapsed = !clockPanelCollapsed;
-  document.getElementById("clock-panel-body").classList.toggle("collapsed", clockPanelCollapsed);
-  document.getElementById("clock-panel-toggle").innerHTML = clockPanelCollapsed ? "&#8964;" : "&#8963;";
-}
+      if (!sensors || sensors.length === 0) {
+        dotEl.style.background = "#6e7681";
+        labelEl.textContent = "OFFLINE";
+        labelEl.style.color = "#6e7681";
+        countEl.textContent = "0 / 0 sensors";
+        return;
+      }
 
-// ─── Clock panel live stats ───────────────────────────────────────────────────
-// ─── Network health indicator ─────────────────────────────────────────────────
-function updateNetworkHealth(sensors) {
-  const dotEl   = document.getElementById("net-dot");
-  const labelEl = document.getElementById("net-label");
-  const countEl = document.getElementById("net-count");
-  if (!dotEl || !labelEl || !countEl) return;
+      const total = sensors.length;
+      const stable = sensors.filter((s) => s.status === "stable").length;
+      const active = sensors.filter(
+        (s) => s.status === "stable" || s.status === "marginal",
+      ).length;
 
-  if (!sensors || sensors.length === 0) {
-    dotEl.style.background = "#6e7681";
-    labelEl.textContent    = "OFFLINE";
-    labelEl.style.color    = "#6e7681";
-    countEl.textContent    = "0 / 0 sensors";
-    return;
-  }
+      let color, label;
+      if (stable >= 3) {
+        color = "#22c55e";
+        label = "OPERATIONAL";
+      } else if (active >= 1) {
+        color = "#f59e0b";
+        label = "DEGRADED";
+      } else {
+        color = "#ef4444";
+        label = "OFFLINE";
+      }
 
-  const total  = sensors.length;
-  const stable = sensors.filter(s => s.status === "stable").length;
-  const active = sensors.filter(s => s.status === "stable" || s.status === "marginal").length;
+      dotEl.style.background = color;
+      labelEl.textContent = label;
+      labelEl.style.color = color;
+      countEl.textContent = `${active} / ${total} sensors`;
+    }
 
-  let color, label;
-  if (stable >= 3)      { color = "#22c55e"; label = "OPERATIONAL"; }
-  else if (active >= 1) { color = "#f59e0b"; label = "DEGRADED";    }
-  else                  { color = "#ef4444"; label = "OFFLINE";      }
+    function updateClockPanelHeader(clockData) {
+      if (!clockData) return;
+      const rms = clockData.global_rms_ns;
+      const el = document.getElementById("clock-panel-rms");
+      if (el && rms != null) {
+        el.textContent = `RMS: ${rms.toFixed(1)} ns`;
+        el.style.color =
+          rms < 50 ? "#22c55e" : rms < 100 ? "#f59e0b" : "#ef4444";
+      }
+      updateClockSensorDots(clockData.sensors);
+      updateNetworkHealth(clockData.sensors);
+    }
 
-  dotEl.style.background = color;
-  labelEl.textContent    = label;
-  labelEl.style.color    = color;
-  countEl.textContent    = `${active} / ${total} sensors`;
-}
-
-function updateClockPanelHeader(clockData) {
-  if (!clockData) return;
-  const rms = clockData.global_rms_ns;
-  const el = document.getElementById("clock-panel-rms");
-  if (el && rms != null) {
-    el.textContent = `RMS: ${rms.toFixed(1)} ns`;
-    el.style.color = rms < 50 ? "#22c55e" : rms < 100 ? "#f59e0b" : "#ef4444";
-  }
-  updateClockSensorDots(clockData.sensors);
-  updateNetworkHealth(clockData.sensors);
-}
-
-function updateClockSensorDots(sensors) {
-  const el = document.getElementById("clock-legend-panel");
-  if (!el || !sensors) return;
-  el.innerHTML = sensors.map(s => {
-    const ds = healthData.datasets.find(d => d.sensorId === s.sensor_id);
-    const lineColor = ds?.paletteColor || "#8b949e";
-    const statusColor = s.status === "stable"   ? "#22c55e"
-                      : s.status === "marginal" ? "#f59e0b"
-                      : s.status === "unstable" ? "#ef4444" : "#6e7681";
-    const statusLabel = s.status === "stable"   ? "OK"
-                      : s.status === "marginal" ? "MGRL"
-                      : s.status === "unstable" ? "UNST" : "—";
-    return `<div title="S${s.sensor_id}: ${s.status}" style="display:flex;align-items:center;gap:4px;padding:3px 0;border-bottom:1px solid #21262d">
+    function updateClockSensorDots(sensors) {
+      const el = document.getElementById("clock-legend-panel");
+      if (!el || !sensors) return;
+      el.innerHTML = sensors
+        .map((s) => {
+          const ds = healthData.datasets.find(
+            (d) => d.sensorId === s.sensor_id,
+          );
+          const lineColor = ds?.paletteColor || "#8b949e";
+          const statusColor =
+            s.status === "stable"
+              ? "#22c55e"
+              : s.status === "marginal"
+                ? "#f59e0b"
+                : s.status === "unstable"
+                  ? "#ef4444"
+                  : "#6e7681";
+          const statusLabel =
+            s.status === "stable"
+              ? "OK"
+              : s.status === "marginal"
+                ? "MGRL"
+                : s.status === "unstable"
+                  ? "UNST"
+                  : "—";
+          return `<div title="S${s.sensor_id}: ${s.status}" style="display:flex;align-items:center;gap:4px;padding:3px 0;border-bottom:1px solid #21262d">
       <span style="display:inline-block;width:14px;height:2px;background:${lineColor};flex-shrink:0;border-radius:1px"></span>
       <span style="font-size:.65rem;color:#c9d1d9;font-family:monospace;flex:1;line-height:1">S${s.sensor_id}</span>
       <span style="font-size:.58rem;font-weight:700;color:${statusColor};line-height:1">${statusLabel}</span>
     </div>`;
-  }).join('');
-}
+        })
+        .join("");
+    }
 
-// ─── WebSocket ───────────────────────────────────────────────────────────────
-const WS_URL = `ws://${location.hostname}:9001`;
-let ws;
+    // ─── WebSocket ───────────────────────────────────────────────────────────────
+    const WS_URL = `ws://${location.hostname}:9001`;
+    let ws;
 
-function connect() {
-  ws = new WebSocket(WS_URL);
+    function connect() {
+      ws = new WebSocket(WS_URL);
 
-  ws.onopen = () => {
-    document.getElementById("conn-dot").style.background = "#22c55e";
-  };
+      ws.onopen = () => {
+        document.getElementById("conn-dot").style.background = "#22c55e";
+      };
 
-  ws.onclose = () => {
-    document.getElementById("conn-dot").style.background = "#8b949e";
-    setTimeout(connect, 3000);
-  };
+      ws.onclose = () => {
+        document.getElementById("conn-dot").style.background = "#8b949e";
+        setTimeout(connect, 3000);
+      };
 
-  ws.onerror = () => ws.close();
+      ws.onerror = () => ws.close();
 
-  ws.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-
-    // sensor_health: seed sensorData with lat/lon/alt from sensor registry.
-    // Pairwise offsets remain disabled — only geographic position is extracted here.
-    if (msg.type === "sensor_health") {
-      if (Array.isArray(msg.sensors)) {
-        for (const s of msg.sensors) {
-          if (!sensorData[s.sensor_id]) sensorData[s.sensor_id] = {};
-          sensorData[s.sensor_id].lat   = s.lat;
-          sensorData[s.sensor_id].lon   = s.lon;
-          sensorData[s.sensor_id].alt_m = s.alt_m;
+      ws.onmessage = (ev) => {
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch {
+          return;
         }
-        if (sensorsVisible) {
-          for (const [id, sd] of Object.entries(sensorData)) {
-            if (!sensorMarkers[id] && sd.lat != null && sd.lon != null) {
-              createSensorMarker(id, sd);
+
+        // sensor_health: seed sensorData with lat/lon/alt from sensor registry.
+        // Pairwise offsets remain disabled — only geographic position is extracted here.
+        if (msg.type === "sensor_health") {
+          if (Array.isArray(msg.sensors)) {
+            for (const s of msg.sensors) {
+              if (!sensorData[s.sensor_id]) sensorData[s.sensor_id] = {};
+              sensorData[s.sensor_id].lat = s.lat;
+              sensorData[s.sensor_id].lon = s.lon;
+              sensorData[s.sensor_id].alt_m = s.alt_m;
+            }
+            if (sensorsVisible) {
+              for (const [id, sd] of Object.entries(sensorData)) {
+                if (!sensorMarkers[id] && sd.lat != null && sd.lon != null) {
+                  createSensorMarker(id, sd);
+                }
+              }
             }
           }
+        } else if (msg.type === "clock_sync_global") {
+          // Phase 4: Process global clock sync with topology + analytics
+          processClockSyncGlobal(msg);
+        } else if (msg.type === "gdop_heatmap" && msg.mode === "planning") {
+          updatePlanningHeatmap(msg);
+        } else if (msg.type === "gdop_heatmap") {
+          updateGdopHeatmap(msg);
+        } else if (msg.type === "virtual_sensor_added") {
+          onVsAdded(msg);
+        } else if (msg.type === "virtual_sensor_removed") {
+          onVsRemoved(msg);
+        } else if (msg.type === "virtual_sensors_cleared") {
+          onVsCleared();
+        } else if (msg.type === "virtual_sensor_error") {
+          showVsError(msg.message);
+        } else {
+          // aircraft state update
+          updateAircraft(msg);
+          document.getElementById("stat-time").textContent =
+            new Date().toLocaleTimeString();
         }
-      }
-    } else if (msg.type === "clock_sync_global") {
-      // Phase 4: Process global clock sync with topology + analytics
-      processClockSyncGlobal(msg);
-    } else if (msg.type === "gdop_heatmap") {
-      updateGdopHeatmap(msg);
-    } else {
-      // aircraft state update
-      updateAircraft(msg);
-      document.getElementById("stat-time").textContent = new Date().toLocaleTimeString();
+      };
     }
-  };
-}
 
-connect();
-</script>
+    function toggleVsFloat() {
+      const body = document.getElementById("vs-float-body");
+      const btn  = document.getElementById("vs-float-toggle");
+      if (!body) return;
+      body.classList.toggle("collapsed");
+      btn.textContent = body.classList.contains("collapsed") ? "⌄" : "⌃";
+    }
+
+    // ─── Planning Mode ────────────────────────────────────────────────────────────
+    function togglePlanningMode() {
+      planningMode ? exitPlanningMode() : enterPlanningMode();
+    }
+
+    function enterPlanningMode() {
+      planningMode = true;
+      document.getElementById("planning-toggle").classList.add("active");
+      map.getContainer().style.cursor = "crosshair";
+      document.getElementById("vs-float").style.display = "block";
+      // Ensure live GDOP heatmap is visible so user sees what they're improving
+      if (!gdopVisible) toggleGdopHeatmap();
+      planningGdopLayer.addTo(map);
+    }
+
+    function exitPlanningMode() {
+      planningMode = false;
+      document.getElementById("planning-toggle").classList.remove("active");
+      map.getContainer().style.cursor = "";
+      wsSend({type: "clear_virtual_sensors"});
+      clearVsLocal();
+      map.removeLayer(planningGdopLayer);
+      planningGdopLayer.clearLayers();
+      document.getElementById("vs-float").style.display = "none";
+      document.getElementById("planning-badge").style.display = "none";
+      document.getElementById("planning-cov-stats").innerHTML =
+        "Place virtual sensors to see simulated coverage.";
+    }
+
+    // ─── Virtual Sensor Markers & Lifecycle ──────────────────────────────────────
+    function makeVsIcon(label) {
+      return L.divIcon({
+        className: "",
+        html: `<svg width="28" height="30" viewBox="0 0 28 30">
+      <polygon points="14,2 26,14 14,26 2,14"
+        fill="#f59e0b" stroke="#78350f" stroke-width="1.5" opacity="0.93"/>
+      <text x="14" y="18" font-size="6.5" font-family="monospace" font-weight="700"
+        fill="#1c1917" text-anchor="middle">${label}</text>
+    </svg>`,
+        iconSize: [28, 30],
+        iconAnchor: [14, 26],
+      });
+    }
+
+    function onVsAdded(msg) {
+      vsCounter++;
+      const label = `VS-${vsCounter}`;
+      const marker = L.marker([msg.lat, msg.lon], {
+        icon: makeVsIcon(label),
+        zIndexOffset: 500,
+      })
+        .bindTooltip(
+          `<b style="color:#f59e0b">${label}</b><br>${msg.lat.toFixed(5)}° ${msg.lon.toFixed(5)}°<br>Alt: ${msg.alt_m}m<br><span style="color:#6e7681;font-size:.75em">Click to remove</span>`,
+          {direction: "top", offset: [0, -8]},
+        )
+        .addTo(map);
+      marker.on("click", (e) => {
+        L.DomEvent.stopPropagation(e); // prevent triggering planning placement
+        wsSend({type: "remove_virtual_sensor", id: msg.id});
+      });
+      virtualSensors[msg.id] = {
+        lat: msg.lat,
+        lon: msg.lon,
+        alt_m: msg.alt_m,
+        marker,
+        label,
+      };
+      renderVsList();
+    }
+
+    function onVsRemoved(msg) {
+      const vs = virtualSensors[msg.id];
+      if (vs) {
+        map.removeLayer(vs.marker);
+        delete virtualSensors[msg.id];
+      }
+      renderVsList();
+    }
+
+    function onVsCleared() {
+      clearVsLocal();
+      renderVsList();
+    }
+
+    function clearVsLocal() {
+      Object.values(virtualSensors).forEach((vs) =>
+        map.removeLayer(vs.marker),
+      );
+      Object.keys(virtualSensors).forEach((k) => delete virtualSensors[k]);
+      vsCounter = 0;
+    }
+
+    function showVsError(message) {
+      const el = document.getElementById("vs-error");
+      if (!el) return;
+      el.textContent = message;
+      el.style.display = "block";
+      setTimeout(() => {
+        el.style.display = "none";
+      }, 4000);
+    }
+
+    function renderVsList() {
+      const list = document.getElementById("vs-list");
+      if (!list) return;
+      const entries = Object.entries(virtualSensors);
+      list.innerHTML =
+        entries.length === 0
+          ? `<div style="color:#6e7681;font-size:.7rem;padding:4px 0">No virtual sensors placed.</div>`
+          : entries
+            .map(
+              ([id, vs]) => `
+      <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid #21262d;font-size:.68rem;font-family:'Courier New',monospace">
+        <span style="color:#f59e0b;font-weight:700;min-width:36px">${vs.label}</span>
+        <span style="color:#8b949e;flex:1">${vs.lat.toFixed(4)}° ${vs.lon.toFixed(4)}°</span>
+        <button onclick="wsSend({type:'remove_virtual_sensor',id:${id}})"
+          style="background:none;border:1px solid #30363d;color:#8b949e;border-radius:3px;padding:1px 6px;cursor:pointer;font-size:.62rem" title="Remove">✕</button>
+      </div>`,
+            )
+            .join("");
+      // Update floating panel counter
+      const cnt = document.getElementById("vs-float-count");
+      if (cnt) cnt.textContent = `${Object.keys(virtualSensors).length} placed`;
+    }
+
+    // ─── Planning-Mode GDOP Heatmap ───────────────────────────────────────────────
+    function updatePlanningHeatmap(data) {
+      planningGdopLayer.clearLayers();
+      if (!data.points || data.points.length === 0) return;
+
+      // Group by quality for back-to-front z-index rendering
+      const groups = groupPointsByQuality(data.points);
+      const qualityOrder = [
+        "degenerate",
+        "unacceptable",
+        "poor",
+        "moderate",
+        "good",
+        "excellent",
+      ];
+      const qualityColors = {
+        degenerate: "#18181b",
+        unacceptable: "#ef4444",
+        poor: "#f97316",
+        moderate: "#eab308",
+        good: "#84cc16",
+        excellent: "#22c55e",
+      };
+      const halfRes = data.resolution_deg / 2;
+
+      qualityOrder.forEach((q) => {
+        (groups[q] || []).forEach((p) => {
+          L.rectangle(
+            [
+              [p.lat - halfRes, p.lon - halfRes],
+              [p.lat + halfRes, p.lon + halfRes],
+            ],
+            {
+              fillColor: qualityColors[q],
+              fillOpacity: 0.35,
+              stroke: false,
+              interactive: false,
+            },
+          ).addTo(planningGdopLayer);
+        });
+      });
+
+      // Update SIMULATED badge
+      const badge = document.getElementById("planning-badge");
+      if (badge) {
+        badge.style.display = "inline";
+        badge.textContent = `SIMULATED · ${data.real_sensor_count}R+${data.virtual_sensor_count}V`;
+      }
+
+      // Update planning coverage stats in VS panel
+      const s = data.stats;
+      const pct = (k) =>
+        s.total_points > 0
+          ? ((s[k] / s.total_points) * 100).toFixed(1) + "%"
+          : "—";
+      const statsEl = document.getElementById("planning-cov-stats");
+      if (statsEl) {
+        statsEl.innerHTML = `
+      <div style="font-size:.7rem;line-height:1.65;font-family:monospace">
+        <div style="color:#f59e0b;font-weight:700;margin-bottom:3px;letter-spacing:.05em">SIMULATED COVERAGE</div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#22c55e">Excellent</span><span>${pct("excellent")}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#84cc16">Good</span><span>${pct("good")}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#eab308">Moderate</span><span>${pct("moderate")}</span></div>
+        <div style="display:flex;justify-content:space-between"><span style="color:#f97316">Poor</span><span>${pct("poor")}</span></div>
+        <div style="margin-top:3px;padding-top:3px;border-top:1px solid #30363d;display:flex;justify-content:space-between">
+          <span style="color:#8b949e">Mean GDOP</span>
+          <span>${Number.isFinite(s.mean_gdop) ? s.mean_gdop.toFixed(2) : "∞"}</span>
+        </div>
+      </div>`;
+      }
+    }
+
+    connect();
+  </script>
 </body>
+
 </html>
