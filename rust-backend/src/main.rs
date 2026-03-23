@@ -390,6 +390,7 @@ async fn solve_semi_mlat_and_broadcast(
     clock_sync: &mut ClockSyncEngine,
     sensor_registry: &SensorRegistry,
     kalman_registry: &mut KalmanRegistry,
+    adsb_parser: &mut AdsbParser,
     ws_tx: &BroadcastTx,
 ) {
     // Extract ICAO24 for track lookup
@@ -406,6 +407,11 @@ async fn solve_semi_mlat_and_broadcast(
             return;
         }
     };
+
+    // Parse ADS-B to extract altitude (CRITICAL FIX: enable altitude constraint)
+    let adsb_parsed = group.frames[0]
+        .bytes()
+        .and_then(|bytes| adsb_parser.parse(bytes, group.frames[0].timestamp_ns()));
 
     // Apply clock corrections
     clock_sync.apply_corrections(&mut group.frames);
@@ -432,14 +438,22 @@ async fn solve_semi_mlat_and_broadcast(
     let var_ns2 = clock_sync.get_pair_variance_ns2(other_id, ref_id);
     let tdoa_variance_m2 = var_ns2 * C_M_PER_NS * C_M_PER_NS;
 
-    // Build semi-MLAT input
+    // Extract altitude from ADS-B (if present, it's fresh from current frame)
+    let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
+    let alt_age_seconds = if adsb_alt_m.is_some() {
+        0.0 // Fresh altitude from current frame
+    } else {
+        999.0 // No altitude → constraint disabled (age > 926m threshold)
+    };
+
+    // Build semi-MLAT input (now with altitude constraint enabled)
     let input = semi_mlat_solver::SemiMlatInput {
         sensor_positions: [sensor_vecs[0], sensor_vecs[1]],
         observed_tdoa_m,
         tdoa_variance_m2,
         kalman_prior,
-        adsb_alt_m: None, // TODO: could extract from ADS-B parser if needed
-        alt_age_seconds: 0.0,
+        adsb_alt_m,
+        alt_age_seconds,
     };
 
     // Solve
@@ -574,8 +588,8 @@ async fn solve_and_broadcast(
 
     // Branch: 2-sensor semi-MLAT vs 3+ sensor full MLAT
     if group.frames.len() == 2 {
-        // Semi-MLAT path: requires existing Kalman track
-        solve_semi_mlat_and_broadcast(group, clock_sync, sensor_registry, kalman_registry, ws_tx)
+        // Semi-MLAT path: requires existing Kalman track (now with altitude constraint)
+        solve_semi_mlat_and_broadcast(group, clock_sync, sensor_registry, kalman_registry, adsb_parser, ws_tx)
             .await;
         return;
     } else if group.frames.len() < 2 {
