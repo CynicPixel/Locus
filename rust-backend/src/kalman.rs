@@ -91,10 +91,11 @@ impl AircraftKalman {
 
         // Covariance: P_new = F*P*F^T + Q, exploiting F = I + dt*B sparsity
         let dt2 = dt * dt;
-        // FIX-8: 1 m/s² process noise — appropriate for commercial aviation.
-        // mlat-server uses 0.10 m/s² for a 9-state CA model; 1 m/s² is used here
-        // for the 6-state CV model to cover typical manoeuvres without over-smoothing.
-        let sigma_a2: f64 = crate::consts::PROCESS_NOISE_ACCEL_MS2; // (1 m/s²)²
+        // FIX: Process noise increased to 100 m²/s⁴ for sparse MLAT measurements.
+        // With 6-state CV model and 5-30s measurement intervals, this allows velocity
+        // uncertainty to grow by √(100×10s) = 32 m/s over 10s, covering ±3σ = ±96 m/s
+        // (99.7% of realistic maneuvers). Based on Bar-Shalom (2001) for CV models.
+        let sigma_a2: f64 = crate::consts::PROCESS_NOISE_ACCEL_MS2; // (10 m/s²)²
         for i in 0..3 {
             let j = i + 3;
             for k in 0..6 {
@@ -203,12 +204,37 @@ impl AircraftKalman {
 
         // Clamp horizontal velocity to physically plausible range
         let v_mag = (self.x[3].powi(2) + self.x[4].powi(2) + self.x[5].powi(2)).sqrt();
-        if v_mag > crate::consts::MAX_SPEED_MS {
-            let scale = crate::consts::MAX_SPEED_MS / v_mag;
+        let max_speed = crate::consts::MAX_SPEED_MS;
+
+        // Safety net: hard reset if velocity approaches clamp (likely diverged)
+        if v_mag > max_speed * 0.8 {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                v_mag,
+                vx = self.x[3],
+                vy = self.x[4],
+                vz = self.x[5],
+                "Velocity divergence detected (>{:.1} m/s), resetting to zero", max_speed * 0.8
+            );
+            self.x[3] = 0.0;
+            self.x[4] = 0.0;
+            self.x[5] = 0.0;
+            self.p[(3, 3)] = crate::consts::RESET_VEL_VARIANCE_M2; // 200 m/s std dev
+            self.p[(4, 4)] = crate::consts::RESET_VEL_VARIANCE_M2;
+            self.p[(5, 5)] = crate::consts::RESET_VEL_VARIANCE_M2;
+        } else if v_mag > max_speed {
+            let scale = max_speed / v_mag;
             self.x[3] *= scale;
             self.x[4] *= scale;
             self.x[5] *= scale;
-            tracing::debug!(icao24 = %self.icao24, v_mag, "velocity clamped");
+            tracing::warn!(
+                icao24 = %self.icao24,
+                v_mag,
+                vx = self.x[3],
+                vy = self.x[4],
+                vz = self.x[5],
+                "Velocity clamped from {:.1} m/s to {:.1} m/s", v_mag, max_speed
+            );
         }
 
         // Clamp vertical velocity to realistic aircraft performance
