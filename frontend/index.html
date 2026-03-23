@@ -2559,7 +2559,7 @@
     }
 
     // ─── WebSocket ───────────────────────────────────────────────────────────────
-    const WS_URL = `ws://${location.hostname}:9001`;
+    const WS_URL = location.protocol === 'https:' ? `wss://${location.hostname}/ws` : `ws://${location.hostname}:9001`;
     let ws;
 
     function connect() {
