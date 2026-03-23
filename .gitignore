@@ -2,8 +2,8 @@
 buyer-env
 .buyer-env
 go-ingestor/.buyer-env
-*.env
-*.env.local
+.env
+.env.local
 
 # Build artefacts
 go-ingestor/ingestor
