@@ -14,8 +14,8 @@ services:
       - "--buyer-or-seller=buyer"
       - "--list-of-sellers-source=env"
       - "--envFile=/app/buyer.env"
-      - "--my-public-ip=${MY_PUBLIC_IP:-147.185.221.17}"
-      - "--my-public-port=${MY_PUBLIC_PORT:-25677}"
+      - "--my-public-ip=${MY_PUBLIC_IP}"
+      - "--my-public-port=${MY_PUBLIC_PORT}"
 
   ml-service:
     build: ./ml-service
