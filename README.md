@@ -239,10 +239,6 @@ The wider gate trades false-negative risk (rejecting valid measurements) for fal
 
 ### 1. Message Ingestion & Correlation
 
-<p align="center">
-  <img src="docs/assets/correlator-diagram.png" alt="Correlator Pipeline" width="600"/>
-</p>
-
 #### Overview
 
 Raw Mode S frames arrive from distributed sensors via a Unix socket ingestor. Each frame carries a sensor ID, nanosecond-precision timestamp, and the raw hex-encoded transponder message. The **correlator** groups frames that represent the *same physical transmission* received at multiple sensors.
@@ -355,7 +351,7 @@ The ECEF-to-ENU rotation uses the full geodetic rotation matrix, not a simplifie
 ### 3. Semi-MLAT Solver (2 Sensors + Kalman Prior)
 
 <p align="center">
-  <img src="docs/assets/semi-mlat-hyperbola.png" alt="Semi-MLAT Geometry" width="500"/>
+  <img src="docs/assets/semi-mlat.png" alt="Semi-MLAT Geometry" width="500"/>
 </p>
 
 #### Overview
@@ -478,6 +474,10 @@ When no Kalman track exists, semi-MLAT can still solve using an ADS-B position a
 ---
 
 ### 4. ADS-B Decode Pipeline
+
+<p align="center">
+  <img src="docs/assets/ads-b.png" alt="ADS-B Tracking" width="500"/>
+</p>
 
 #### Overview
 
@@ -639,6 +639,10 @@ Three consecutive outliers trigger a **filter reset** — the track re-acquires 
 
 <p align="center">
   <img src="docs/assets/gdop-heatmap-screenshot.png" alt="GDOP Heatmap" width="700"/>
+</p>
+
+<p align="center">
+  <img src="docs/assets/virtuals-screenshot.jpg" alt="GDOP Re-evalution with Virtual Sensors" width="700"/>
 </p>
 
 #### Overview
