@@ -21,8 +21,8 @@
 // - Kay (1993), "Fundamentals of Statistical Signal Processing", Ch. 12 (MAP estimation)
 // - Grewal & Andrews (2014), "Kalman Filtering", Ch. 8 (constrained filtering)
 
-use nalgebra::{DVector, Matrix3, OMatrix, Vector3};
 use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
+use nalgebra::{DVector, Matrix3, OMatrix, Vector3};
 
 use crate::coords::ecef_to_wgs84;
 
@@ -136,7 +136,7 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     }
 
     // 2. Geometry checks
-    let baseline = (&input.sensor_positions[0] - &input.sensor_positions[1]).norm();
+    let baseline = (input.sensor_positions[0] - input.sensor_positions[1]).norm();
     if baseline < crate::consts::MIN_SENSOR_BASELINE_M {
         return Err("sensors too close (<5km baseline)");
     }
@@ -147,8 +147,8 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     // 3. Innovation gating (Mahalanobis distance)
     // Predicted TDOA from Kalman prior
     let pred_pos = &input.kalman_prior.position;
-    let pred_tdoa = (pred_pos - &input.sensor_positions[0]).norm()
-                  - (pred_pos - &input.sensor_positions[1]).norm();
+    let pred_tdoa = (pred_pos - input.sensor_positions[0]).norm()
+        - (pred_pos - input.sensor_positions[1]).norm();
     let innovation = input.observed_tdoa_m - pred_tdoa;
 
     // CRITICAL FIX: Proper covariance projection (not scalar trace approximation)
@@ -163,9 +163,9 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     // - Makes gate too permissive when prior is elongated perpendicular to baseline
     //
     // Standard Kalman innovation: ν ~ N(0, S) where S = H·P·H^T + R
-    let H = tdoa_measurement_jacobian(pred_pos, &input.sensor_positions);
-    let HPH = H * &input.kalman_prior.covariance * H.transpose(); // 1×1 scalar
-    let innovation_variance = input.tdoa_variance_m2 + HPH[(0, 0)];
+    let h = tdoa_measurement_jacobian(pred_pos, &input.sensor_positions);
+    let hph = h * input.kalman_prior.covariance * h.transpose(); // 1×1 scalar
+    let innovation_variance = input.tdoa_variance_m2 + hph[(0, 0)];
     let sigma_total = innovation_variance.sqrt();
 
     if innovation.abs() > crate::consts::INNOVATION_GATE_MAHALANOBIS * sigma_total {
@@ -173,17 +173,18 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
             innovation,
             sigma_total,
             ratio = innovation.abs() / sigma_total,
-            HPH = HPH[(0, 0)],
-            "semi-MLAT rejected: innovation gate exceeded (>{MAHALANOBIS_GATE}σ)"
+            HPH = hph[(0, 0)],
+            "semi-MLAT rejected: innovation gate exceeded (>{:?}σ)",
+            crate::consts::INNOVATION_GATE_MAHALANOBIS
         );
         return Err("innovation exceeds gate (outlier)");
     }
 
     // 4. Weak constraint check: avoid nearly collinear geometry
     // Direction vectors from prior to sensors
-    let dir_0 = (pred_pos - &input.sensor_positions[0]).normalize();
-    let dir_1 = (pred_pos - &input.sensor_positions[1]).normalize();
-    let dir_diff = (&dir_0 - &dir_1).norm();
+    let dir_0 = (pred_pos - input.sensor_positions[0]).normalize();
+    let dir_1 = (pred_pos - input.sensor_positions[1]).normalize();
+    let dir_diff = (dir_0 - dir_1).norm();
     if dir_diff < crate::consts::WEAK_CONSTRAINT_THRESHOLD {
         return Err("weak constraint (sensors nearly collinear with prior)");
     }
@@ -242,14 +243,14 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U3> for SemiMlatProblem {
         let mut r = Vec::with_capacity(4 + n_alt);
 
         // TDOA residual (weighted by measurement uncertainty)
-        let dist_0 = (pos - &self.sensors[0]).norm();
-        let dist_1 = (pos - &self.sensors[1]).norm();
+        let dist_0 = (pos - self.sensors[0]).norm();
+        let dist_1 = (pos - self.sensors[1]).norm();
         let predicted_tdoa = dist_0 - dist_1;
         r.push((self.observed_tdoa_m - predicted_tdoa) / self.sigma_tdoa_m);
 
         // Prior residuals: L⁻¹ · (p - p_prior)
-        let diff = pos - &self.prior_position;
-        let r_prior = &self.prior_precision_chol * diff;
+        let diff = pos - self.prior_position;
+        let r_prior = self.prior_precision_chol * diff;
         r.push(r_prior[0]);
         r.push(r_prior[1]);
         r.push(r_prior[2]);
@@ -271,22 +272,23 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U3> for SemiMlatProblem {
         let mut j = OMatrix::<f64, nalgebra::Dyn, nalgebra::U3>::zeros(n_rows);
 
         // TDOA gradient: ∂TDOA/∂p = dir_0 - dir_1
-        let dist_0 = (pos - &self.sensors[0]).norm();
-        let dist_1 = (pos - &self.sensors[1]).norm();
+        let dist_0 = (pos - self.sensors[0]).norm();
+        let dist_1 = (pos - self.sensors[1]).norm();
 
         if dist_0 < crate::consts::MIN_DISTANCE_M || dist_1 < crate::consts::MIN_DISTANCE_M {
             return None; // Degenerate (on sensor)
         }
 
-        let dir_0 = (pos - &self.sensors[0]) / dist_0;
-        let dir_1 = (pos - &self.sensors[1]) / dist_1;
+        let dir_0 = (pos - self.sensors[0]) / dist_0;
+        let dir_1 = (pos - self.sensors[1]) / dist_1;
 
         // Row 0: TDOA gradient (negated because residual = obs - pred)
         let grad_tdoa = -(dir_0 - dir_1) / self.sigma_tdoa_m;
         j.set_row(0, &grad_tdoa.transpose());
 
         // Rows 1-3: L⁻¹ block (prior precision)
-        j.fixed_view_mut::<3, 3>(1, 0).copy_from(&self.prior_precision_chol);
+        j.fixed_view_mut::<3, 3>(1, 0)
+            .copy_from(&self.prior_precision_chol);
 
         // Row 4 (if altitude enabled): WGS84 altitude gradient
         // ∂alt_wgs84/∂p ≈ surface normal = [cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat)]
@@ -343,7 +345,11 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
     // Error = 250ft base + 70ft/s * age. Skip if too stale (>~12s → >926m error).
     let alt_data: Option<(f64, f64)> = input.adsb_alt_m.and_then(|alt| {
         let err_m = 76.2 + input.alt_age_seconds * 21.3; // 250ft + 70ft/s degradation
-        if err_m > 926.0 { None } else { Some((alt, err_m)) }
+        if err_m > 926.0 {
+            None
+        } else {
+            Some((alt, err_m))
+        }
     });
     let alt_weight = alt_data.map(|(_, err)| 1.0 / err).unwrap_or(0.0);
     let alt_target_m = alt_data.map(|(a, _)| a);
@@ -390,9 +396,15 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
 
     // Condition number check
     let jtj_mat = Matrix3::new(
-        jtj[(0, 0)], jtj[(0, 1)], jtj[(0, 2)],
-        jtj[(1, 0)], jtj[(1, 1)], jtj[(1, 2)],
-        jtj[(2, 0)], jtj[(2, 1)], jtj[(2, 2)],
+        jtj[(0, 0)],
+        jtj[(0, 1)],
+        jtj[(0, 2)],
+        jtj[(1, 0)],
+        jtj[(1, 1)],
+        jtj[(1, 2)],
+        jtj[(2, 0)],
+        jtj[(2, 1)],
+        jtj[(2, 2)],
     );
 
     // Check condition number via SVD (expensive but robust)
@@ -522,9 +534,15 @@ fn confidence_ellipse_m(cov_ecef: &Matrix3<f64>, lat_deg: f64, lon_deg: f64) -> 
 
     // ECEF → ENU rotation matrix
     let r = Matrix3::new(
-        -slon,        clon,         0.0,
-        -slat * clon, -slat * slon, clat,
-        clat * clon,  clat * slon,  slat,
+        -slon,
+        clon,
+        0.0,
+        -slat * clon,
+        -slat * slon,
+        clat,
+        clat * clon,
+        clat * slon,
+        slat,
     );
 
     let cov_enu = &r * cov_ecef * r.transpose();
@@ -566,8 +584,7 @@ mod tests {
         let prior_pos = true_pos + Vector3::new(200.0, 200.0, 0.0);
         let prior_cov = Matrix3::from_diagonal(&Vector3::new(
             250_000.0, // 500m std dev (250km² variance)
-            250_000.0,
-            250_000.0,
+            250_000.0, 250_000.0,
         ));
 
         let input = SemiMlatInput {
@@ -650,8 +667,7 @@ mod tests {
 
         let prior_cov = Matrix3::from_diagonal(&Vector3::new(
             500_000.0, // 500m std dev
-            500_000.0,
-            500_000.0,
+            500_000.0, 500_000.0,
         ));
 
         // But TDOA observation implies aircraft is far from prior
@@ -671,7 +687,10 @@ mod tests {
         };
 
         let solution = solve_semi_mlat(&input);
-        assert!(solution.is_none(), "should reject outlier via innovation gate");
+        assert!(
+            solution.is_none(),
+            "should reject outlier via innovation gate"
+        );
     }
 
     #[test]
@@ -691,9 +710,8 @@ mod tests {
         // Good prior (close to truth, moderate uncertainty)
         let prior_pos = true_pos + Vector3::new(100.0, 100.0, 200.0);
         let prior_cov = Matrix3::from_diagonal(&Vector3::new(
-            500_000.0,  // 707m std dev
-            500_000.0,
-            500_000.0,
+            500_000.0, // 707m std dev
+            500_000.0, 500_000.0,
         ));
 
         // Solve WITH altitude constraint
@@ -706,7 +724,7 @@ mod tests {
                 covariance: prior_cov,
             },
             adsb_alt_m: Some(10_000.0), // Provide altitude constraint
-            alt_age_seconds: 0.5, // Fresh
+            alt_age_seconds: 0.5,       // Fresh
         };
 
         // Should solve successfully with altitude constraint
@@ -714,25 +732,13 @@ mod tests {
 
         // Verify solution is reasonable
         let alt_error = (sol.alt_m - 10_000.0).abs();
-        assert!(
-            alt_error < 300.0,
-            "altitude error: {} m",
-            alt_error
-        );
+        assert!(alt_error < 300.0, "altitude error: {} m", alt_error);
 
         let pos_error = (&sol.ecef - &true_pos).norm();
-        assert!(
-            pos_error < 400.0,
-            "position error: {} m",
-            pos_error
-        );
+        assert!(pos_error < 400.0, "position error: {} m", pos_error);
 
         // Verify SDOP is reasonable
-        assert!(
-            sol.sdop < 300.0,
-            "SDOP: {} m",
-            sol.sdop
-        );
+        assert!(sol.sdop < 300.0, "SDOP: {} m", sol.sdop);
     }
 
     #[test]
@@ -851,9 +857,9 @@ mod tests {
         // Start with a prior that has moderate uncertainty
         let mut current_prior_pos = true_pos + Vector3::new(200.0, 200.0, 100.0);
         let mut current_prior_cov = Matrix3::from_diagonal(&Vector3::new(
-            1_000_000.0,  // 1000m std dev horizontal
+            1_000_000.0, // 1000m std dev horizontal
             1_000_000.0,
-            500_000.0,    // 707m std dev vertical
+            500_000.0, // 707m std dev vertical
         ));
 
         // Track minimum covariance to ensure it doesn't collapse

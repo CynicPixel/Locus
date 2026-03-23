@@ -1005,7 +1005,9 @@
 
     // Whether to show this aircraft in the current mode
     function aircraftVisible(state) {
-      return displayMode === "mlat" ? state.gdop > 0 : state.gdop === 0;
+      if (displayMode === "mlat")
+        return state.gdop > 0 || state.observation_mode === "semi_mlat";
+      return state.gdop === 0 && state.observation_mode !== "semi_mlat";
     }
 
     // Add or remove an aircraft's marker + ellipse from the map without deleting state
@@ -1233,6 +1235,7 @@
 
     // ─── Aircraft update ──────────────────────────────────────────────────────────
     function ellipseFillOpacity(state) {
+      if (state.observation_mode === "semi_mlat") return 0.10;
       if (state.gdop === 0) return 0.06;
       const tier = gdopTier(state.gdop);
       return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
@@ -1257,6 +1260,9 @@
       const pos = [lat, lon];
       const visible = aircraftVisible(state);
       const fillOpacity = ellipseFillOpacity(state);
+      const isSemiMlat = state.observation_mode === "semi_mlat";
+      const ellipseColor = isSemiMlat ? "#14b8a6" : color;
+      const ellipseDash  = isSemiMlat ? "6 4" : null;
 
       if (!aircraft[icao24]) {
         const tooltipLabel = state.callsign
@@ -1267,13 +1273,15 @@
           {permanent: false, direction: "top"},
         );
         marker.on("click", () => focusAircraft(icao24));
-        const ellipse = L.circle(pos, {
+        const ellipseOpts = {
           radius: Math.max(state.confidence_ellipse_m || 200, 100),
-          color,
-          fillColor: color,
+          color: ellipseColor,
+          fillColor: ellipseColor,
           fillOpacity,
-          weight: 1,
-        });
+          weight: isSemiMlat ? 1.5 : 1,
+        };
+        if (ellipseDash) ellipseOpts.dashArray = ellipseDash;
+        const ellipse = L.circle(pos, ellipseOpts);
         aircraft[icao24] = {
           marker,
           ellipse,
@@ -1291,10 +1299,12 @@
         const ac = aircraft[icao24];
         if (visible) {
           ac.marker.setLatLng(pos).setIcon(makeIcon(color, status));
+          const ellipseStyle = { color: ellipseColor, fillColor: ellipseColor, fillOpacity, weight: isSemiMlat ? 1.5 : 1 };
+          if (ellipseDash) ellipseStyle.dashArray = ellipseDash;
           ac.ellipse
             .setLatLng(pos)
             .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
-            .setStyle({color, fillColor: color, fillOpacity});
+            .setStyle(ellipseStyle);
         }
         setAircraftMapVisibility(icao24, visible);
         ac.lastSeen = Date.now();
@@ -1319,6 +1329,11 @@
 
       if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
 
+      const prevMode = prev?.state?.observation_mode;
+      if (state.observation_mode === "semi_mlat" && prevMode !== "semi_mlat") {
+        addSemiMlatAlert(state);
+      }
+
       if (selectedIcao === icao24 && visible) {
         refreshPopup();
         drawAttributionLines(icao24);
@@ -1333,6 +1348,19 @@
       row.className = "alert-entry";
       const flag = state.spoof_flag ? "GPS-SPOOF" : "ANOMALY";
       row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24} — ${flag}`;
+      el.insertBefore(row, el.firstChild);
+      if (el.children.length > 40) el.removeChild(el.lastChild);
+    }
+
+    function addSemiMlatAlert(state) {
+      const el = document.getElementById("alert-list");
+      const em = el.querySelector("em");
+      if (em) em.remove();
+      const row = document.createElement("div");
+      row.className = "alert-entry";
+      row.style.color = "#60a5fa";
+      const sdopStr = state.sdop != null ? `, SDOP ${Math.round(state.sdop)}m` : "";
+      row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24.toUpperCase()} — Semi-MLAT acquired (2 sensors${sdopStr})`;
       el.insertBefore(row, el.firstChild);
       if (el.children.length > 40) el.removeChild(el.lastChild);
     }
@@ -1384,6 +1412,10 @@
           ? `<span class="badge badge-idle">IDLE</span>`
           : "";
 
+        const semiMlatBadge = s.observation_mode === "semi_mlat"
+          ? `<span class="badge" style="background:#0e7490;color:#fff" title="Positioned via 2-sensor semi-MLAT (Kalman-assisted MAP solver)">SEMI</span>`
+          : "";
+
         // Show GDOP tier badge for Fair (3) and Poor (4) only — Excellent/Good are clean
         let gdopBadge = "";
         if (displayMode === "mlat" && s.gdop > 0) {
@@ -1396,7 +1428,7 @@
         row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
       <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
-      ${badge}${spoofBadge}${gdopBadge}${idleBadge}`;
+      ${badge}${spoofBadge}${semiMlatBadge}${gdopBadge}${idleBadge}`;
         list.appendChild(row);
       }
       document.getElementById("ac-count").textContent = sorted.length;
@@ -1483,11 +1515,11 @@
           const status = markerStatus(ac.state);
           ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color, status));
           if (ac.ellipse) {
-            ac.ellipse.setStyle({
-              color,
-              fillColor: color,
-              fillOpacity: ellipseFillOpacity(ac.state),
-            });
+            const isSemi = ac.state.observation_mode === "semi_mlat";
+            const eColor = isSemi ? "#14b8a6" : color;
+            const eStyle = { color: eColor, fillColor: eColor, fillOpacity: ellipseFillOpacity(ac.state), weight: isSemi ? 1.5 : 1 };
+            if (isSemi) eStyle.dashArray = "6 4";
+            ac.ellipse.setStyle(eStyle);
           }
         }
       }
@@ -1969,10 +2001,13 @@
       const age = Date.now() - ac.lastSeen;
 
       // Source badge + GDOP tier badge
-      const isAdsb = s.gdop === 0;
+      const isAdsb    = s.gdop === 0 && s.observation_mode !== "semi_mlat";
+      const isSemiMlat = s.observation_mode === "semi_mlat";
       let srcBadge;
       if (isAdsb) {
         srcBadge = `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`;
+      } else if (isSemiMlat) {
+        srcBadge = `<span class="badge" style="background:#0e7490;color:#fff" title="Positioned via 2-sensor semi-MLAT (Kalman-assisted MAP solver)">SEMI-MLAT</span>`;
       } else {
         const tier = gdopTier(s.gdop);
         const tierBadge =
@@ -1999,8 +2034,13 @@
           ? `${Math.round(durationMs / 1000)}s`
           : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
 
-      // GDOP row — show numeric + tier label for MLAT, N/A for ADS-B
-      const gdopCell = (() => {
+      // DOP row — SDOP for semi-MLAT, GDOP otherwise
+      const isSemiMlatPopup = s.observation_mode === "semi_mlat";
+      const dopRowLabel = isSemiMlatPopup ? "SDOP" : "GDOP";
+      const dopCell = (() => {
+        if (isSemiMlatPopup) {
+          return `${Math.round(s.sdop ?? 0)}m <span style="color:#8b949e;font-size:.68rem" title="Semi-MLAT Dilution of Precision — 1σ uncertainty from 2-sensor MAP solver">(2-sensor MAP)</span>`;
+        }
         if (s.gdop === 0) return "N/A (ADS-B)";
         const tier = gdopTier(s.gdop);
         const tierHtml = tier
@@ -2017,7 +2057,7 @@
 
       // LEFT card (ac-popup-right, DOM 1st): quality + tracking
       const qualityRows = [
-        ["GDOP", gdopCell],
+        [dopRowLabel, dopCell],
         [
           "Accuracy",
           `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`,
@@ -2453,7 +2493,10 @@
       dotEl.style.background = color;
       labelEl.textContent = label;
       labelEl.style.color = color;
-      countEl.textContent = `${active} / ${total} sensors`;
+      const fullCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "full_mlat").length;
+      const semiCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "semi_mlat").length;
+      const modeStr = (fullCount + semiCount) > 0 ? ` · ${fullCount} full / ${semiCount} semi` : "";
+      countEl.textContent = `${active} / ${total} sensors${modeStr}`;
     }
 
     function updateClockPanelHeader(clockData) {
