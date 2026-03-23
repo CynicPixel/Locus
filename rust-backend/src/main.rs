@@ -412,19 +412,54 @@ async fn solve_semi_mlat_and_broadcast(
         group.key.icao24[0], group.key.icao24[1], group.key.icao24[2]
     );
 
-    // Require existing Kalman track (no cold starts from 2-sensor data)
-    let kalman_prior = match kalman_registry.get_prior(&icao24) {
-        Some(prior) => prior,
-        None => {
-            tracing::debug!(icao24 = %icao24, "2-sensor obs discarded: no existing track");
-            return;
-        }
-    };
-
-    // Parse ADS-B to extract altitude (CRITICAL FIX: enable altitude constraint)
+    // Parse ADS-B early (needed for cold-start prior AND altitude constraint)
     let adsb_parsed = group.frames[0]
         .bytes()
         .and_then(|bytes| adsb_parser.parse(bytes, group.frames[0].timestamp_ns()));
+
+    // Try Kalman track first, fallback to ADS-B position for cold start
+    let kalman_prior = match kalman_registry.get_prior(&icao24) {
+        Some(prior) => prior,
+        None => {
+            // Cold start: use ADS-B position as prior if available and reasonable quality
+            match &adsb_parsed {
+                Some(adsb) if adsb.nuc >= 5 => {
+                    // NUC >= 5 means position uncertainty ≤ 463m (acceptable with 5× inflation)
+                    let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
+                    let ecef_pos = nalgebra::Vector3::new(x, y, z);
+
+                    // Construct prior with large uncertainty (no velocity information)
+                    let pos_uncertainty = match adsb.nuc {
+                        9 => 50.0,   // ≤ 7.5m
+                        8 => 100.0,  // ≤ 25m
+                        7 => 300.0,  // ≤ 75m
+                        6 => 500.0,  // ≤ 185m
+                        5 => 800.0,  // ≤ 463m
+                        _ => 800.0,
+                    };
+
+                    // Large covariance for cold start (3×3 position covariance)
+                    use nalgebra::Matrix3;
+                    let mut covariance = Matrix3::<f64>::zeros();
+                    for i in 0..3 {
+                        covariance[(i, i)] = pos_uncertainty * pos_uncertainty; // Position variance
+                    }
+
+                    semi_mlat_solver::KalmanPrior {
+                        position: ecef_pos,
+                        covariance,
+                    }
+                }
+                _ => {
+                    tracing::debug!(
+                        icao24 = %icao24,
+                        "2-sensor obs discarded: no Kalman track and no ADS-B position (NUC < 5)"
+                    );
+                    return;
+                }
+            }
+        }
+    };
 
     // Apply clock corrections
     clock_sync.apply_corrections(&mut group.frames);
@@ -491,6 +526,11 @@ async fn solve_semi_mlat_and_broadcast(
     // Update Kalman filter
     let now_ns = group.first_seen_ns;
     kalman_registry.update_from_semi_mlat(&icao24, &solution, now_ns);
+
+    // If this was a cold start (no prior Kalman), the update_from_semi_mlat above
+    // initialized the filter via or_insert_with. Log confirmation.
+    // Note: update_from_semi_mlat already handles initialization via or_insert_with,
+    // so we don't need a separate initialize() call here. The track now exists.
 
     // Get smoothed position from Kalman
     let (lat, lon, alt_m) =
