@@ -25,14 +25,12 @@
 ## Demo
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=YOUR_VIDEO_ID">
-    <img src="https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg" alt="Locus Demo Video" width="720"/>
+  <a href="https://www.youtube.com/watch?v=3yB2SLVSIskc">
+    <img src="docs/assets/thumb.png" alt="Locus Demo Video" width="720"/>
   </a>
   <br/>
   <em>Click to watch the full demo on YouTube</em>
 </p>
-
-> **Replace `YOUR_VIDEO_ID`** with the actual YouTube video ID once uploaded.
 
 ---
 
