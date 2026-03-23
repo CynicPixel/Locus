@@ -9,7 +9,8 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, RwLock};
+use nalgebra::Vector3;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -88,6 +89,8 @@ enum ClientMessage {
     RemoveVirtualSensor { id: u64 },
     ClearVirtualSensors,
     SetPlanningAltitude { altitude_m: f64 },
+    SetLiveHeatmapAltitude { altitude_m: f64 },
+    RequestAircraftInfo { icao24: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +104,12 @@ enum ClientResponse {
     VirtualSensorRemoved { id: u64 },
     VirtualSensorsCleared,
     VirtualSensorError { message: String },
+    AircraftInfoResult {
+        icao24:         String,
+        callsign:       Option<String>,
+        squawk:         Option<String>,
+        origin_country: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +123,10 @@ pub async fn run_ws_server(
     tx: BroadcastTx,
     cache: Arc<RwLock<Option<String>>>,
     sensor_registry: Arc<RwLock<SensorRegistry>>,
+    live_altitude: Arc<RwLock<f64>>,
+    heatmap_tx: mpsc::Sender<crate::gdop_heatmap::HeatmapRequest>,
+    opensky_cache: crate::opensky_client::OpenSkyCache,
+    opensky_http: Arc<reqwest::Client>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("WebSocket server listening on {addr}");
@@ -124,6 +137,10 @@ pub async fn run_ws_server(
         let mut rx = tx.subscribe();
         let cache = Arc::clone(&cache);
         let sensor_registry = Arc::clone(&sensor_registry);
+        let live_altitude = Arc::clone(&live_altitude);
+        let heatmap_tx = heatmap_tx.clone();
+        let opensky_cache = Arc::clone(&opensky_cache);
+        let opensky_http  = Arc::clone(&opensky_http);
 
         tokio::spawn(async move {
             let ws = match tokio_tungstenite::accept_async(stream).await {
@@ -136,7 +153,7 @@ pub async fn run_ws_server(
 
             let (mut sink, mut source) = ws.split();
             let mut virtual_registry = VirtualSensorRegistry::new(20);
-            let mut planning_altitude = 3048.0; // FL100 default
+            let mut planning_altitude_m: f64 = crate::consts::DEFAULT_HEATMAP_ALTITUDE_M; // default FL300
 
             // Send cached heatmap immediately — no wait for next 60s tick
             {
@@ -173,7 +190,11 @@ pub async fn run_ws_server(
                                     &mut sink,
                                     &sensor_registry,
                                     peer,
-                                    &mut planning_altitude,
+                                    &mut planning_altitude_m,
+                                    &live_altitude,
+                                    &heatmap_tx,
+                                    &opensky_cache,
+                                    &opensky_http,
                                 ).await;
                             }
                             Some(Ok(Message::Close(_))) | None => break,
@@ -203,7 +224,11 @@ async fn handle_client_msg(
     sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
     sreg: &Arc<RwLock<SensorRegistry>>,
     peer: SocketAddr,
-    planning_altitude: &mut f64,
+    planning_alt: &mut f64,
+    live_alt: &Arc<RwLock<f64>>,
+    heatmap_tx: &mpsc::Sender<crate::gdop_heatmap::HeatmapRequest>,
+    opensky_cache: &crate::opensky_client::OpenSkyCache,
+    opensky_http: &reqwest::Client,
 ) {
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -220,7 +245,7 @@ async fn handle_client_msg(
                     send_json(sink, &ClientResponse::VirtualSensorAdded {
                         id: id.0, lat, lon, alt_m,
                     }).await;
-                    recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
+                    recompute_planning_gdop(vreg, sink, sreg, *planning_alt).await;
                 }
                 Err(e) => {
                     send_json(sink, &ClientResponse::VirtualSensorError { message: e }).await;
@@ -230,7 +255,7 @@ async fn handle_client_msg(
         ClientMessage::RemoveVirtualSensor { id } => {
             vreg.remove(VirtualSensorId(id));
             send_json(sink, &ClientResponse::VirtualSensorRemoved { id }).await;
-            recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
+            recompute_planning_gdop(vreg, sink, sreg, *planning_alt).await;
         }
         ClientMessage::ClearVirtualSensors => {
             vreg.clear();
@@ -238,15 +263,74 @@ async fn handle_client_msg(
             // No recompute — client exits planning mode, live heatmap resumes
         }
         ClientMessage::SetPlanningAltitude { altitude_m } => {
-            // Validate altitude (positive, reasonable range)
-            if altitude_m > 0.0 && altitude_m <= 15_000.0 {
-                *planning_altitude = altitude_m;
-                tracing::debug!(altitude_m, "updated planning mode altitude");
-                recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
+            if crate::consts::ALLOWED_PLANNING_ALTITUDES.contains(&altitude_m) {
+                *planning_alt = altitude_m;
+                if vreg.count() > 0 {
+                    recompute_planning_gdop(vreg, sink, sreg, *planning_alt).await;
+                }
             } else {
                 send_json(sink, &ClientResponse::VirtualSensorError {
-                    message: format!("Invalid altitude: {altitude_m}m (must be 0-15000m)"),
+                    message: format!("Invalid altitude: {altitude_m}m (must be FL050/FL100/FL300)"),
                 }).await;
+            }
+        }
+        ClientMessage::RequestAircraftInfo { icao24 } => {
+            let key = icao24.to_lowercase();
+
+            // Check TTL cache first
+            let cached = {
+                let cache = opensky_cache.read().await;
+                cache.get(&key).and_then(|c| {
+                    if c.fetched_at.elapsed() < crate::opensky_client::CACHE_TTL {
+                        Some(c.info.clone())
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            let info = if let Some(info) = cached {
+                info
+            } else {
+                let fetched = crate::opensky_client::fetch_aircraft_info(opensky_http, &key).await
+                    .unwrap_or_default();
+                opensky_cache.write().await.insert(key.clone(), crate::opensky_client::CachedInfo {
+                    info: fetched.clone(),
+                    fetched_at: std::time::Instant::now(),
+                });
+                fetched
+            };
+
+            send_json(sink, &ClientResponse::AircraftInfoResult {
+                icao24:         icao24.clone(),
+                callsign:       info.callsign,
+                squawk:         info.squawk,
+                origin_country: info.origin_country,
+            }).await;
+        }
+        ClientMessage::SetLiveHeatmapAltitude { altitude_m } => {
+            if crate::consts::ALLOWED_PLANNING_ALTITUDES.contains(&altitude_m) {
+                *live_alt.write().await = altitude_m;
+                let sensor_ecef: Vec<Vector3<f64>> = {
+                    let reg = sreg.read().await;
+                    reg.export_wgs84()
+                        .iter()
+                        .map(|s| {
+                            let (x, y, z) = crate::coords::wgs84_to_ecef(s.lat, s.lon, s.alt_m);
+                            Vector3::new(x, y, z)
+                        })
+                        .collect()
+                };
+                if sensor_ecef.len() >= 3 {
+                    let _ = heatmap_tx.try_send(crate::gdop_heatmap::HeatmapRequest::Compute {
+                        sensor_ecef,
+                        bounds: None,
+                        resolution_deg: crate::consts::PLANNING_GDOP_RESOLUTION_DEG,
+                        altitude_m,
+                    });
+                }
+            } else {
+                tracing::warn!("Invalid live heatmap altitude {altitude_m} from {peer}");
             }
         }
     }
@@ -271,8 +355,8 @@ async fn recompute_planning_gdop(
         crate::gdop_heatmap::compute_grid_with_virtual(
             &real_snap,
             &virt_snap,
-            altitude_m, // User-configurable altitude (FL050/FL100/FL300)
-            0.1,        // 0.1° resolution — same as live heatmap
+            altitude_m,
+            0.1,    // 0.1° resolution — same as live heatmap
         )
     })
     .await;

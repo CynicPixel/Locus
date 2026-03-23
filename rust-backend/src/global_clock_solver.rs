@@ -26,45 +26,21 @@ use serde::Serialize;
 use crate::coords::ecef_dist;
 use crate::sensors::SensorRegistry;
 
-/// Speed of light in air (m/ns). c_vacuum/1.0003 — matches mlat-server Cair.
-const C_M_PER_NS: f64 = 0.299_702_547;
-
-/// Observation buffer capacity (60s at ~500 obs/s with 8+ sensors = 30_000 samples).
-const BUFFER_CAPACITY: usize = 30_000;
-
-/// Minimum edges per sensor to be considered well-constrained.
-const MIN_EDGES_PER_SENSOR: usize = 2;
-
-/// Covariance diagonal threshold (ns) for unstable sensor detection.
-const UNSTABLE_SENSOR_THRESHOLD_NS: f64 = 500.0;
-
-/// IRLS outlier threshold (MAD multiplier).
-/// FIX-4: Reduced from 3.0 to 2.0 after detrending makes MAD represent true noise.
-const OUTLIER_MAD_THRESHOLD: f64 = 2.0;
-
-/// Maximum IRLS iterations.
-const MAX_IRLS_ITERATIONS: usize = 5;
-
-/// IRLS convergence threshold (relative change in weights).
-/// Audit Bug #5: Relaxed from 0.01 — 0.01 was too tight, forcing extra iterations with no accuracy gain.
-const IRLS_CONVERGENCE_THRESHOLD: f64 = 0.05;
-
-/// Maximum condition number before warning.
-const MAX_CONDITION_NUMBER: f64 = 1e8;
-
-// Hysteresis thresholds for sensor status transitions (Audit Issue #8).
-// Wider gap between enter/exit thresholds prevents status flapping.
-/// Uncertainty threshold to enter Marginal from Stable (ns).
-const MARGINAL_ENTER_NS: f64 = 350.0;
-/// Uncertainty threshold to exit Marginal back to Stable (ns).
-const MARGINAL_EXIT_NS: f64 = 200.0;
-/// Uncertainty threshold to exit Unstable down to Marginal (ns).
-const UNSTABLE_EXIT_NS: f64 = 400.0;
-/// Consecutive zero-edge solves required before declaring Disconnected.
-const DISCONNECTED_COUNT: u32 = 3;
-
-/// Drift tracking window size (seconds).
-const DRIFT_WINDOW_S: f64 = 60.0;
+// Global clock solver constants are defined in crate::consts.
+use crate::consts::{
+    BUFFER_CAPACITY,
+    MIN_EDGES_PER_SENSOR,
+    UNSTABLE_SENSOR_THRESHOLD_NS,
+    OUTLIER_MAD_THRESHOLD,
+    MAX_IRLS_ITERATIONS,
+    IRLS_CONVERGENCE_THRESHOLD,
+    MAX_CONDITION_NUMBER,
+    MARGINAL_ENTER_NS,
+    MARGINAL_EXIT_NS,
+    UNSTABLE_EXIT_NS,
+    DISCONNECTED_COUNT,
+    DRIFT_WINDOW_S,
+};
 
 // ---------------------------------------------------------------------------
 // Core data structures

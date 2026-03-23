@@ -22,7 +22,7 @@ pub struct VirtualSensorId(pub u64);
 
 impl VirtualSensorId {
     pub fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
+        static COUNTER: AtomicU64 = AtomicU64::new(crate::consts::VIRTUAL_SENSOR_ID_START as u64);
         Self(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -100,7 +100,7 @@ impl VirtualSensorRegistry {
         }
 
         // Altitude validation (0m - FL500 = 15,240m MSL)
-        if !(0.0..=15240.0).contains(&alt_m) {
+        if !(0.0..=crate::consts::MAX_VIRTUAL_SENSOR_ALTITUDE_M).contains(&alt_m) {
             return Err(format!(
                 "Altitude {} out of range [0, 15240]m MSL",
                 alt_m

@@ -82,9 +82,12 @@ impl RawFrame {
 // Socket connection with retry
 // ---------------------------------------------------------------------------
 
-const SOCKET_PATH: &str = "/tmp/locus/ingestor.sock";
-const MAX_CONNECT_RETRIES: u32 = 240; // 120 s budget
-const RETRY_DELAY_MS: u64 = 500;
+// Ingestor connection constants are defined in crate::consts.
+use crate::consts::{
+    INGESTOR_SOCKET_PATH as SOCKET_PATH,
+    MAX_CONNECT_RETRIES,
+    INGESTOR_RETRY_DELAY_MS as RETRY_DELAY_MS,
+};
 
 async fn connect_with_retry() -> anyhow::Result<tokio::net::UnixStream> {
     for attempt in 0..MAX_CONNECT_RETRIES {
@@ -142,7 +145,7 @@ pub async fn run_ingestor(tx: mpsc::Sender<RawFrame>) -> anyhow::Result<()> {
         match connect_with_retry().await {
             Err(e) => {
                 tracing::error!("Could not connect to Go ingestor: {e}. Retrying in 5 s.");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(crate::consts::INGESTOR_RECONNECT_DELAY_SECS)).await;
             }
             Ok(stream) => {
                 let result = read_loop(stream, &tx).await;
@@ -150,7 +153,7 @@ pub async fn run_ingestor(tx: mpsc::Sender<RawFrame>) -> anyhow::Result<()> {
                     Ok(()) => tracing::warn!("Go ingestor connection closed cleanly. Reconnecting…"),
                     Err(e) => tracing::warn!("Go ingestor connection lost: {e}. Reconnecting…"),
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(crate::consts::INGESTOR_CLOSE_RECONNECT_DELAY_MS)).await;
             }
         }
     }

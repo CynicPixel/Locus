@@ -66,12 +66,12 @@ impl AircraftKalman {
         let x = Vector6::new(x_ecef, y_ecef, z_ecef, 0.0, 0.0, 0.0);
         let mut p = Matrix6::zeros();
         // Initial uncertainty: 1000 m position, 200 m/s velocity (matching mlat-server UKF init).
-        p[(0, 0)] = 1_000_000.0; // 1 km
-        p[(1, 1)] = 1_000_000.0;
-        p[(2, 2)] = 1_000_000.0;
-        p[(3, 3)] = 40_000.0; // 200 m/s
-        p[(4, 4)] = 40_000.0;
-        p[(5, 5)] = 40_000.0;
+        p[(0, 0)] = crate::consts::INITIAL_POS_VARIANCE_M2; // 1 km
+        p[(1, 1)] = crate::consts::INITIAL_POS_VARIANCE_M2;
+        p[(2, 2)] = crate::consts::INITIAL_POS_VARIANCE_M2;
+        p[(3, 3)] = crate::consts::INITIAL_VEL_VARIANCE_M2; // 200 m/s
+        p[(4, 4)] = crate::consts::INITIAL_VEL_VARIANCE_M2;
+        p[(5, 5)] = crate::consts::INITIAL_VEL_VARIANCE_M2;
         Self {
             icao24,
             x,
@@ -94,7 +94,7 @@ impl AircraftKalman {
         // FIX-8: 1 m/s² process noise — appropriate for commercial aviation.
         // mlat-server uses 0.10 m/s² for a 9-state CA model; 1 m/s² is used here
         // for the 6-state CV model to cover typical manoeuvres without over-smoothing.
-        let sigma_a2: f64 = 1.0; // (1 m/s²)²
+        let sigma_a2: f64 = crate::consts::PROCESS_NOISE_ACCEL_MS2; // (1 m/s²)²
         for i in 0..3 {
             let j = i + 3;
             for k in 0..6 {
@@ -156,7 +156,7 @@ impl AircraftKalman {
     pub fn update(&mut self, x_m: f64, y_m: f64, z_m: f64, accuracy_m: f64) {
         let h = h_matrix();
         // Measurement noise: MLAT accuracy² (floor 10 000 m²); Z 4× larger (approx.)
-        let r_val = accuracy_m.powi(2).max(10_000.0);
+        let r_val = accuracy_m.powi(2).max(crate::consts::MEASUREMENT_NOISE_FLOOR_M2);
         let r = Matrix3::from_diagonal(&Vector3::new(r_val, r_val, r_val * 4.0));
 
         let z = Vector3::new(x_m, y_m, z_m);
@@ -166,8 +166,7 @@ impl AircraftKalman {
         // Mahalanobis distance: y^T S^{-1} y (FIX-8).
         if let Some(s_inv) = s.try_inverse() {
             let maha2 = (y.transpose() * s_inv * y)[(0, 0)];
-            const MAHALANOBIS_GATE: f64 = 15.0 * 15.0; // mlat-server threshold = 15
-            if maha2 > MAHALANOBIS_GATE {
+            if maha2 > crate::consts::MAHALANOBIS_GATE_SQ {
                 self.outlier_count += 1;
                 tracing::debug!(
                     icao24 = %self.icao24,
@@ -175,7 +174,7 @@ impl AircraftKalman {
                     outlier_count = self.outlier_count,
                     "Kalman outlier rejected"
                 );
-                if self.outlier_count >= 3 {
+                if self.outlier_count >= crate::consts::OUTLIER_COUNT_RESET {
                     // Three consecutive outliers: reset position from measurement.
                     self.x[0] = x_m;
                     self.x[1] = y_m;
@@ -184,7 +183,10 @@ impl AircraftKalman {
                     self.x[4] = 0.0;
                     self.x[5] = 0.0;
                     self.p = Matrix6::from_diagonal(&Vector6::new(
-                        r_val, r_val, r_val * 4.0, 40_000.0, 40_000.0, 40_000.0,
+                        r_val, r_val, r_val * 4.0,
+                        crate::consts::RESET_VEL_VARIANCE_M2,
+                        crate::consts::RESET_VEL_VARIANCE_M2,
+                        crate::consts::RESET_VEL_VARIANCE_M2,
                     ));
                     self.outlier_count = 0;
                 }
@@ -201,9 +203,8 @@ impl AircraftKalman {
 
         // Clamp horizontal velocity to physically plausible range
         let v_mag = (self.x[3].powi(2) + self.x[4].powi(2) + self.x[5].powi(2)).sqrt();
-        const MAX_SPEED_MS: f64 = 350.0;
-        if v_mag > MAX_SPEED_MS {
-            let scale = MAX_SPEED_MS / v_mag;
+        if v_mag > crate::consts::MAX_SPEED_MS {
+            let scale = crate::consts::MAX_SPEED_MS / v_mag;
             self.x[3] *= scale;
             self.x[4] *= scale;
             self.x[5] *= scale;
@@ -253,9 +254,9 @@ impl AircraftKalman {
 // ---------------------------------------------------------------------------
 
 /// Stores the last 20 Kalman track states for the LSTM classifier.
-/// Units: (lat°, lon°, alt_m, vel_lat °/s, vel_lon °/s, vel_alt m/s)
+/// Units: (lat°, lon°, alt_m, vel_lat °/s, vel_lon °/s, vel_alt m/s, gdop, divergence_m)
 pub struct AircraftHistory {
-    pub states: std::collections::VecDeque<(f64, f64, f64, f64, f64, f64)>,
+    pub states: std::collections::VecDeque<(f64, f64, f64, f64, f64, f64, f64, f64)>,
     pub last_classify_ns: u64,
 }
 
@@ -268,7 +269,8 @@ impl AircraftHistory {
     }
 
     /// Push a new state after each Kalman update (ECEF velocity converted to ENU °/s).
-    pub fn push(&mut self, kalman: &AircraftKalman) {
+    /// `gdop` and `divergence_m` are passed from the MLAT solver / spoof detector.
+    pub fn push(&mut self, kalman: &AircraftKalman, gdop: f64, divergence_m: f64) {
         let (lat, lon, alt_m) = kalman.position_wgs84();
         let (vx, vy, vz) = kalman.velocity_ms();
         let (lat_r, lon_r) = (lat.to_radians(), lon.to_radians());
@@ -282,14 +284,14 @@ impl AircraftHistory {
             + lat_r.cos() * lon_r.sin() * vy
             + lat_r.sin() * vz;
 
-        let vel_lat = north / 111_320.0;
+        let vel_lat = north / crate::consts::METERS_PER_DEGREE_LAT;
         let cos_lat = lat_r.cos().abs().max(1e-9);
-        let vel_lon = east / (111_320.0 * cos_lat);
+        let vel_lon = east / (crate::consts::METERS_PER_DEGREE_LAT * cos_lat);
         let vel_alt = up;
 
         self.states
-            .push_back((lat, lon, alt_m, vel_lat, vel_lon, vel_alt));
-        if self.states.len() > 20 {
+            .push_back((lat, lon, alt_m, vel_lat, vel_lon, vel_alt, gdop, divergence_m));
+        if self.states.len() > crate::consts::MAX_HISTORY_STATES {
             self.states.pop_front();
         }
     }
@@ -332,11 +334,20 @@ impl KalmanRegistry {
         entry.update(x_ecef, y_ecef, z_ecef, mlat.accuracy_m);
         entry.last_update_ns = now_ns;
 
+    }
+
+    /// Push a history entry for the given aircraft with gdop and divergence_m.
+    /// Call this after spoof detection so both values are available.
+    pub fn push_history(&mut self, icao24: &str, gdop: f64, divergence_m: f64) {
+        let entry = match self.filters.get(icao24) {
+            Some(e) => e,
+            None => return,
+        };
         let hist = self
             .histories
             .entry(icao24.to_string())
             .or_insert_with(AircraftHistory::new);
-        hist.push(entry);
+        hist.push(entry, gdop, divergence_m);
     }
 
     /// Current ECEF position for use as LM solver prior.
@@ -399,7 +410,7 @@ impl KalmanRegistry {
             .histories
             .entry(icao24.to_string())
             .or_insert_with(AircraftHistory::new);
-        hist.push(entry);
+        hist.push(entry, 0.0, 0.0);
 
         tracing::debug!(
             icao24 = %icao24,

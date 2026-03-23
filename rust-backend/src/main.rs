@@ -1,6 +1,7 @@
 mod adsb_parser;
 mod anomaly_client;
 mod clock_sync;
+pub mod consts;
 mod coords;
 mod correlator;
 mod gdop_heatmap;
@@ -52,15 +53,7 @@ pub struct Cli {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Speed of light **in air** (m/ns). c_vacuum/1.0003 — matches mlat-server Cair constant.
-/// Using vacuum speed introduces ~0.03% systematic TDOA error (~90 m at 300 km range).
-const C_M_PER_NS: f64 = 0.299_702_547;
-/// Rate-limit ML classify to once per 5 s per aircraft.
-const CLASSIFY_INTERVAL_NS: u64 = 5_000_000_000;
-/// Eviction tick — run correlator eviction every 10 ms.
-const EVICTION_TICK_MS: u64 = 10;
-/// Sensor health broadcast every 5 s.
-const HEALTH_BROADCAST_SECS: u64 = 5;
+// Speed of light, timing intervals, and broadcast periods are defined in crate::consts.
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -74,7 +67,7 @@ fn classify_topology_health(
     connectivity: f64,
     condition_number: f64,
 ) -> &'static str {
-    if condition_number > 1e8 {
+    if condition_number > crate::consts::MAX_CONDITION_NUMBER {
         return "poor"; // Ill-conditioned system
     }
     if global_rms_ns < 50.0 && connectivity > 0.7 {
@@ -106,18 +99,19 @@ async fn main() -> anyhow::Result<()> {
     info!(ws_addr = %cli.ws_addr, ml_url = %cli.ml_service_url);
 
     // ---- channels --------------------------------------------------------
-    let (frame_tx, mut frame_rx) = mpsc::channel::<RawFrame>(4096);
-    let (ws_tx, _) = broadcast::channel::<String>(4096);
+    let (frame_tx, mut frame_rx) = mpsc::channel::<RawFrame>(crate::consts::FRAME_CHANNEL_CAPACITY);
+    let (ws_tx, _) = broadcast::channel::<String>(crate::consts::WS_BROADCAST_CAPACITY);
 
     // ---- heatmap cache: last computed result served instantly to new clients
     let heatmap_cache: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    // ---- OpenSky enrichment cache: callsign/squawk/origin_country keyed by ICAO24
+    // ---- live heatmap altitude: shared between main loop and WS server ------
+    let live_heatmap_altitude_m: Arc<RwLock<f64>> =
+        Arc::new(RwLock::new(crate::consts::DEFAULT_HEATMAP_ALTITUDE_M)); // FL300
+
+    // ---- OpenSky enrichment: on-demand per-aircraft, TTL-cached ---------------
     let opensky_cache = opensky_client::new_cache();
-    opensky_client::spawn_opensky_task(
-        Arc::clone(&opensky_cache),
-        (43.0, -6.0, 57.0, 18.0), // Europe bbox: lamin, lomin, lamax, lomax
-    );
+    let opensky_http = Arc::new(opensky_client::new_client());
 
     // ---- spawn ingestor (connects to Go Unix socket) ----------------------
     let _ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
@@ -127,21 +121,37 @@ async fn main() -> anyhow::Result<()> {
     let mut clock_sync = ClockSyncEngine::new();
     let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
 
+    // ---- spawn GDOP heatmap background task -------------------------------
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
+    let heatmap_tx_for_ws = heatmap_tx.clone();
+
     // ---- spawn WebSocket server -------------------------------------------
     {
         let ws_tx2 = ws_tx.clone();
         let addr = cli.ws_addr.clone();
         let cache = Arc::clone(&heatmap_cache);
         let registry_clone = Arc::clone(&sensor_registry);
+        let live_alt = Arc::clone(&live_heatmap_altitude_m);
+        let htx = heatmap_tx_for_ws;
+        let osky_cache = Arc::clone(&opensky_cache);
+        let osky_http = Arc::clone(&opensky_http);
         tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache, registry_clone).await {
+            if let Err(e) = ws_server::run_ws_server(
+                addr,
+                ws_tx2,
+                cache,
+                registry_clone,
+                live_alt,
+                htx,
+                osky_cache,
+                osky_http,
+            )
+            .await
+            {
                 tracing::error!("WS server error: {e}");
             }
         });
     }
-
-    // ---- spawn GDOP heatmap background task -------------------------------
-    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
 
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
@@ -159,9 +169,12 @@ async fn main() -> anyhow::Result<()> {
     let mut beacon_obs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     let mut last_frame_ns: u64 = 0;
-    let mut eviction_tick = tokio::time::interval(Duration::from_millis(EVICTION_TICK_MS));
-    let mut health_tick = tokio::time::interval(Duration::from_secs(HEALTH_BROADCAST_SECS));
-    let mut heatmap_tick = tokio::time::interval(Duration::from_secs(60));
+    let mut eviction_tick =
+        tokio::time::interval(Duration::from_millis(crate::consts::EVICTION_TICK_MS));
+    let mut health_tick =
+        tokio::time::interval(Duration::from_secs(crate::consts::HEALTH_BROADCAST_SECS));
+    let mut heatmap_tick =
+        tokio::time::interval(Duration::from_secs(crate::consts::HEATMAP_TICK_SECS));
     let mut frame_count: u64 = 0;
     let mut last_sensor_count: usize = 0;
     let mut first_heatmap_triggered = false;
@@ -317,10 +330,10 @@ async fn main() -> anyhow::Result<()> {
                     1.0
                 };
 
-                let should_compute = count >= 3 && (
+                let should_compute = count >= crate::consts::MIN_SENSORS_FIRST_HEATMAP && (
                     change_ratio > 0.2
                     || last_sensor_count == 0
-                    || (!first_heatmap_triggered && count >= 3)  // Immediate first computation
+                    || (!first_heatmap_triggered && count >= crate::consts::MIN_SENSORS_FIRST_HEATMAP)  // Immediate first computation
                 );
 
                 if should_compute {
@@ -335,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
                         sensor_ecef,
                         bounds: None,  // Auto-compute from sensors
                         resolution_deg: 0.1,
-                        altitude_m: 9144.0,  // FL300
+                        altitude_m: *live_heatmap_altitude_m.read().await,
                     });
 
                     last_sensor_count = count;
@@ -430,13 +443,13 @@ async fn solve_semi_mlat_and_broadcast(
     // Compute TDOA (meters) relative to sensor[0]
     let ref_ts_ns = group.frames[0].timestamp_ns() as i64;
     let tdoa_ns = group.frames[1].timestamp_ns() as i64 - ref_ts_ns;
-    let observed_tdoa_m = tdoa_ns as f64 * C_M_PER_NS;
+    let observed_tdoa_m = tdoa_ns as f64 * crate::consts::C_M_PER_NS;
 
     // TDOA variance from clock sync (or fallback to 300m if unavailable)
     let ref_id = group.frames[0].sensor_id;
     let other_id = group.frames[1].sensor_id;
     let var_ns2 = clock_sync.get_pair_variance_ns2(other_id, ref_id);
-    let tdoa_variance_m2 = var_ns2 * C_M_PER_NS * C_M_PER_NS;
+    let tdoa_variance_m2 = var_ns2 * crate::consts::C_M_PER_NS * crate::consts::C_M_PER_NS;
 
     // Extract altitude from ADS-B (if present, it's fresh from current frame)
     let adsb_alt_m = adsb_parsed.as_ref().map(|a| a.alt_m);
@@ -490,8 +503,8 @@ async fn solve_semi_mlat_and_broadcast(
         .get_velocity_enu(&icao24, lat, lon)
         .unwrap_or((0.0, 0.0, 0.0));
     let cos_lat = lat.to_radians().cos().abs().max(1e-9);
-    let vel_lat = north / 111_320.0;
-    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_lat = north / crate::consts::METERS_PER_DEGREE_LAT;
+    let vel_lon = east / (crate::consts::METERS_PER_DEGREE_LAT * cos_lat);
     let vel_alt = up;
 
     // Build AircraftState (observation_mode = "semi_mlat")
@@ -504,8 +517,8 @@ async fn solve_semi_mlat_and_broadcast(
         vel_lat,
         vel_lon,
         vel_alt,
-        gdop: 0.0, // N/A for semi-MLAT
-        vdop: 0.0, // N/A for semi-MLAT
+        gdop: 0.0,            // N/A for semi-MLAT
+        vdop: 0.0,            // N/A for semi-MLAT
         altitude_valid: true, // semi-MLAT uses Kalman prior, assumed valid
         confidence_ellipse_m: solution.accuracy_m,
         spoof_flag: false, // Don't run spoof detector on semi-MLAT (lower accuracy)
@@ -625,13 +638,13 @@ async fn solve_and_broadcast(
     // 3. Timestamp feasibility check (FIX-13): reject groups where any pair's
     //    TDOA exceeds the physical bound imposed by their separation distance.
     //    |t_i - t_j| > d(i,j) * 1.05 / C_air + 1µs guard → impossible.
-    const TDOA_GUARD_NS: f64 = 1_000.0; // 1 µs guard
     for (fi, pi) in group.frames.iter().zip(sensor_vecs.iter()) {
         for (fj, pj) in group.frames.iter().zip(sensor_vecs.iter()) {
             if fi.sensor_id >= fj.sensor_id {
                 continue;
             }
-            let max_tdoa_ns = (pi - pj).norm() * 1.05 / C_M_PER_NS + TDOA_GUARD_NS;
+            let max_tdoa_ns =
+                (pi - pj).norm() * 1.05 / crate::consts::C_M_PER_NS + crate::consts::TDOA_GUARD_NS;
             let obs_ns =
                 (fi.timestamp_ns() as i64 - fj.timestamp_ns() as i64).unsigned_abs() as f64;
             if obs_ns > max_tdoa_ns {
@@ -651,7 +664,7 @@ async fn solve_and_broadcast(
     let ref_ts_ns = group.frames[0].timestamp_ns() as i64;
     let observed_tdoa_m: Vec<f64> = group.frames[1..]
         .iter()
-        .map(|f| (f.timestamp_ns() as i64 - ref_ts_ns) as f64 * C_M_PER_NS)
+        .map(|f| (f.timestamp_ns() as i64 - ref_ts_ns) as f64 * crate::consts::C_M_PER_NS)
         .collect();
 
     let icao24 = format!(
@@ -691,7 +704,8 @@ async fn solve_and_broadcast(
     sensor_ids.sort_unstable();
 
     // Count sensors with valid clock calibration (Stable or Marginal status).
-    let calibrated_sensor_count = sensor_ids.iter()
+    let calibrated_sensor_count = sensor_ids
+        .iter()
         .filter(|&&sid| clock_sync.is_calibrated(sid, now_ns))
         .count();
 
@@ -713,11 +727,11 @@ async fn solve_and_broadcast(
     // FIX-4: Per-measurement variance from clock sync (meters²).
     // Reference sensor (index 0) uses a fixed 50 ns timing uncertainty.
     let ref_id = group.frames[0].sensor_id;
-    let ref_sigma_m = 50.0 * C_M_PER_NS; // 50 ns * C_air ≈ 15 m
+    let ref_sigma_m = 50.0 * crate::consts::C_M_PER_NS; // 50 ns * C_air ≈ 15 m
     let mut tdoa_variance_m2 = vec![ref_sigma_m * ref_sigma_m]; // sensor 0
     for f in &group.frames[1..] {
         let var_ns2 = clock_sync.get_pair_variance_ns2(f.sensor_id, ref_id);
-        tdoa_variance_m2.push(var_ns2 * C_M_PER_NS * C_M_PER_NS);
+        tdoa_variance_m2.push(var_ns2 * crate::consts::C_M_PER_NS * crate::consts::C_M_PER_NS);
     }
 
     let input = MlatInput {
@@ -789,13 +803,16 @@ async fn solve_and_broadcast(
         .get_velocity_enu(&icao24, lat, lon)
         .unwrap_or((0.0, 0.0, 0.0));
     let cos_lat = lat.to_radians().cos().abs().max(1e-9);
-    let vel_lat = north / 111_320.0;
-    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_lat = north / crate::consts::METERS_PER_DEGREE_LAT;
+    let vel_lon = east / (crate::consts::METERS_PER_DEGREE_LAT * cos_lat);
     let vel_alt = up;
 
     // 9. Spoof detection
     let (spoof_flag, divergence_m) =
         spoof_detector.check(&icao24, lat, lon, alt_m, solution.accuracy_m);
+
+    // Push Kalman history now that gdop and divergence_m are both available.
+    kalman_registry.push_history(&icao24, solution.gdop, divergence_m);
 
     // 10. Record ADS-B position for spoof detection.
     if let Some(adsb) = &adsb_parsed {
@@ -803,11 +820,15 @@ async fn solve_and_broadcast(
     }
 
     // 11. Build AircraftState and broadcast
-    // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
+    // Enrich with callsign/squawk from OpenSky cache (populated on-demand by WS handler).
     let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
-        if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        if let Some(cached) = cache.get(&icao24.to_lowercase()) {
+            (
+                cached.info.callsign.clone(),
+                cached.info.squawk.clone(),
+                cached.info.origin_country.clone(),
+            )
         } else {
             (None, None, None)
         }
@@ -850,7 +871,7 @@ async fn solve_and_broadcast(
     // Collect data under the immutable borrow, then drop it before get_mut.
     let classify_data = kalman_registry.histories.get(&icao24).and_then(|hist| {
         let elapsed = now_ns.saturating_sub(hist.last_classify_ns);
-        if elapsed > CLASSIFY_INTERVAL_NS && hist.states.len() >= 5 {
+        if elapsed > crate::consts::CLASSIFY_INTERVAL_NS && hist.states.len() >= 5 {
             Some(hist.states.iter().copied().collect::<Vec<_>>())
         } else {
             None
@@ -918,12 +939,15 @@ async fn broadcast_adsb(
             let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
             nalgebra::Vector3::new(x, y, z)
         },
-        gdop: 0.0,           // 0.0 signals ADS-B source (not MLAT)
-        vdop: 0.0,           // N/A for ADS-B
+
+        gdop: 0.0,            // 0.0 signals ADS-B source (not MLAT)
         altitude_valid: true, // ADS-B altitude is always considered valid
-        accuracy_m: 500.0,    // ADS-B typical horizontal accuracy (~500 m NUC=5)
-        dof: 0,              // not applicable for ADS-B
-        covariance: nalgebra::Matrix3::identity() * (500.0_f64 * 500.0),
+        vdop: 0.0,            // N/A for ADS-B
+        accuracy_m: crate::consts::ADSB_HORIZONTAL_ACCURACY_M, // ADS-B typical horizontal accuracy (~500 m NUC=5)
+        dof: 0,                                                // not applicable for ADS-B
+        covariance: nalgebra::Matrix3::identity()
+            * (crate::consts::ADSB_HORIZONTAL_ACCURACY_M
+                * crate::consts::ADSB_HORIZONTAL_ACCURACY_M),
     };
 
     kalman_registry.update(icao24, &solution, now_ns);
@@ -936,19 +960,27 @@ async fn broadcast_adsb(
         .get_velocity_enu(icao24, lat, lon)
         .unwrap_or((0.0, 0.0, 0.0));
     let cos_lat = lat.to_radians().cos().abs().max(1e-9);
-    let vel_lat = north / 111_320.0;
-    let vel_lon = east / (111_320.0 * cos_lat);
+    let vel_lat = north / crate::consts::METERS_PER_DEGREE_LAT;
+    let vel_lon = east / (crate::consts::METERS_PER_DEGREE_LAT * cos_lat);
     let vel_alt = up;
 
     let (spoof_flag, divergence_m) = spoof_detector.check(icao24, lat, lon, alt_m, 500.0);
+
+    // Push Kalman history now that divergence_m is available (gdop=0.0 for ADS-B).
+    kalman_registry.push_history(icao24, 0.0, divergence_m);
+
     // Record this ADS-B position as the "claimed" position for spoof detection.
     spoof_detector.record_adsb(icao24, adsb.lat, adsb.lon, adsb.alt_m);
 
-    // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
+    // Enrich with callsign/squawk from OpenSky cache (populated on-demand by WS handler).
     let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
-        if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        if let Some(cached) = cache.get(&icao24.to_lowercase()) {
+            (
+                cached.info.callsign.clone(),
+                cached.info.squawk.clone(),
+                cached.info.origin_country.clone(),
+            )
         } else {
             (None, None, None)
         }
@@ -992,7 +1024,7 @@ async fn broadcast_adsb(
     // Rate-limited anomaly classification
     let classify_data = kalman_registry.histories.get(icao24).and_then(|hist| {
         let elapsed = now_ns.saturating_sub(hist.last_classify_ns);
-        if elapsed > CLASSIFY_INTERVAL_NS && hist.states.len() >= 5 {
+        if elapsed > crate::consts::CLASSIFY_INTERVAL_NS && hist.states.len() >= 5 {
             Some(hist.states.iter().copied().collect::<Vec<_>>())
         } else {
             None
