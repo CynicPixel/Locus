@@ -27,6 +27,16 @@ use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use crate::coords::ecef_to_wgs84;
 
 // ---------------------------------------------------------------------------
+// Altitude bounds (shared with mlat_solver)
+// ---------------------------------------------------------------------------
+
+/// Altitude floor (meters MSL). Dead Sea: -430m.
+const ALTITUDE_FLOOR_M: f64 = -500.0;
+
+/// Altitude ceiling (meters MSL). Typical MLAT operational ceiling.
+const ALTITUDE_CEILING_M: f64 = 15_000.0;
+
+// ---------------------------------------------------------------------------
 // Public I/O types
 // ---------------------------------------------------------------------------
 
@@ -340,6 +350,22 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
 
     // 8. Convert to WGS84
     let (lat, lon, alt_m) = ecef_to_wgs84(solution_ecef[0], solution_ecef[1], solution_ecef[2]);
+
+    // Validate altitude is physically plausible for aircraft
+    if alt_m < ALTITUDE_FLOOR_M {
+        tracing::warn!(
+            alt_m,
+            "Semi-MLAT solution below altitude floor ({ALTITUDE_FLOOR_M}m), rejecting"
+        );
+        return None;
+    }
+    if alt_m > ALTITUDE_CEILING_M {
+        tracing::warn!(
+            alt_m,
+            "Semi-MLAT solution above altitude ceiling ({ALTITUDE_CEILING_M}m), rejecting"
+        );
+        return None;
+    }
 
     // 9. Horizontal accuracy (2-sigma confidence ellipse)
     let accuracy_m = confidence_ellipse_m(&covariance, lat, lon);

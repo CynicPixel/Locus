@@ -15,6 +15,17 @@ use levenberg_marquardt::{LeastSquaresProblem, LevenbergMarquardt};
 use crate::coords::ecef_to_wgs84;
 
 // ---------------------------------------------------------------------------
+// Altitude bounds for aircraft tracking
+// ---------------------------------------------------------------------------
+
+/// Altitude floor (meters MSL). Dead Sea: -430m. Allows low-elevation operations.
+const ALTITUDE_FLOOR_M: f64 = -500.0;
+
+/// Altitude ceiling (meters MSL). Typical MLAT operational ceiling.
+/// Commercial aircraft rarely exceed FL450 (~13,700m).
+const ALTITUDE_CEILING_M: f64 = 15_000.0;
+
+// ---------------------------------------------------------------------------
 // Public I/O types
 // ---------------------------------------------------------------------------
 
@@ -442,6 +453,22 @@ pub fn solve(
 
     let (lat_tmp, lon_tmp, alt_tmp) = ecef_to_wgs84(best_param[0], best_param[1], best_param[2]);
 
+    // Validate altitude is physically plausible for aircraft
+    if alt_tmp < ALTITUDE_FLOOR_M {
+        tracing::warn!(
+            alt_m = alt_tmp,
+            "MLAT solution below altitude floor ({ALTITUDE_FLOOR_M}m), rejecting"
+        );
+        return None;
+    }
+    if alt_tmp > ALTITUDE_CEILING_M {
+        tracing::warn!(
+            alt_m = alt_tmp,
+            "MLAT solution above altitude ceiling ({ALTITUDE_CEILING_M}m), rejecting"
+        );
+        return None;
+    }
+
     // GDOP: 2D horizontal when altitude constrained, 3D otherwise.
     let gdop = if alt_target_m.is_some() {
         let lat = lat_tmp.to_radians();
@@ -462,6 +489,25 @@ pub fn solve(
     if !gdop.is_finite() {
         tracing::debug!(gdop, "MLAT solution discarded — non-finite GDOP");
         return None;
+    }
+
+    // VDOP check when altitude constraint is weak (FIX: vertical geometry validation)
+    // When constraint weight is low, unconstrained vertical geometry can be poor
+    // even if GDOP appears acceptable. Check VDOP explicitly to prevent
+    // underground solutions from coplanar sensor configurations.
+    if alt_weight < 1e-3 {
+        // VDOP ≈ sqrt(covariance[2,2]) for ECEF Z axis
+        // Threshold 5.0 from GNSS standards - VDOP > 5 indicates poor vertical geometry
+        let vdop = jtj_inv[(2, 2)].sqrt();
+        if vdop > 5.0 {
+            tracing::debug!(
+                gdop,
+                vdop,
+                constraint_weight = alt_weight,
+                "VDOP exceeds threshold with weak altitude constraint, rejecting"
+            );
+            return None;
+        }
     }
 
     let covariance = jtj_inv * sigma2;

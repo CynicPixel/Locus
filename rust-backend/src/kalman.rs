@@ -12,8 +12,22 @@ use std::sync::OnceLock;
 
 use nalgebra::{Matrix3, Matrix3x6, Matrix6, Vector3, Vector6};
 
-use crate::coords::ecef_to_wgs84;
+use crate::coords::{ecef_to_wgs84, wgs84_to_ecef};
 use crate::mlat_solver::MlatSolution;
+
+// ---------------------------------------------------------------------------
+// Altitude and velocity bounds for aircraft tracking
+// ---------------------------------------------------------------------------
+
+/// Vertical velocity bounds for aircraft (m/s).
+/// 50 m/s = ~9,840 ft/min - extreme but physically possible (emergency descent, fighter jets).
+const VERTICAL_VELOCITY_MAX_MPS: f64 = 50.0;
+
+/// Altitude floor (meters MSL). Dead Sea: -430m. Allows low-elevation operations.
+const ALTITUDE_FLOOR_M: f64 = -500.0;
+
+/// Altitude ceiling (meters MSL). Typical MLAT operational ceiling.
+const ALTITUDE_CEILING_M: f64 = 15_000.0;
 
 // ---------------------------------------------------------------------------
 // Shared constant — H matrix never changes (Improvement 9)
@@ -100,6 +114,36 @@ impl AircraftKalman {
             self.p[(i, j)] += s2;
             self.p[(j, i)] += s2;
         }
+
+        // Clamp position to physically plausible altitudes
+        let (lat, lon, alt_m) = ecef_to_wgs84(self.x[0], self.x[1], self.x[2]);
+        if alt_m < ALTITUDE_FLOOR_M {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                alt_m,
+                "Kalman prediction below altitude floor, clamping to {ALTITUDE_FLOOR_M}m"
+            );
+            // Reproject to ECEF with clamped altitude
+            let (x_new, y_new, z_new) = wgs84_to_ecef(lat, lon, ALTITUDE_FLOOR_M);
+            self.x[0] = x_new;
+            self.x[1] = y_new;
+            self.x[2] = z_new;
+
+            // Inflate vertical uncertainty to signal low confidence
+            self.p[(2, 2)] = (500.0_f64).powi(2); // 500m std dev in Z
+        }
+        if alt_m > ALTITUDE_CEILING_M {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                alt_m,
+                "Kalman prediction above altitude ceiling, clamping to {ALTITUDE_CEILING_M}m"
+            );
+            let (x_new, y_new, z_new) = wgs84_to_ecef(lat, lon, ALTITUDE_CEILING_M);
+            self.x[0] = x_new;
+            self.x[1] = y_new;
+            self.x[2] = z_new;
+            self.p[(2, 2)] = (500.0_f64).powi(2);
+        }
     }
 
     /// Update step with MLAT-derived ECEF position.
@@ -152,7 +196,7 @@ impl AircraftKalman {
         self.x = &self.x + &k * y;
         self.p = (Matrix6::identity() - k * h) * &self.p;
 
-        // Clamp velocity to physically plausible range
+        // Clamp horizontal velocity to physically plausible range
         let v_mag = (self.x[3].powi(2) + self.x[4].powi(2) + self.x[5].powi(2)).sqrt();
         const MAX_SPEED_MS: f64 = 350.0;
         if v_mag > MAX_SPEED_MS {
@@ -161,6 +205,18 @@ impl AircraftKalman {
             self.x[4] *= scale;
             self.x[5] *= scale;
             tracing::debug!(icao24 = %self.icao24, v_mag, "velocity clamped");
+        }
+
+        // Clamp vertical velocity to realistic aircraft performance
+        // Typical max climb: 25 m/s (4900 ft/min), max descent: 40 m/s (7900 ft/min)
+        // Use 50 m/s as absolute limit to allow for transients
+        if self.x[5].abs() > VERTICAL_VELOCITY_MAX_MPS {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                vz = self.x[5],
+                "Vertical velocity exceeds physical limit, clamping to ±{VERTICAL_VELOCITY_MAX_MPS} m/s"
+            );
+            self.x[5] = self.x[5].signum() * VERTICAL_VELOCITY_MAX_MPS;
         }
     }
 

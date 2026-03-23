@@ -53,6 +53,15 @@ pub fn crc24_residual(payload: &[u8]) -> u32 {
 // ADS-B decoded position
 // ---------------------------------------------------------------------------
 
+/// Altitude source type from ADS-B Type Code
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltitudeSource {
+    /// Barometric altitude (TC 9-18) - can be negative for low-elevation locations
+    Barometric,
+    /// GNSS altitude / HAE (TC 20-22) - must be above geoid for aircraft
+    Gnss,
+}
+
 #[derive(Debug, Clone)]
 pub struct AdsbPosition {
     pub icao24: String,
@@ -62,6 +71,8 @@ pub struct AdsbPosition {
     /// Navigation Uncertainty Category (0–9, 9 = best, ≥ 6 required for clock sync beacons).
     /// Derived from Type Code: TC 9→NUC 9, TC 10→8, TC 11→7, TC 12→6, TC 13→5, TC≥14→<5.
     pub nuc: u8,
+    /// Altitude source (barometric vs GNSS) from Type Code
+    pub altitude_source: AltitudeSource,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,15 +336,26 @@ impl AdsbParser {
         }
 
         let tc = (bytes[4] >> 3) & 0x1F;
-        if !(9..=18).contains(&tc) {
-            return None; // airborne position TCs only
-        }
+
+        // Determine altitude source from Type Code:
+        // TC 9-18: Barometric altitude (can be negative for low elevations)
+        // TC 20-22: GNSS altitude / HAE (must be above geoid for aircraft)
+        let altitude_source = if (9..=18).contains(&tc) {
+            AltitudeSource::Barometric
+        } else if (20..=22).contains(&tc) {
+            AltitudeSource::Gnss
+        } else {
+            return None; // Only accept airborne position TCs with altitude
+        };
 
         // NUC from TC (ICAO Doc 9684 Table C-1) — FIX-10.
         // TC 9→NUC 9 (≤7.5m), TC 10→8 (≤25m), TC 11→7 (≤75m), TC 12→6 (≤185m),
-        // TC 13→5 (≤463m), TC ≥14 → NUC <5.
+        // TC 13→5 (≤463m), TC 20-22→similar to TC 9-13, TC ≥14 → NUC <5.
         let nuc: u8 = match tc {
-            9 => 9, 10 => 8, 11 => 7, 12 => 6, 13 => 5, 14 => 4,
+            9 | 20 => 9,  // TC 9 or 20: NUC 9 (≤7.5m)
+            10 | 21 => 8, // TC 10 or 21: NUC 8 (≤25m)
+            11 | 22 => 7, // TC 11 or 22: NUC 7 (≤75m)
+            12 => 6, 13 => 5, 14 => 4,
             15 => 3, 16 => 2, 17 => 1, _ => 0,
         };
 
@@ -343,6 +365,18 @@ impl AdsbParser {
         // Altitude (13-bit Gillham/Q-bit field across bytes 5–6)
         let alt_raw = (((bytes[5] as u16) & 0xFF) << 4) | ((bytes[6] as u16) >> 4);
         let alt_m = decode_altitude_m(alt_raw)?;
+
+        // Validate altitude based on source
+        // GNSS altitude below geoid floor is physically impossible for aircraft
+        // Barometric altitude can legitimately be negative (Dead Sea region: -430m MSL)
+        if altitude_source == AltitudeSource::Gnss && alt_m < -500.0 {
+            tracing::warn!(
+                icao24 = %format!("{:02X}{:02X}{:02X}", bytes[1], bytes[2], bytes[3]),
+                alt_m,
+                "ADS-B GNSS altitude below geoid floor, likely corrupt, rejecting"
+            );
+            return None;
+        }
 
         // CPR lat/lon
         let lat_cpr = ((bytes[6] as u32 & 0x03) << 15)
@@ -362,6 +396,7 @@ impl AdsbParser {
             lon,
             alt_m,
             nuc,
+            altitude_source,
         })
     }
 }
