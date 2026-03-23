@@ -18,16 +18,19 @@ import torch
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from model import AircraftLSTM
 from pydantic import BaseModel
+from constants import (
+    SEQ_LEN, NUM_FEATURES, ANOMALY_CLASS_INDEX, ANOMALY_LABEL,
+    DEFAULT_RETRAIN_EPOCHS,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("locus-ml")
 
-SEQ_LEN = 20
-FEATURES = 6
+FEATURES = NUM_FEATURES  # lat, lon, alt_m, vel_lat, vel_lon, vel_alt, gdop, divergence_m
 
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "model.pt"))
-MEAN_PATH = Path(os.getenv("MODEL_PATH", "model.pt").replace(".pt", "_mean.npy"))
-STD_PATH = Path(os.getenv("MODEL_PATH", "model.pt").replace(".pt", "_std.npy"))
+MEAN_PATH = MODEL_PATH.with_name(MODEL_PATH.stem + "_mean.npy")
+STD_PATH = MODEL_PATH.with_name(MODEL_PATH.stem + "_std.npy")
 
 app = FastAPI(title="Locus ML Service")
 
@@ -69,6 +72,8 @@ class KalmanStatePoint(BaseModel):
     vel_lat: float
     vel_lon: float
     vel_alt: float
+    gdop: float = 0.0
+    divergence_m: float = 0.0
 
 
 class ClassifyRequest(BaseModel):
@@ -93,21 +98,21 @@ async def health():
 
 
 @app.post("/classify", response_model=ClassifyResponse)
-async def classify(req: ClassifyRequest):
+def classify(req: ClassifyRequest):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     raw = np.array(
-        [[s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt] for s in req.states],
+        [[s.lat, s.lon, s.alt_m, s.vel_lat, s.vel_lon, s.vel_alt, s.gdop, s.divergence_m] for s in req.states],
         dtype=np.float32,
     )
 
     # Pad or trim to SEQ_LEN
     if len(raw) < SEQ_LEN:
-        pad = np.tile(raw[:1], (SEQ_LEN - len(raw), 1))
+        pad = np.zeros((SEQ_LEN - len(raw), FEATURES), dtype=np.float32)
         raw = np.concatenate([pad, raw], axis=0)
     else:
-        raw = raw[-SEQ_LEN:]
+        raw = raw[-SEQ_LEN:]  # keep the most recent SEQ_LEN steps
 
     # Normalise
     if model_mean is not None and model_std is not None:
@@ -119,7 +124,7 @@ async def classify(req: ClassifyRequest):
         probs = torch.softmax(logits, dim=1)[0]
         label_idx = int(probs.argmax().item())
         confidence = float(probs[label_idx].item())
-        label = "anomalous" if label_idx == 1 else "normal"
+        label = "anomalous" if label_idx == ANOMALY_CLASS_INDEX else "normal"
 
     return ClassifyResponse(
         icao24=req.icao24, anomaly_label=label, confidence=confidence
@@ -134,7 +139,7 @@ async def trigger_train(background_tasks: BackgroundTasks):
 
 async def _run_train() -> None:
     proc = await asyncio.create_subprocess_exec(
-        "python", "train.py", "--epochs", "20", "--output", str(MODEL_PATH)
+        "python", "train.py", "--epochs", str(DEFAULT_RETRAIN_EPOCHS), "--output", str(MODEL_PATH)
     )
     await proc.wait()
     _load_model()

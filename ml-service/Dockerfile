@@ -1,11 +1,18 @@
 FROM python:3.12-slim
 WORKDIR /app
+
 COPY requirements.txt .
-# Install torch CPU-only first (avoids downloading the 2GB CUDA wheel)
+# Install torch CPU wheel first (small ~250MB vs 2GB CUDA wheel), then rest of deps
 RUN pip install --no-cache-dir --timeout 120 \
-    torch --extra-index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir --timeout 120 -r requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+        torch --extra-index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir --timeout 120 \
+        -r requirements.txt \
+        --extra-index-url https://download.pytorch.org/whl/cpu
+
 COPY . .
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
 EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
