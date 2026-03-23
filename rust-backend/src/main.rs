@@ -1,3 +1,4 @@
+pub mod consts;
 mod adsb_parser;
 mod anomaly_client;
 mod clock_sync;
@@ -112,12 +113,12 @@ async fn main() -> anyhow::Result<()> {
     // ---- heatmap cache: last computed result served instantly to new clients
     let heatmap_cache: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    // ---- OpenSky enrichment cache: callsign/squawk/origin_country keyed by ICAO24
+    // ---- live heatmap altitude: shared between main loop and WS server ------
+    let live_heatmap_altitude_m: Arc<RwLock<f64>> = Arc::new(RwLock::new(crate::consts::DEFAULT_HEATMAP_ALTITUDE_M)); // FL300
+
+    // ---- OpenSky enrichment: on-demand per-aircraft, TTL-cached ---------------
     let opensky_cache = opensky_client::new_cache();
-    opensky_client::spawn_opensky_task(
-        Arc::clone(&opensky_cache),
-        (43.0, -6.0, 57.0, 18.0), // Europe bbox: lamin, lomin, lamax, lomax
-    );
+    let opensky_http  = Arc::new(opensky_client::new_client());
 
     // ---- spawn ingestor (connects to Go Unix socket) ----------------------
     let _ingestor_handle = tokio::spawn(ingestor::run_ingestor(frame_tx));
@@ -127,21 +128,26 @@ async fn main() -> anyhow::Result<()> {
     let mut clock_sync = ClockSyncEngine::new();
     let sensor_registry = Arc::new(RwLock::new(SensorRegistry::new()));
 
+    // ---- spawn GDOP heatmap background task -------------------------------
+    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
+    let heatmap_tx_for_ws = heatmap_tx.clone();
+
     // ---- spawn WebSocket server -------------------------------------------
     {
         let ws_tx2 = ws_tx.clone();
         let addr = cli.ws_addr.clone();
         let cache = Arc::clone(&heatmap_cache);
         let registry_clone = Arc::clone(&sensor_registry);
+        let live_alt = Arc::clone(&live_heatmap_altitude_m);
+        let htx = heatmap_tx_for_ws;
+        let osky_cache = Arc::clone(&opensky_cache);
+        let osky_http  = Arc::clone(&opensky_http);
         tokio::spawn(async move {
-            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache, registry_clone).await {
+            if let Err(e) = ws_server::run_ws_server(addr, ws_tx2, cache, registry_clone, live_alt, htx, osky_cache, osky_http).await {
                 tracing::error!("WS server error: {e}");
             }
         });
     }
-
-    // ---- spawn GDOP heatmap background task -------------------------------
-    let heatmap_tx = gdop_heatmap::spawn_heatmap_task(ws_tx.clone(), Arc::clone(&heatmap_cache));
 
     let mut kalman_registry = KalmanRegistry::new();
     let mut spoof_detector = SpoofDetector::new();
@@ -792,8 +798,8 @@ async fn solve_and_broadcast(
     // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
     let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
-        if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        if let Some(cached) = cache.get(&icao24.to_lowercase()) {
+            (cached.info.callsign.clone(), cached.info.squawk.clone(), cached.info.origin_country.clone())
         } else {
             (None, None, None)
         }
@@ -933,8 +939,8 @@ async fn broadcast_adsb(
     // Enrich with callsign/squawk from OpenSky cache (non-blocking read).
     let (callsign, squawk, origin_country) = {
         let cache = opensky_cache.read().await;
-        if let Some(info) = cache.get(&icao24.to_lowercase()) {
-            (info.callsign.clone(), info.squawk.clone(), info.origin_country.clone())
+        if let Some(cached) = cache.get(&icao24.to_lowercase()) {
+            (cached.info.callsign.clone(), cached.info.squawk.clone(), cached.info.origin_country.clone())
         } else {
             (None, None, None)
         }
