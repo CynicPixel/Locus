@@ -13,7 +13,7 @@ static CRC24_TABLE: OnceLock<[u32; 256]> = OnceLock::new();
 
 fn crc24_table() -> &'static [u32; 256] {
     CRC24_TABLE.get_or_init(|| {
-        const POLY: u32 = 0xFFF409;
+        const POLY: u32 = crate::consts::CRC24_POLY;
         let mut table = [0u32; 256];
         for i in 0..256u32 {
             let mut c = i << 16;
@@ -145,7 +145,7 @@ static NL_BREAKS: [f64; 58] = [
 /// Number of longitude zones at the given latitude (ICAO Doc 9684).
 fn nl(lat: f64) -> f64 {
     let lat = lat.abs();
-    if lat >= 87.0 {
+    if lat >= crate::consts::NL_POLAR_LAT {
         return 1.0;
     }
     let breaks_below = NL_BREAKS.partition_point(|&b| b <= lat);
@@ -183,9 +183,9 @@ fn decode_ac13_gillham(ac13: u16) -> Option<f64> {
     if ac13 & 0x0002 != 0 { f ^= 0x001; } // B4
 
     if f & 1 != 0 { h = 6 - h; }
-    let alt_ft = 500 * f + 100 * h - 1300;
+    let alt_ft = crate::consts::GILLHAM_ALT_MULTIPLIER * f + crate::consts::GILLHAM_ALT_RESOLUTION * h - crate::consts::GILLHAM_ALT_OFFSET;
     if alt_ft < -1200 { return None; }
-    Some(alt_ft as f64 * 0.3048)
+    Some(alt_ft as f64 * crate::consts::FEET_TO_METERS)
 }
 
 /// Decode a 12-bit AC altitude field from DF17/18 extended squitter.
@@ -199,11 +199,11 @@ fn decode_altitude_m(raw: u16) -> Option<f64> {
         if !(0..=2047).contains(&n) {
             return None; // invalid Q=1 value
         }
-        let alt_ft = n as f64 * 25.0 - 1000.0;
+        let alt_ft = n as f64 * crate::consts::QBIT_ALT_RESOLUTION - crate::consts::QBIT_ALT_OFFSET;
         if alt_ft < -1000.0 || alt_ft > 60_000.0 {
             return None;
         }
-        Some(alt_ft * 0.304_8)
+        Some(alt_ft * crate::consts::FEET_TO_METERS)
     } else {
         // Q-bit clear: Gillham Gray code.
         // Map 12-bit AC12 → 13-bit AC13 index (insert M=0 at bit 6):
@@ -223,8 +223,7 @@ struct CprDecoder {
     odd: Option<(u32, u32, u64)>,
 }
 
-const MAX_PAIR_AGE_NS: u64 = 10_000_000_000; // 10 s (ICAO Doc 9684 §C.2.6)
-const CPR_BITS: f64 = (1u64 << 17) as f64; // 2^17
+// CPR decoder uses crate::consts::MAX_PAIR_AGE_NS and crate::consts::crate::consts::CPR_BITS
 
 impl CprDecoder {
     fn feed(
@@ -245,7 +244,7 @@ impl CprDecoder {
 
         // Reject stale pairs
         let age_diff = even_ts.abs_diff(odd_ts);
-        if age_diff > MAX_PAIR_AGE_NS {
+        if age_diff > crate::consts::MAX_PAIR_AGE_NS {
             if even_ts < odd_ts {
                 self.even = None;
             } else {
@@ -254,24 +253,24 @@ impl CprDecoder {
             return None;
         }
 
-        let dlat_e = 360.0 / 60.0_f64;
-        let dlat_o = 360.0 / 59.0_f64;
+        let dlat_e = crate::consts::CPR_DLAT_EVEN;
+        let dlat_o = crate::consts::CPR_DLAT_ODD;
 
-        let j = ((59.0 * even_lat as f64 - 60.0 * odd_lat as f64) / CPR_BITS + 0.5).floor();
-        let lat_e = dlat_e * (j % 60.0 + even_lat as f64 / CPR_BITS);
-        let lat_o = dlat_o * (j % 59.0 + odd_lat as f64 / CPR_BITS);
+        let j = ((59.0 * even_lat as f64 - 60.0 * odd_lat as f64) / crate::consts::CPR_BITS + 0.5).floor();
+        let lat_e = dlat_e * (j % 60.0 + even_lat as f64 / crate::consts::CPR_BITS);
+        let lat_o = dlat_o * (j % 59.0 + odd_lat as f64 / crate::consts::CPR_BITS);
 
         // Normalize per ICAO Doc 9684
-        let lat_e = if lat_e >= 270.0 {
+        let lat_e = if lat_e >= crate::consts::LAT_NORM_THRESHOLD {
             lat_e - 360.0
-        } else if lat_e > 90.0 {
+        } else if lat_e > crate::consts::LAT_VALIDITY_THRESHOLD {
             return None; // invalid zone
         } else {
             lat_e
         };
-        let lat_o = if lat_o >= 270.0 {
+        let lat_o = if lat_o >= crate::consts::LAT_NORM_THRESHOLD {
             lat_o - 360.0
-        } else if lat_o > 90.0 {
+        } else if lat_o > crate::consts::LAT_VALIDITY_THRESHOLD {
             return None;
         } else {
             lat_o
@@ -292,10 +291,10 @@ impl CprDecoder {
         let dlon = 360.0 / m;
         let mi = ((even_lon as f64 * (nl(lat_e) - 1.0)
             - odd_lon as f64 * nl(lat_e))
-            / CPR_BITS
+            / crate::consts::CPR_BITS
             + 0.5)
             .floor();
-        let lon = dlon * (mi % m + cpr_lon as f64 / CPR_BITS);
+        let lon = dlon * (mi % m + cpr_lon as f64 / crate::consts::CPR_BITS);
         let lon = if lon >= 180.0 { lon - 360.0 } else { lon };
 
         Some((lat, lon))

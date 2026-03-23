@@ -46,13 +46,13 @@ impl GdopQuality {
     pub fn from_gdop(gdop: f64) -> Self {
         if !gdop.is_finite() {
             Self::Degenerate
-        } else if gdop < 2.0 {
+        } else if gdop < crate::consts::GDOP_EXCELLENT {
             Self::Excellent
-        } else if gdop < 5.0 {
+        } else if gdop < crate::consts::GDOP_GOOD {
             Self::Good
-        } else if gdop < 10.0 {
+        } else if gdop < crate::consts::GDOP_MODERATE {
             Self::Moderate
-        } else if gdop < 20.0 {
+        } else if gdop < crate::consts::GDOP_POOR {
             Self::Poor
         } else {
             Self::Unacceptable
@@ -213,7 +213,7 @@ impl GdopHeatmapEngine {
 
         // Compute unit vectors from point to each sensor
         let ref_dist = (&solution_ecef - &sensors[0]).norm();
-        if ref_dist < 1.0 {
+        if ref_dist < crate::consts::MIN_DISTANCE_M {
             return (f64::INFINITY, None);
         }
         let ref_dir = (&solution_ecef - &sensors[0]) / ref_dist;
@@ -223,7 +223,7 @@ impl GdopHeatmapEngine {
 
         for (k, s_k1) in sensors[1..].iter().enumerate() {
             let d_k1 = (&solution_ecef - s_k1).norm();
-            if d_k1 < 1.0 {
+            if d_k1 < crate::consts::MIN_DISTANCE_M {
                 return (f64::INFINITY, None);
             }
             let dir_k1 = (&solution_ecef - s_k1) / d_k1;
@@ -243,10 +243,10 @@ impl GdopHeatmapEngine {
         let condition_number = max_sv / min_sv.max(f64::EPSILON);
 
         // Degeneracy checks
-        if min_sv < 1e-6 {
+        if min_sv < crate::consts::GDOP_MIN_SINGULAR_VALUE {
             return (f64::INFINITY, Some(condition_number));
         }
-        if condition_number > 1e8 {
+        if condition_number > crate::consts::MAX_CONDITION_NUMBER {
             return (f64::INFINITY, Some(condition_number));
         }
 
@@ -266,10 +266,10 @@ impl GdopHeatmapEngine {
     fn auto_bounds(sensor_ecef: &[Vector3<f64>]) -> GridBounds {
         if sensor_ecef.is_empty() {
             return GridBounds {
-                north: 55.0,
-                south: 45.0,
-                east: 5.0,
-                west: -5.0,
+                north: crate::consts::DEFAULT_BOUNDS_NORTH,
+                south: crate::consts::DEFAULT_BOUNDS_SOUTH,
+                east: crate::consts::DEFAULT_BOUNDS_EAST,
+                west: crate::consts::DEFAULT_BOUNDS_WEST,
             };
         }
 
@@ -289,14 +289,11 @@ impl GdopHeatmapEngine {
         let max_lon = lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
         // Add padding: 300 km ≈ 2.7° latitude, varies by longitude
-        let padding_lat = 2.7;
-        let padding_lon = 3.5; // Approximate for mid-latitudes
-
         GridBounds {
-            north: (max_lat + padding_lat).min(85.0),
-            south: (min_lat - padding_lat).max(-85.0),
-            east: (max_lon + padding_lon).min(180.0),
-            west: (min_lon - padding_lon).max(-180.0),
+            north: (max_lat + crate::consts::PADDING_LAT_DEG).min(crate::consts::MAX_NORTH_BOUND),
+            south: (min_lat - crate::consts::PADDING_LAT_DEG).max(crate::consts::MIN_SOUTH_BOUND),
+            east: (max_lon + crate::consts::PADDING_LON_DEG).min(crate::consts::MAX_EAST_BOUND),
+            west: (min_lon - crate::consts::PADDING_LON_DEG).max(crate::consts::MIN_WEST_BOUND),
         }
     }
 

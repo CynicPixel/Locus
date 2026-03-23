@@ -106,8 +106,8 @@ impl Correlator {
     pub fn new() -> Self {
         Self {
             groups: HashMap::new(),
-            min_sensors: 2, // Changed from 3 to enable semi-MLAT (2-sensor observations)
-            window_ns: 200_000_000, // FIX-19: 200 ms (was 50 ms) — captures late-arriving frames
+            min_sensors: crate::consts::MIN_SENSORS_SEMI_MLAT, // Changed from 3 to enable semi-MLAT (2-sensor observations)
+            window_ns: crate::consts::CORRELATION_WINDOW_NS, // FIX-19: 200 ms (was 50 ms) — captures late-arriving frames
         }
     }
 

@@ -98,7 +98,7 @@ pub struct SemiMlatSolution {
 fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     // 1. Prior uncertainty check (5 km std dev limit)
     let prior_trace = input.kalman_prior.covariance.trace();
-    if prior_trace > 25_000_000.0 {
+    if prior_trace > crate::consts::MAX_PRIOR_TRACE {
         tracing::debug!(
             trace = prior_trace,
             "semi-MLAT rejected: prior too uncertain (>5km std dev)"
@@ -108,7 +108,7 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
 
     // 2. Geometry checks
     let baseline = (&input.sensor_positions[0] - &input.sensor_positions[1]).norm();
-    if baseline < 5_000.0 {
+    if baseline < crate::consts::MIN_SENSOR_BASELINE_M {
         return Err("sensors too close (<5km baseline)");
     }
     if input.observed_tdoa_m.abs() > baseline {
@@ -126,13 +126,12 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     // Approximation: sigma_total ≈ sqrt(sigma_tdoa² + trace(P_prior))
     let sigma_total = (input.tdoa_variance_m2 + prior_trace).sqrt();
 
-    const MAHALANOBIS_GATE: f64 = 15.0; // Match full MLAT Kalman outlier threshold
-    if innovation.abs() > MAHALANOBIS_GATE * sigma_total {
+    if innovation.abs() > crate::consts::INNOVATION_GATE_MAHALANOBIS * sigma_total {
         tracing::debug!(
             innovation,
             sigma_total,
             ratio = innovation.abs() / sigma_total,
-            "semi-MLAT rejected: innovation gate exceeded (>{MAHALANOBIS_GATE}σ)"
+            "semi-MLAT rejected: innovation gate exceeded (>{}σ)", crate::consts::INNOVATION_GATE_MAHALANOBIS
         );
         return Err("innovation exceeds gate (outlier)");
     }
@@ -142,7 +141,7 @@ fn validate_input(input: &SemiMlatInput) -> Result<(), &'static str> {
     let dir_0 = (pred_pos - &input.sensor_positions[0]).normalize();
     let dir_1 = (pred_pos - &input.sensor_positions[1]).normalize();
     let dir_diff = (&dir_0 - &dir_1).norm();
-    if dir_diff < 0.1 {
+    if dir_diff < crate::consts::WEAK_CONSTRAINT_THRESHOLD {
         return Err("weak constraint (sensors nearly collinear with prior)");
     }
 
@@ -211,7 +210,7 @@ impl LeastSquaresProblem<f64, nalgebra::U4, nalgebra::U3> for SemiMlatProblem {
         let dist_0 = (pos - &self.sensors[0]).norm();
         let dist_1 = (pos - &self.sensors[1]).norm();
 
-        if dist_0 < 1.0 || dist_1 < 1.0 {
+        if dist_0 < crate::consts::MIN_DISTANCE_M || dist_1 < crate::consts::MIN_DISTANCE_M {
             return None; // Degenerate (on sensor)
         }
 
@@ -278,7 +277,7 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
 
     // 4. Solve (4 residuals, 3 parameters)
     let (result, report) = LevenbergMarquardt::new()
-        .with_patience(50) // Match full MLAT solver
+        .with_patience(crate::consts::SEMI_MLAT_MAX_ITERATIONS) // Match full MLAT solver
         .minimize(problem);
 
     // 5. Convergence check
@@ -286,7 +285,7 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
         tracing::debug!("semi-MLAT LM failed: {:?}", report.termination);
         return None;
     }
-    if report.number_of_evaluations >= 50 {
+    if report.number_of_evaluations >= crate::consts::SEMI_MLAT_MAX_ITERATIONS {
         tracing::debug!("semi-MLAT LM exceeded max iterations");
         return None;
     }
@@ -342,9 +341,8 @@ pub fn solve_semi_mlat(input: &SemiMlatInput) -> Option<SemiMlatSolution> {
 
     // 7. Quality metrics
     let sdop = covariance.trace().sqrt();
-    const SDOP_THRESHOLD: f64 = 500.0; // 500m quality threshold
-    if sdop > SDOP_THRESHOLD {
-        tracing::debug!(sdop, "semi-MLAT rejected: SDOP exceeds {SDOP_THRESHOLD}m");
+    if sdop > crate::consts::SDOP_THRESHOLD_M {
+        tracing::debug!(sdop, "semi-MLAT rejected: SDOP exceeds {}m", crate::consts::SDOP_THRESHOLD_M);
         return None;
     }
 

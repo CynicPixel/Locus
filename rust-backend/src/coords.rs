@@ -1,9 +1,8 @@
 // ECEF ↔ WGS84 coordinate conversion
 // Used by: mlat_solver, kalman, spoof_detector, clock_sync
 
-/// WGS84 ellipsoid parameters
-const A: f64 = 6_378_137.0;
-const E2: f64 = 6.694_379_990_14e-3;
+/// WGS84 ellipsoid parameters — canonical values in crate::consts.
+use crate::consts::{WGS84_A as A, WGS84_E2 as E2};
 
 /// Convert WGS84 geodetic coordinates to ECEF Cartesian (meters).
 #[inline]
@@ -25,14 +24,14 @@ pub fn ecef_to_wgs84(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     let lon = y.atan2(x);
     let p = (x * x + y * y).sqrt();
     let mut lat = z.atan2(p * (1.0 - E2));
-    for _ in 0..10 {
+    for _ in 0..crate::consts::BOWRING_ITERATIONS {
         let (slat, _clat) = (lat.sin(), lat.cos());
         let n = A / (1.0 - E2 * slat * slat).sqrt();
         lat = (z + E2 * n * lat.sin()).atan2(p);
     }
     let slat = lat.sin();
     let n = A / (1.0 - E2 * slat * slat).sqrt();
-    let alt = if lat.cos().abs() > 1e-10 {
+    let alt = if lat.cos().abs() > crate::consts::LAT_COS_THRESHOLD {
         p / lat.cos() - n
     } else {
         z / slat - n * (1.0 - E2)

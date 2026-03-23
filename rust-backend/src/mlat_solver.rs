@@ -127,7 +127,7 @@ fn compute_geometry_result(sensor_ecef: &[Vector3<f64>]) -> GeometryResult {
     let min_sv = sv[sv.len() - 1];
     let condition = sv[0] / min_sv.max(f64::EPSILON);
 
-    let proxy = centroid.normalize() * (6_371_000.0 + 10_000.0);
+    let proxy = centroid.normalize() * crate::consts::EARTH_RADIUS_CRUISE_ALT_M;
     let centroid_gdop = compute_gdop(&proxy, sensor_ecef);
 
     GeometryResult {
@@ -148,16 +148,16 @@ pub fn check_geometry(
     cache: &mut GeometryCache,
 ) -> Result<(), &'static str> {
     let r = cache.get_or_compute(sensor_ids, sensor_ecef);
-    if r.max_dist_m < 5_000.0 {
+    if r.max_dist_m < crate::consts::MIN_SENSOR_BASELINE_M {
         return Err("sensors too clustered — baseline below 5 km");
     }
-    if r.min_sv < 1e-3 {
+    if r.min_sv < crate::consts::MIN_SINGULAR_VALUE {
         return Err("sensors coplanar/collinear — rank deficient");
     }
-    if r.condition_num > 1e8 {
+    if r.condition_num > crate::consts::MAX_CONDITION_NUMBER {
         return Err("sensor geometry extremely ill-conditioned");
     }
-    if r.centroid_gdop > 20.0 {
+    if r.centroid_gdop > crate::consts::PRESOLVER_GDOP_THRESHOLD {
         return Err("pre-solve GDOP exceeds coarse threshold (20)");
     }
     Ok(())
@@ -172,7 +172,7 @@ pub fn compute_gdop(solution_ecef: &Vector3<f64>, sensors: &[Vector3<f64>]) -> f
         return f64::INFINITY;
     }
     let ref_dist = (solution_ecef - &sensors[0]).norm();
-    if ref_dist < 1.0 {
+    if ref_dist < crate::consts::MIN_DISTANCE_M {
         return f64::INFINITY;
     }
     let ref_dir = (solution_ecef - &sensors[0]) / ref_dist;
@@ -181,7 +181,7 @@ pub fn compute_gdop(solution_ecef: &Vector3<f64>, sensors: &[Vector3<f64>]) -> f
     let mut h = DMatrix::<f64>::zeros(n_tdoa, 3);
     for (k, s_k1) in sensors[1..].iter().enumerate() {
         let d_k1 = (solution_ecef - s_k1).norm();
-        if d_k1 < 1.0 {
+        if d_k1 < crate::consts::MIN_DISTANCE_M {
             return f64::INFINITY;
         }
         let dir_k1 = (solution_ecef - s_k1) / d_k1;
@@ -265,13 +265,13 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U4> for MlatProblem {
 
         // Reference sensor residual: r[0] = (offset - dist_0) / sigma_0
         let dist_0 = (&pos - &self.sensor_ecef[0]).norm();
-        let sigma_0 = self.sigmas_m[0].max(1.0);
+        let sigma_0 = self.sigmas_m[0].max(crate::consts::MIN_SIGMA_M);
         r.push((offset - dist_0) / sigma_0);
 
         // Other sensors: r[k] = (obs_tdoa_m[k-1] - dist_k + offset) / sigma_k
         for k in 1..n_sensors {
             let dist_k = (&pos - &self.sensor_ecef[k]).norm();
-            let sigma_k = self.sigmas_m[k].max(1.0);
+            let sigma_k = self.sigmas_m[k].max(crate::consts::MIN_SIGMA_M);
             r.push((self.observed_tdoa_m[k - 1] - dist_k + offset) / sigma_k);
         }
 
@@ -296,9 +296,9 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U4> for MlatProblem {
 
         // Row 0: reference sensor.
         let dist_0 = (&pos - &self.sensor_ecef[0]).norm();
-        if dist_0 < 1.0 { return None; }
+        if dist_0 < crate::consts::MIN_DISTANCE_M { return None; }
         let dir_0 = (&pos - &self.sensor_ecef[0]) / dist_0;
-        let sigma_0 = self.sigmas_m[0].max(1.0);
+        let sigma_0 = self.sigmas_m[0].max(crate::consts::MIN_SIGMA_M);
         for i in 0..3 {
             j[(0, i)] = -dir_0[i] / sigma_0;  // ∂(offset - dist_0)/∂x_i = -dir_0[i]
         }
@@ -307,9 +307,9 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U4> for MlatProblem {
         // Rows 1..n_sensors-1: other sensors.
         for k in 1..n_sensors {
             let dist_k = (&pos - &self.sensor_ecef[k]).norm();
-            if dist_k < 1.0 { return None; }
+            if dist_k < crate::consts::MIN_DISTANCE_M { return None; }
             let dir_k = (&pos - &self.sensor_ecef[k]) / dist_k;
-            let sigma_k = self.sigmas_m[k].max(1.0);
+            let sigma_k = self.sigmas_m[k].max(crate::consts::MIN_SIGMA_M);
             for i in 0..3 {
                 j[(k, i)] = -dir_k[i] / sigma_k;  // ∂(obs - dist_k + offset)/∂x_i = -dir_k[i]
             }
@@ -337,8 +337,6 @@ impl LeastSquaresProblem<f64, nalgebra::Dyn, nalgebra::U4> for MlatProblem {
 // Public solve function
 // ---------------------------------------------------------------------------
 
-const MAX_RANGE_M: f64 = 500_000.0; // 500 km — reject implausible solutions (FIX-15)
-
 /// Solve MLAT for the given sensor/TDOA inputs.
 ///
 /// Returns `None` if geometry is degenerate, solver fails to converge,
@@ -363,8 +361,8 @@ pub fn solve(
     // Altitude degradation: error = 250ft + 70ft/s * age (FIX-16 variant).
     // If no altitude or too stale (> ~12 s → > 926 m error), skip constraint.
     let alt_data: Option<(f64, f64)> = input.adsb_alt_m.and_then(|alt| {
-        let err_m = 76.2 + input.alt_age_seconds * 21.3; // 250ft base + 70ft/s degradation
-        if err_m > 926.0 { None } else { Some((alt, err_m)) }
+        let err_m = crate::consts::ALT_ERROR_BASE_M + input.alt_age_seconds * crate::consts::ALT_DEGRADATION_RATE; // 250ft base + 70ft/s degradation
+        if err_m > crate::consts::ALT_CONSTRAINT_MAX_ERROR_M { None } else { Some((alt, err_m)) }
     });
     let alt_weight = alt_data.map(|(_, err)| 1.0 / err).unwrap_or(0.0);
     let alt_target_m = alt_data.map(|(a, _)| a);
@@ -373,13 +371,13 @@ pub fn solve(
     // tdoa_variance_m2 length must match n_sensors; fall back to 300 m if missing.
     let sigmas_m: Vec<f64> = (0..n_sensors)
         .map(|k| {
-            let var = input.tdoa_variance_m2.get(k).copied().unwrap_or(90_000.0);
+            let var = input.tdoa_variance_m2.get(k).copied().unwrap_or(crate::consts::DEFAULT_VARIANCE_M2);
             var.sqrt().max(1.0)
         })
         .collect();
 
     // Initial guess: Kalman prior if available; else centroid at ADS-B / cruise altitude.
-    let cruise_alt = input.adsb_alt_m.unwrap_or(10_000.0);
+    let cruise_alt = input.adsb_alt_m.unwrap_or(crate::consts::DEFAULT_CRUISE_ALT_M);
     let initial_pos = match prior_ecef {
         Some(ecef) => ecef,
         None => {
@@ -387,7 +385,7 @@ pub fn solve(
             let centroid = input.sensor_positions.iter().fold(Vector3::zeros(), |a, v| a + v) / n;
             let norm = centroid.norm();
             if norm < 1.0 { return None; }
-            centroid * ((6_371_000.0 + cruise_alt) / norm)
+            centroid * ((crate::consts::EARTH_RADIUS_M + cruise_alt) / norm)
         }
     };
 
@@ -405,7 +403,7 @@ pub fn solve(
     };
 
     let (result_problem, report) = LevenbergMarquardt::new()
-        .with_patience(50)  // FIX-17: match mlat-server SOLVER_MAXFEV = 50
+        .with_patience(crate::consts::SOLVER_PATIENCE)  // FIX-17: match mlat-server SOLVER_MAXFEV = 50
         .minimize(problem);
 
     if !report.termination.was_successful() {
@@ -418,7 +416,7 @@ pub fn solve(
 
     // Post-solve range validation (FIX-15): reject implausibly distant solutions.
     for sensor in &input.sensor_positions {
-        if (&best_ecef - sensor).norm() > MAX_RANGE_M {
+        if (&best_ecef - sensor).norm() > crate::consts::MAX_RANGE_M {
             tracing::debug!("MLAT solution discarded — out of range");
             return None;
         }
@@ -435,13 +433,13 @@ pub fn solve(
             m[(3,0)], m[(3,1)], m[(3,2)], m[(3,3)],
         )
     };
-    let jtj4_inv = jtj4.try_inverse().unwrap_or(Matrix4::identity() * 1e12);
+    let jtj4_inv = jtj4.try_inverse().unwrap_or(Matrix4::identity() * crate::consts::LARGE_COVARIANCE);
 
     // Position covariance = top-left 3×3 block of (J^T J)^{-1} scaled by sigma².
     let n_tdoa = input.observed_tdoa_m.len();
     let rss = result_problem.residuals()?.norm_squared();
     let n_obs = n_tdoa as f64;
-    let sigma2 = if n_obs > 3.0 { rss / (n_obs - 3.0) } else { rss };
+    let sigma2 = if n_obs > crate::consts::DOF_CORRECTION { rss / (n_obs - crate::consts::DOF_CORRECTION) } else { rss };
 
     let jtj_inv = Matrix3::new(
         jtj4_inv[(0,0)], jtj4_inv[(0,1)], jtj4_inv[(0,2)],
@@ -450,7 +448,7 @@ pub fn solve(
     );
 
     // Post-solve covariance magnitude check (FIX-15): trace > 100e6 → ~10 km uncertainty.
-    if !jtj4_inv[(0,0)].is_finite() || jtj_inv.trace() > 100e6 {
+    if !jtj4_inv[(0,0)].is_finite() || jtj_inv.trace() > crate::consts::MAX_COVARIANCE_TRACE {
         tracing::debug!("MLAT solution discarded — covariance too large");
         return None;
     }

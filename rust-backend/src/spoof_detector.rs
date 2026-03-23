@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::coords::wgs84_to_ecef;
 
-const SPOOF_THRESHOLD_M: f64 = 2_000.0; // 2 km hard floor
+// Spoof threshold is defined in crate::consts::SPOOF_THRESHOLD_M
 
 pub struct SpoofDetector {
     /// Cached ADS-B claimed position in both WGS84 and ECEF.
@@ -51,7 +51,7 @@ impl SpoofDetector {
                     ((mx - cx).powi(2) + (my - cy).powi(2) + (mz - cz).powi(2)).sqrt();
 
                 // GDOP-adaptive threshold: only flag when divergence exceeds MLAT uncertainty
-                let threshold = SPOOF_THRESHOLD_M.max(3.0 * accuracy_m);
+                let threshold = crate::consts::SPOOF_THRESHOLD_M.max(3.0 * accuracy_m);
                 let flag = divergence_m > threshold;
 
                 if flag {
