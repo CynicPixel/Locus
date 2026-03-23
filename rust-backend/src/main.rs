@@ -772,7 +772,9 @@ async fn solve_and_broadcast(
     if !solution.altitude_valid {
         let fallback_altitude = kalman_registry
             .get_last_valid_altitude(&icao24)
-            .or(adsb_parsed.as_ref().map(|a| a.alt_m))
+            .or(adsb_parsed.as_ref().and_then(|a| {
+                if a.alt_m >= -500.0 && a.alt_m <= 15_000.0 { Some(a.alt_m) } else { None }
+            }))
             .unwrap_or(5000.0); // FL164 - conservative cruise altitude
 
         tracing::info!(
@@ -930,18 +932,32 @@ async fn broadcast_adsb(
 ) {
     let icao24 = &adsb.icao24;
 
+    // Validate ADS-B altitude range. Barometric alt can be negative (Dead Sea ~-430m)
+    // but values outside [-500, 15000] indicate a bad decode — fall back to last known.
+    let adsb_alt_valid = adsb.alt_m >= -500.0 && adsb.alt_m <= 15_000.0;
+    let alt_to_use = if adsb_alt_valid {
+        adsb.alt_m
+    } else {
+        tracing::warn!(
+            icao24,
+            adsb_alt_m = adsb.alt_m,
+            "ADS-B altitude out of range, using fallback"
+        );
+        kalman_registry.get_last_valid_altitude(icao24).unwrap_or(5000.0)
+    };
+
     // Build a synthetic MlatSolution so we can reuse the Kalman registry.
     let solution = mlat_solver::MlatSolution {
         lat: adsb.lat,
         lon: adsb.lon,
-        alt_m: adsb.alt_m,
+        alt_m: alt_to_use,
         ecef: {
-            let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
+            let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, alt_to_use);
             nalgebra::Vector3::new(x, y, z)
         },
 
         gdop: 0.0,            // 0.0 signals ADS-B source (not MLAT)
-        altitude_valid: true, // ADS-B altitude is always considered valid
+        altitude_valid: adsb_alt_valid,
         vdop: 0.0,            // N/A for ADS-B
         accuracy_m: crate::consts::ADSB_HORIZONTAL_ACCURACY_M, // ADS-B typical horizontal accuracy (~500 m NUC=5)
         dof: 0,                                                // not applicable for ADS-B
@@ -996,7 +1012,7 @@ async fn broadcast_adsb(
         vel_alt,
         gdop: 0.0,
         vdop: 0.0,
-        altitude_valid: true, // ADS-B altitude considered valid
+        altitude_valid: adsb_alt_valid,
         confidence_ellipse_m: 500.0,
         spoof_flag,
         divergence_m,

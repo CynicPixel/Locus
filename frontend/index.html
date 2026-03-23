@@ -1250,6 +1250,16 @@
         state.anomaly_confidence = prev.state.anomaly_confidence;
       }
 
+      // Carry forward last valid altitude when backend flags altitude as invalid
+      if (!state.altitude_valid && prev != null) {
+        const lastAlt = prev.last_valid_alt_m ?? prev.state.alt_m;
+        if (lastAlt != null) {
+          state.alt_m = lastAlt;
+          state._alt_estimated = true;
+        }
+      }
+      if (state.altitude_valid) state._alt_estimated = false;
+
       const {icao24, lat, lon, anomaly_label, spoof_flag} = state;
       if (lat == null || lon == null) return;
       if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
@@ -1288,6 +1298,7 @@
           state,
           lastSeen: Date.now(),
           idle: false,
+          last_valid_alt_m: state.altitude_valid ? state.alt_m : null,
         };
         if (visible) {
           marker.addTo(map);
@@ -1309,6 +1320,7 @@
         setAircraftMapVisibility(icao24, visible);
         ac.lastSeen = Date.now();
         ac.state = state;
+        if (state.altitude_valid) ac.last_valid_alt_m = state.alt_m;
         // Update hover tooltip with callsign when enrichment arrives.
         const newLabel = state.callsign
           ? `${state.callsign} (${icao24.toUpperCase()})`
@@ -1427,7 +1439,7 @@
 
         row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
-      <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
+      <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m${s._alt_estimated ? '~' : ''}</span>
       ${badge}${spoofBadge}${semiMlatBadge}${gdopBadge}${idleBadge}`;
         list.appendChild(row);
       }
@@ -2090,7 +2102,7 @@
       if (s.squawk) identityRows.push(["Squawk", s.squawk]);
       if (s.origin_country) identityRows.push(["Country", s.origin_country]);
       identityRows.push(
-        ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
+        ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft${s._alt_estimated ? ' (est)' : ''}`],
         ["Speed", `${speedKts.toFixed(0)} kts`],
         ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
       );

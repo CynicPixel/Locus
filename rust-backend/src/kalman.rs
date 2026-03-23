@@ -120,34 +120,7 @@ impl AircraftKalman {
         }
 
         // Clamp position to physically plausible altitudes
-        let (lat, lon, alt_m) = ecef_to_wgs84(self.x[0], self.x[1], self.x[2]);
-        if alt_m < ALTITUDE_FLOOR_M {
-            tracing::warn!(
-                icao24 = %self.icao24,
-                alt_m,
-                "Kalman prediction below altitude floor, clamping to {ALTITUDE_FLOOR_M}m"
-            );
-            // Reproject to ECEF with clamped altitude
-            let (x_new, y_new, z_new) = wgs84_to_ecef(lat, lon, ALTITUDE_FLOOR_M);
-            self.x[0] = x_new;
-            self.x[1] = y_new;
-            self.x[2] = z_new;
-
-            // Inflate vertical uncertainty to signal low confidence
-            self.p[(2, 2)] = (500.0_f64).powi(2); // 500m std dev in Z
-        }
-        if alt_m > ALTITUDE_CEILING_M {
-            tracing::warn!(
-                icao24 = %self.icao24,
-                alt_m,
-                "Kalman prediction above altitude ceiling, clamping to {ALTITUDE_CEILING_M}m"
-            );
-            let (x_new, y_new, z_new) = wgs84_to_ecef(lat, lon, ALTITUDE_CEILING_M);
-            self.x[0] = x_new;
-            self.x[1] = y_new;
-            self.x[2] = z_new;
-            self.p[(2, 2)] = (500.0_f64).powi(2);
-        }
+        self.clamp_altitude_state();
     }
 
     /// Update step with MLAT-derived ECEF position.
@@ -190,6 +163,7 @@ impl AircraftKalman {
                         crate::consts::RESET_VEL_VARIANCE_M2,
                     ));
                     self.outlier_count = 0;
+                    self.clamp_altitude_state();
                 }
                 return;
             }
@@ -249,10 +223,38 @@ impl AircraftKalman {
             self.x[5] = self.x[5].signum() * VERTICAL_VELOCITY_MAX_MPS;
         }
 
+        // Clamp altitude after blend — update() can pull state outside [-500, 15000] range
+        self.clamp_altitude_state();
+
         // Track last valid altitude for fallback when MLAT altitude is invalid
         let (_, _, current_alt) = self.position_wgs84();
         if current_alt >= ALTITUDE_FLOOR_M && current_alt <= ALTITUDE_CEILING_M {
             self.last_valid_altitude_m = Some(current_alt);
+        }
+    }
+
+    /// Clamp ECEF state to physically plausible WGS84 altitude range.
+    /// Called after both predict and update steps.
+    fn clamp_altitude_state(&mut self) {
+        let (lat, lon, alt_m) = ecef_to_wgs84(self.x[0], self.x[1], self.x[2]);
+        if alt_m < ALTITUDE_FLOOR_M {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                alt_m,
+                "Kalman altitude below floor, clamping to {ALTITUDE_FLOOR_M}m"
+            );
+            let (x, y, z) = wgs84_to_ecef(lat, lon, ALTITUDE_FLOOR_M);
+            self.x[0] = x; self.x[1] = y; self.x[2] = z;
+            self.p[(2, 2)] = (500.0_f64).powi(2);
+        } else if alt_m > ALTITUDE_CEILING_M {
+            tracing::warn!(
+                icao24 = %self.icao24,
+                alt_m,
+                "Kalman altitude above ceiling, clamping to {ALTITUDE_CEILING_M}m"
+            );
+            let (x, y, z) = wgs84_to_ecef(lat, lon, ALTITUDE_CEILING_M);
+            self.x[0] = x; self.x[1] = y; self.x[2] = z;
+            self.p[(2, 2)] = (500.0_f64).powi(2);
         }
     }
 
