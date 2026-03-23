@@ -57,6 +57,8 @@ pub struct AircraftKalman {
     pub last_update_ns: u64,
     /// Consecutive Mahalanobis outlier count; filter reset after 3 (FIX-8).
     outlier_count: u32,
+    /// Last valid altitude (for fallback when MLAT produces invalid altitude).
+    pub last_valid_altitude_m: Option<f64>,
 }
 
 impl AircraftKalman {
@@ -76,6 +78,7 @@ impl AircraftKalman {
             p,
             last_update_ns: 0,
             outlier_count: 0,
+            last_valid_altitude_m: None,
         }
     }
 
@@ -217,6 +220,12 @@ impl AircraftKalman {
                 "Vertical velocity exceeds physical limit, clamping to ±{VERTICAL_VELOCITY_MAX_MPS} m/s"
             );
             self.x[5] = self.x[5].signum() * VERTICAL_VELOCITY_MAX_MPS;
+        }
+
+        // Track last valid altitude for fallback when MLAT altitude is invalid
+        let (_, _, current_alt) = self.position_wgs84();
+        if current_alt >= ALTITUDE_FLOOR_M && current_alt <= ALTITUDE_CEILING_M {
+            self.last_valid_altitude_m = Some(current_alt);
         }
     }
 
@@ -397,5 +406,10 @@ impl KalmanRegistry {
             sdop = solution.sdop,
             "Kalman updated from semi-MLAT"
         );
+    }
+
+    /// Get last valid altitude for fallback when MLAT altitude is invalid.
+    pub fn get_last_valid_altitude(&self, icao24: &str) -> Option<f64> {
+        self.filters.get(icao24).and_then(|k| k.last_valid_altitude_m)
     }
 }

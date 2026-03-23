@@ -491,6 +491,8 @@ async fn solve_semi_mlat_and_broadcast(
         vel_lon,
         vel_alt,
         gdop: 0.0, // N/A for semi-MLAT
+        vdop: 0.0, // N/A for semi-MLAT
+        altitude_valid: true, // semi-MLAT uses Kalman prior, assumed valid
         confidence_ellipse_m: solution.accuracy_m,
         spoof_flag: false, // Don't run spoof detector on semi-MLAT (lower accuracy)
         divergence_m: 0.0, // N/A
@@ -717,7 +719,7 @@ async fn solve_and_broadcast(
         .get_ecef(&icao24)
         .or(sensor_registry.initial_guess_ecef);
 
-    let solution = match mlat_solver::solve(&input, prior_ecef, geo_cache, &sensor_ids) {
+    let mut solution = match mlat_solver::solve(&input, prior_ecef, geo_cache, &sensor_ids) {
         Some(s) => s,
         None => return,
     };
@@ -728,12 +730,37 @@ async fn solve_and_broadcast(
     tracing::debug!(
         icao24,
         gdop = solution.gdop,
+        vdop = solution.vdop,
+        altitude_valid = solution.altitude_valid,
         dof = solution.dof,
         lat = solution.lat,
         lon = solution.lon,
         alt_m = solution.alt_m,
         "MLAT solution"
     );
+
+    // Altitude fallback: If MLAT altitude is invalid (negative or too high),
+    // use last valid altitude from Kalman > ADS-B > conservative default
+    if !solution.altitude_valid {
+        let fallback_altitude = kalman_registry
+            .get_last_valid_altitude(&icao24)
+            .or(adsb_parsed.as_ref().map(|a| a.alt_m))
+            .unwrap_or(5000.0); // FL164 - conservative cruise altitude
+
+        tracing::info!(
+            icao24,
+            mlat_alt_m = solution.alt_m,
+            fallback_alt_m = fallback_altitude,
+            gdop = solution.gdop,
+            vdop = solution.vdop,
+            "Using fallback altitude - MLAT altitude invalid"
+        );
+
+        // Update solution with fallback altitude
+        let (x, y, z) = coords::wgs84_to_ecef(solution.lat, solution.lon, fallback_altitude);
+        solution.alt_m = fallback_altitude;
+        solution.ecef = nalgebra::Vector3::new(x, y, z);
+    }
 
     // 7. Kalman update
     kalman_registry.update(&icao24, &solution, now_ns);
@@ -781,6 +808,8 @@ async fn solve_and_broadcast(
         vel_lon,
         vel_alt,
         gdop: solution.gdop,
+        vdop: solution.vdop,
+        altitude_valid: solution.altitude_valid,
         confidence_ellipse_m: solution.accuracy_m,
         spoof_flag,
         divergence_m,
@@ -875,9 +904,11 @@ async fn broadcast_adsb(
             let (x, y, z) = coords::wgs84_to_ecef(adsb.lat, adsb.lon, adsb.alt_m);
             nalgebra::Vector3::new(x, y, z)
         },
-        gdop: 0.0,         // 0.0 signals ADS-B source (not MLAT)
-        accuracy_m: 500.0, // ADS-B typical horizontal accuracy (~500 m NUC=5)
-        dof: 0,            // not applicable for ADS-B
+        gdop: 0.0,           // 0.0 signals ADS-B source (not MLAT)
+        vdop: 0.0,           // N/A for ADS-B
+        altitude_valid: true, // ADS-B altitude is always considered valid
+        accuracy_m: 500.0,    // ADS-B typical horizontal accuracy (~500 m NUC=5)
+        dof: 0,              // not applicable for ADS-B
         covariance: nalgebra::Matrix3::identity() * (500.0_f64 * 500.0),
     };
 
@@ -918,6 +949,8 @@ async fn broadcast_adsb(
         vel_lon,
         vel_alt,
         gdop: 0.0,
+        vdop: 0.0,
+        altitude_valid: true, // ADS-B altitude considered valid
         confidence_ellipse_m: 500.0,
         spoof_flag,
         divergence_m,

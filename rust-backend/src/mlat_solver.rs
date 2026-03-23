@@ -52,6 +52,10 @@ pub struct MlatSolution {
     /// Native ECEF output — no round-trip needed for Kalman / spoof detector.
     pub ecef: Vector3<f64>,
     pub gdop: f64,
+    /// Vertical DOP — quality indicator for altitude estimate.
+    pub vdop: f64,
+    /// True if altitude is within valid range (-500m to 15,000m).
+    pub altitude_valid: bool,
     /// 2-sigma semi-major axis of the horizontal confidence ellipse (meters).
     pub accuracy_m: f64,
     /// Degrees of freedom: n_receivers + (1 if altitude constrained) - 4.
@@ -453,22 +457,6 @@ pub fn solve(
 
     let (lat_tmp, lon_tmp, alt_tmp) = ecef_to_wgs84(best_param[0], best_param[1], best_param[2]);
 
-    // Validate altitude is physically plausible for aircraft
-    if alt_tmp < ALTITUDE_FLOOR_M {
-        tracing::warn!(
-            alt_m = alt_tmp,
-            "MLAT solution below altitude floor ({ALTITUDE_FLOOR_M}m), rejecting"
-        );
-        return None;
-    }
-    if alt_tmp > ALTITUDE_CEILING_M {
-        tracing::warn!(
-            alt_m = alt_tmp,
-            "MLAT solution above altitude ceiling ({ALTITUDE_CEILING_M}m), rejecting"
-        );
-        return None;
-    }
-
     // GDOP: 2D horizontal when altitude constrained, 3D otherwise.
     let gdop = if alt_target_m.is_some() {
         let lat = lat_tmp.to_radians();
@@ -491,23 +479,31 @@ pub fn solve(
         return None;
     }
 
-    // VDOP check when altitude constraint is weak (FIX: vertical geometry validation)
-    // When constraint weight is low, unconstrained vertical geometry can be poor
-    // even if GDOP appears acceptable. Check VDOP explicitly to prevent
-    // underground solutions from coplanar sensor configurations.
-    if alt_weight < 1e-3 {
-        // VDOP ≈ sqrt(covariance[2,2]) for ECEF Z axis
-        // Threshold 5.0 from GNSS standards - VDOP > 5 indicates poor vertical geometry
-        let vdop = jtj_inv[(2, 2)].sqrt();
-        if vdop > 5.0 {
-            tracing::debug!(
-                gdop,
-                vdop,
-                constraint_weight = alt_weight,
-                "VDOP exceeds threshold with weak altitude constraint, rejecting"
-            );
-            return None;
-        }
+    // Always compute VDOP as quality indicator for vertical geometry
+    // VDOP ≈ sqrt(covariance[2,2]) for ECEF Z axis
+    let vdop = jtj_inv[(2, 2)].sqrt();
+
+    // Flag altitude validity but don't reject (with only 9 sensors, need every fix)
+    let altitude_valid = alt_tmp >= ALTITUDE_FLOOR_M && alt_tmp <= ALTITUDE_CEILING_M;
+
+    if !altitude_valid {
+        tracing::warn!(
+            alt_m = alt_tmp,
+            gdop,
+            vdop,
+            constraint_weight = alt_weight,
+            "MLAT altitude outside valid range - flagged for fallback"
+        );
+    }
+
+    // Log warning for poor vertical geometry (but don't reject)
+    if vdop > 10.0 {
+        tracing::warn!(
+            gdop,
+            vdop,
+            constraint_weight = alt_weight,
+            "Poor vertical geometry - altitude uncertainty high (VDOP > 10)"
+        );
     }
 
     let covariance = jtj_inv * sigma2;
@@ -522,6 +518,8 @@ pub fn solve(
         alt_m: alt_tmp,
         ecef: best_ecef,
         gdop,
+        vdop,
+        altitude_valid,
         accuracy_m,
         dof,
         covariance,
