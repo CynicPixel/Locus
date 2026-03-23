@@ -362,8 +362,21 @@
     }
     #sensor-toggle.active .ctrl-indicator { background: #22c55e; box-shadow: 0 0 5px #22c55e88; border-color: #22c55e; }
     #sensor-toggle.active .ctrl-label    { color: #22c55e; }
-    #mode-toggle .ctrl-indicator          { background: #7c3aed; box-shadow: 0 0 5px #7c3aed88; border-color: #7c3aed; }
-    #mode-toggle .ctrl-label              { color: #a78bfa; }
+    /* ─── Mode selector ─────────────────────────────────────────────────────── */
+    .ctrl-mode-group { border-bottom: 1px solid #21262d; padding: 6px 5px 7px; }
+    .ctrl-mode-header { font-size:.50rem; letter-spacing:.14em; font-weight:700;
+      text-transform:uppercase; color:#6e7681; font-family:'Courier New',monospace;
+      text-align:center; margin-bottom:5px; }
+    .ctrl-mode-btns { display:flex; flex-direction:column; gap:3px; }
+    .ctrl-mode-btn { width:100%; padding:4px 0; background:#1c2128;
+      border:1px solid #30363d; border-radius:2px; font-size:.52rem;
+      letter-spacing:.10em; font-weight:700; text-transform:uppercase;
+      font-family:'Courier New',monospace; color:#6e7681; cursor:pointer;
+      transition:background .12s,color .12s,border-color .12s; }
+    .ctrl-mode-btn:hover { background:rgba(255,255,255,.05); color:#c9d1d9; }
+    #mode-btn-mlat.active  { background:#1a1040; border-color:#7c3aed; color:#a78bfa; }
+    #mode-btn-smlat.active { background:#0a2025; border-color:#14b8a6; color:#2dd4bf; }
+    #mode-btn-adsb.active  { background:#0f1f12; border-color:#22c55e; color:#4ade80; }
     #gdop-toggle.active .ctrl-indicator  { background: #a78bfa; box-shadow: 0 0 5px #a78bfa88; border-color: #a78bfa; }
     #gdop-toggle.active .ctrl-label      { color: #a78bfa; }
     #planning-toggle.active .ctrl-indicator { background: #f59e0b; box-shadow: 0 0 6px #f59e0b99; border-color: #d97706; }
@@ -632,10 +645,20 @@
           <span class="ctrl-indicator"></span>
           <span class="ctrl-label">SENSORS</span>
         </button>
-        <button id="mode-toggle" class="ctrl-btn" onclick="toggleDisplayMode()">
-          <span class="ctrl-indicator"></span>
-          <span class="ctrl-label" id="ctrl-mode-label">MLAT</span>
-        </button>
+        <div id="mode-selector" class="ctrl-mode-group">
+          <div class="ctrl-mode-header">SOURCE</div>
+          <div class="ctrl-mode-btns">
+            <button id="mode-btn-mlat"  class="ctrl-mode-btn active"
+                    onclick="setDisplayMode('mlat')"
+                    title="Full MLAT — 3+ sensor triangulation">MLAT</button>
+            <button id="mode-btn-smlat" class="ctrl-mode-btn"
+                    onclick="setDisplayMode('smlat')"
+                    title="S-MLAT — 2-sensor Kalman-fused estimate">S-MLAT</button>
+            <button id="mode-btn-adsb"  class="ctrl-mode-btn"
+                    onclick="setDisplayMode('adsb')"
+                    title="ADS-B — raw transponder broadcast">ADS-B</button>
+          </div>
+        </div>
         <button id="gdop-toggle" class="ctrl-btn" onclick="toggleGdopHeatmap()">
           <span class="ctrl-indicator"></span>
           <span class="ctrl-label">GDOP</span>
@@ -962,7 +985,7 @@
     let attributionLines = []; // active L.polyline[] for sensor highlight
 
     // ─── Display mode ─────────────────────────────────────────────────────────────
-    let displayMode = "mlat"; // "mlat" | "adsb"
+    let displayMode = "mlat"; // "mlat" | "smlat" | "adsb"
 
     // ─── Virtual Sensor / Planning Mode ──────────────────────────────────────────
     let planningMode = false;
@@ -1004,10 +1027,15 @@
     }
 
     // Whether to show this aircraft in the current mode
+    // For new aircraft only (no typedStates yet) — uses the single arriving state
     function aircraftVisible(state) {
-      if (displayMode === "mlat")
-        return state.gdop > 0 || state.observation_mode === "semi_mlat";
-      return state.gdop === 0 && state.observation_mode !== "semi_mlat";
+      switch (displayMode) {
+        case "mlat":  return state.observation_mode === "full_mlat";
+        case "smlat": return state.observation_mode === "semi_mlat";
+        case "adsb":  return state.observation_mode === "adsb" ||
+                             (state.gdop === 0 && state.observation_mode !== "semi_mlat");
+        default:      return false;
+      }
     }
 
     // Add or remove an aircraft's marker + ellipse from the map without deleting state
@@ -1162,6 +1190,7 @@
         anomaly_label: state.anomaly_label,
         anomaly_confidence: state.anomaly_confidence,
         spoof_flag: state.spoof_flag,
+        observation_mode: state.observation_mode,
         ts: Date.now(),
       };
 
@@ -1186,8 +1215,18 @@
       const ac = aircraft[icao24];
       if (!ac || !ac.trail || ac.trail.length < 2) return;
 
-      const trail = ac.trail;
+      // Filter to only points matching the current display mode
+      let trail = ac.trail;
+      if (displayMode === "smlat") {
+        trail = ac.trail.filter(p => p.observation_mode === "semi_mlat");
+      } else if (displayMode === "mlat") {
+        trail = ac.trail.filter(p => p.observation_mode === "full_mlat");
+      } else if (displayMode === "adsb") {
+        trail = ac.trail.filter(p => p.observation_mode === "adsb");
+      }
+
       const total = trail.length;
+      if (total < 2) return;
 
       for (let i = 0; i < total - 1; i++) {
         const p0 = trail[i],
@@ -1201,6 +1240,10 @@
           (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)
         ) {
           color = "#ef4444";
+        } else if (p1.observation_mode === "semi_mlat") {
+          // SMLAT trail — teal, compact dash (matches ellipse color)
+          color = "#14b8a6";
+          dashArray = "3 3";
         } else if (p1.gdop > 0) {
           // MLAT trail — color by GDOP tier
           const tier = gdopTier(p1.gdop);
@@ -1241,6 +1284,21 @@
       return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
     }
 
+    // Returns the typed state for the current display mode (null if none received yet)
+    function getActiveState(ac) {
+      switch (displayMode) {
+        case "mlat":  return ac.typedStates?.full_mlat  ?? null;
+        case "smlat": return ac.typedStates?.semi_mlat  ?? null;
+        case "adsb":  return ac.typedStates?.adsb        ?? null;
+        default:      return ac.state;
+      }
+    }
+
+    // Whether this aircraft should be visible in the current mode (uses typedStates)
+    function acVisible(ac) {
+      return getActiveState(ac) != null;
+    }
+
     function updateAircraft(state) {
       // Carry over last known classification — Rust resets to "unknown" on every
       // new solve; only accept "unknown" if this aircraft has never been classified.
@@ -1268,13 +1326,17 @@
       const color  = markerColor(state);
       const status = markerStatus(state);
       const pos = [lat, lon];
-      const visible = aircraftVisible(state);
-      const fillOpacity = ellipseFillOpacity(state);
       const isSemiMlat = state.observation_mode === "semi_mlat";
       const ellipseColor = isSemiMlat ? "#14b8a6" : color;
       const ellipseDash  = isSemiMlat ? "6 4" : null;
 
+      let finalVisible;
+
       if (!aircraft[icao24]) {
+        // New aircraft — visibility from this first state directly
+        const visible = aircraftVisible(state);
+        finalVisible = visible;
+        const fillOpacity = ellipseFillOpacity(state);
         const tooltipLabel = state.callsign
           ? `${state.callsign} (${icao24.toUpperCase()})`
           : icao24.toUpperCase();
@@ -1292,10 +1354,17 @@
         };
         if (ellipseDash) ellipseOpts.dashArray = ellipseDash;
         const ellipse = L.circle(pos, ellipseOpts);
+        // Initialize typed state buckets
+        const initTyped = { full_mlat: null, semi_mlat: null, adsb: null };
+        const omInit = state.observation_mode;
+        if (omInit === "full_mlat")      initTyped.full_mlat = state;
+        else if (omInit === "semi_mlat") initTyped.semi_mlat = state;
+        else                              initTyped.adsb       = state;
         aircraft[icao24] = {
           marker,
           ellipse,
           state,
+          typedStates: initTyped,
           lastSeen: Date.now(),
           idle: false,
           last_valid_alt_m: state.altitude_valid ? state.alt_m : null,
@@ -1308,34 +1377,48 @@
         if (selectedIcao === icao24) flushTrailSource(icao24);
       } else {
         const ac = aircraft[icao24];
-        if (visible) {
-          ac.marker.setLatLng(pos).setIcon(makeIcon(color, status));
-          const ellipseStyle = { color: ellipseColor, fillColor: ellipseColor, fillOpacity, weight: isSemiMlat ? 1.5 : 1 };
-          if (ellipseDash) ellipseStyle.dashArray = ellipseDash;
+        // Update the typed state bucket for this observation mode
+        if (!ac.typedStates) ac.typedStates = { full_mlat: null, semi_mlat: null, adsb: null };
+        const om = state.observation_mode;
+        if (om === "full_mlat")      ac.typedStates.full_mlat = state;
+        else if (om === "semi_mlat") ac.typedStates.semi_mlat = state;
+        else                          ac.typedStates.adsb       = state;
+        ac.state = state;
+
+        const visibleNow = acVisible(ac);
+        finalVisible = visibleNow;
+        const activeState = getActiveState(ac);
+
+        if (visibleNow && activeState) {
+          const aPos = [activeState.lat, activeState.lon];
+          const aColor = markerColor(activeState);
+          const aStatus = markerStatus(activeState);
+          const aIsSemi = activeState.observation_mode === "semi_mlat";
+          const aEColor = aIsSemi ? "#14b8a6" : aColor;
+          ac.idle = false;
+          ac.marker.setLatLng(aPos).setIcon(makeIcon(aColor, aStatus));
+          const ellipseStyle = { color: aEColor, fillColor: aEColor,
+            fillOpacity: ellipseFillOpacity(activeState), weight: aIsSemi ? 1.5 : 1 };
+          if (aIsSemi) ellipseStyle.dashArray = "6 4"; else delete ellipseStyle.dashArray;
           ac.ellipse
-            .setLatLng(pos)
-            .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
+            .setLatLng(aPos)
+            .setRadius(Math.max(activeState.confidence_ellipse_m || 200, 100))
             .setStyle(ellipseStyle);
         }
-        setAircraftMapVisibility(icao24, visible);
+        setAircraftMapVisibility(icao24, visibleNow);
         ac.lastSeen = Date.now();
-        ac.state = state;
         if (state.altitude_valid) ac.last_valid_alt_m = state.alt_m;
         // Update hover tooltip with callsign when enrichment arrives.
         const newLabel = state.callsign
           ? `${state.callsign} (${icao24.toUpperCase()})`
           : icao24.toUpperCase();
         ac.marker.getTooltip()?.setContent(newLabel);
-        if (ac.idle) {
-          ac.idle = false;
-          if (visible) ac.marker.setIcon(makeIcon(color, status));
-        }
         pushTrailPoint(icao24, state);
         if (selectedIcao === icao24) flushTrailSource(icao24);
       }
 
       // Close popup if this aircraft is no longer visible in current mode
-      if (selectedIcao === icao24 && !visible) closePopup();
+      if (selectedIcao === icao24 && !finalVisible) closePopup();
 
       scheduleRenderList();
 
@@ -1346,7 +1429,7 @@
         addSemiMlatAlert(state);
       }
 
-      if (selectedIcao === icao24 && visible) {
+      if (selectedIcao === icao24 && finalVisible) {
         refreshPopup();
         drawAttributionLines(icao24);
       }
@@ -1379,7 +1462,7 @@
 
     function focusAircraft(icao24) {
       const ac = aircraft[icao24];
-      if (!ac || !aircraftVisible(ac.state)) return;
+      if (!ac || !acVisible(ac)) return;
       map.setView(ac.marker.getLatLng(), Math.max(map.getZoom(), 11));
       openPopup(icao24);
     }
@@ -1387,7 +1470,7 @@
     function renderList() {
       const list = document.getElementById("aircraft-list");
       const sorted = Object.entries(aircraft)
-        .filter(([, ac]) => aircraftVisible(ac.state))
+        .filter(([, ac]) => acVisible(ac))
         .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
 
       list.innerHTML = "";
@@ -1396,15 +1479,17 @@
         const hint = document.createElement("div");
         hint.style.cssText =
           "padding:14px;color:#6b7280;font-size:.78rem;line-height:1.5";
-        hint.textContent =
-          displayMode === "mlat"
-            ? "No MLAT-positioned aircraft — waiting for 3+ sensor correlation."
-            : "No ADS-B-positioned aircraft in current stream.";
+        const hints = {
+          mlat:  "No full-MLAT aircraft — waiting for 3+ sensor correlation.",
+          smlat: "No S-MLAT aircraft — waiting for 2-sensor Kalman-fused fixes.",
+          adsb:  "No ADS-B aircraft in current stream.",
+        };
+        hint.textContent = hints[displayMode] ?? "No aircraft visible.";
         list.appendChild(hint);
       }
 
       for (const [icao, ac] of sorted) {
-        const s = ac.state;
+        const s = getActiveState(ac) ?? ac.state;
         const row = document.createElement("div");
         row.className = "ac-row";
         row.onclick = () => focusAircraft(icao);
@@ -1424,7 +1509,7 @@
           ? `<span class="badge badge-idle">IDLE</span>`
           : "";
 
-        const semiMlatBadge = s.observation_mode === "semi_mlat"
+        const semiMlatBadge = (s.observation_mode === "semi_mlat" && displayMode !== "smlat")
           ? `<span class="badge" style="background:#0e7490;color:#fff" title="Positioned via 2-sensor semi-MLAT (Kalman-assisted MAP solver)">SEMI</span>`
           : "";
 
@@ -1469,7 +1554,7 @@
           ac.idle = shouldBeIdle;
           const color  = markerColor(ac.state);
           const status = markerStatus(ac.state);
-          if (aircraftVisible(ac.state)) {
+          if (acVisible(ac)) {
             ac.marker.setIcon(
               shouldBeIdle ? makeIdleIcon(color) : makeIcon(color, status),
             );
@@ -1506,38 +1591,43 @@
       }
     }
 
-    // ─── Display mode toggle ──────────────────────────────────────────────────────
-    function toggleDisplayMode() {
-      displayMode = displayMode === "mlat" ? "adsb" : "mlat";
-      const lbl = document.getElementById("ctrl-mode-label");
-      if (lbl) lbl.textContent = displayMode === "mlat" ? "MLAT" : "ADS-B";
+    // ─── Display mode selector ────────────────────────────────────────────────────
+    function setDisplayMode(mode) {
+      displayMode = mode;
+      ['mlat', 'smlat', 'adsb'].forEach(m => {
+        document.getElementById(`mode-btn-${m}`)?.classList.toggle('active', m === mode);
+      });
 
-      // Legend stays visible in both modes; only the GDOP section is mode-specific
+      // GDOP section only meaningful for full MLAT
       const gdopSection = document.getElementById("mlgd-gdop-section");
-      if (gdopSection) {
-        gdopSection.style.display = displayMode === "mlat" ? "block" : "none";
-      }
+      if (gdopSection) gdopSection.style.display = mode === "mlat" ? "block" : "none";
 
-      // Reapply visibility and recolor every tracked aircraft
+      // Reapply visibility and re-render every tracked aircraft at its mode-specific position
       for (const [icao, ac] of Object.entries(aircraft)) {
-        const visible = aircraftVisible(ac.state);
+        const visible = acVisible(ac);
         setAircraftMapVisibility(icao, visible);
         if (visible) {
-          const color  = markerColor(ac.state);
-          const status = markerStatus(ac.state);
-          ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color, status));
+          const as = getActiveState(ac);
+          if (!as) continue;
+          const color  = markerColor(as);
+          const status = markerStatus(as);
+          const isSemi = as.observation_mode === "semi_mlat";
+          const eColor = isSemi ? "#14b8a6" : color;
+          ac.marker
+            .setLatLng([as.lat, as.lon])
+            .setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color, status));
           if (ac.ellipse) {
-            const isSemi = ac.state.observation_mode === "semi_mlat";
-            const eColor = isSemi ? "#14b8a6" : color;
-            const eStyle = { color: eColor, fillColor: eColor, fillOpacity: ellipseFillOpacity(ac.state), weight: isSemi ? 1.5 : 1 };
-            if (isSemi) eStyle.dashArray = "6 4";
+            ac.ellipse.setLatLng([as.lat, as.lon]);
+            const eStyle = { color: eColor, fillColor: eColor,
+              fillOpacity: ellipseFillOpacity(as), weight: isSemi ? 1.5 : 1 };
+            if (isSemi) eStyle.dashArray = "6 4"; else delete eStyle.dashArray;
             ac.ellipse.setStyle(eStyle);
           }
         }
       }
 
       // Close popup if selected aircraft is not visible in new mode
-      if (selectedIcao && !aircraftVisible(aircraft[selectedIcao]?.state))
+      if (selectedIcao && !acVisible(aircraft[selectedIcao]))
         closePopup();
 
       scheduleRenderList();
@@ -2009,7 +2099,7 @@
     function refreshPopup() {
       if (!selectedIcao || !aircraft[selectedIcao]) return;
       const ac = aircraft[selectedIcao];
-      const s = ac.state;
+      const s = getActiveState(ac) ?? ac.state;
       const age = Date.now() - ac.lastSeen;
 
       // Source badge + GDOP tier badge
@@ -2142,14 +2232,15 @@
     function drawAttributionLines(icao24) {
       clearAttributionLines();
       const ac = aircraft[icao24];
-      if (!ac || !ac.state.sensor_ids?.length || ac.state.gdop === 0) return;
-      for (const sid of ac.state.sensor_ids) {
+      const activeState = getActiveState(ac) ?? ac.state;
+      if (!ac || !activeState?.sensor_ids?.length) return;
+      for (const sid of activeState.sensor_ids) {
         const sd = sensorData[sid];
         if (!sd) continue;
         const line = L.polyline(
           [
             [sd.lat, sd.lon],
-            [ac.state.lat, ac.state.lon],
+            [activeState.lat, activeState.lon],
           ],
           {color: "#60a5fa", weight: 1.5, opacity: 0.7, dashArray: "5 4"},
         ).addTo(map);
@@ -2505,9 +2596,14 @@
       dotEl.style.background = color;
       labelEl.textContent = label;
       labelEl.style.color = color;
-      const fullCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "full_mlat").length;
-      const semiCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "semi_mlat").length;
-      const modeStr = (fullCount + semiCount) > 0 ? ` · ${fullCount} full / ${semiCount} semi` : "";
+      const fullCount  = Object.values(aircraft).filter(ac => ac.typedStates?.full_mlat != null).length;
+      const semiCount  = Object.values(aircraft).filter(ac => ac.typedStates?.semi_mlat != null).length;
+      const adsbCount  = Object.values(aircraft).filter(ac => ac.typedStates?.adsb       != null).length;
+      let modeStr = "";
+      if (displayMode === "mlat"   && fullCount > 0) modeStr = ` · ${fullCount} full-MLAT`;
+      else if (displayMode === "smlat" && semiCount > 0) modeStr = ` · ${semiCount} S-MLAT`;
+      else if (displayMode === "adsb"  && adsbCount > 0) modeStr = ` · ${adsbCount} ADS-B`;
+      else if (fullCount + semiCount > 0)                modeStr = ` · ${fullCount} full / ${semiCount} S-MLAT`;
       countEl.textContent = `${active} / ${total} sensors${modeStr}`;
     }
 

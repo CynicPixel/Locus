@@ -451,4 +451,50 @@ impl KalmanRegistry {
     pub fn get_last_valid_altitude(&self, icao24: &str) -> Option<f64> {
         self.filters.get(icao24).and_then(|k| k.last_valid_altitude_m)
     }
+
+    /// Check if Kalman track exists for the given aircraft.
+    pub fn has_track(&self, icao24: &str) -> bool {
+        self.filters.contains_key(icao24)
+    }
+
+    /// Initialize Kalman track from cold-start semi-MLAT using ADS-B position.
+    /// This is called when semi-MLAT solves with ADS-B prior but no existing Kalman track.
+    pub fn initialize(
+        &mut self,
+        icao24: &str,
+        ecef_pos: Vector3<f64>,
+        pos_covariance: Matrix3<f64>,
+        timestamp_ns: u64,
+    ) {
+        // Create 6-state vector [x, y, z, vx, vy, vz] with zero initial velocity
+        let (x, y, z) = (ecef_pos[0], ecef_pos[1], ecef_pos[2]);
+
+        // Create 6×6 covariance (position from semi-MLAT, large velocity uncertainty)
+        let mut cov = Matrix6::zeros();
+        cov.fixed_view_mut::<3, 3>(0, 0).copy_from(&pos_covariance);
+        for i in 3..6 {
+            cov[(i, i)] = 50.0 * 50.0; // 50 m/s velocity uncertainty (large for cold start)
+        }
+
+        // Initialize Kalman filter state
+        let kalman = AircraftKalman {
+            icao24: icao24.to_string(),
+            x: Vector6::new(x, y, z, 0.0, 0.0, 0.0),
+            p: cov,
+            last_update_ns: timestamp_ns,
+            last_valid_altitude_m: None,
+            outlier_count: 0,
+        };
+
+        self.filters.insert(icao24.to_string(), kalman);
+
+        // Initialize history
+        let hist = self
+            .histories
+            .entry(icao24.to_string())
+            .or_insert_with(AircraftHistory::new);
+        if let Some(k) = self.filters.get(icao24) {
+            hist.push(k, 0.0, 0.0); // GDOP=0, divergence=0 for cold start
+        }
+    }
 }
