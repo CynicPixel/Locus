@@ -24,13 +24,21 @@ services:
       - "8000:8000"
     networks:
       - internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
   rust-backend:
     build: ./rust-backend
     restart: unless-stopped
     depends_on:
-      - go-ingestor
-      - ml-service
+      go-ingestor:
+        condition: service_started
+      ml-service:
+        condition: service_healthy
     command:
       - "--ws-addr=0.0.0.0:9001"
       - "--ml-service-url=http://ml-service:8000"

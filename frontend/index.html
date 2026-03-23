@@ -42,7 +42,8 @@
       flex-direction: column;
       background: #161b22;
       border-left: 1px solid #30363d;
-      overflow: hidden;
+      overflow-x: auto;
+      overflow-y: hidden;
     }
 
     #sidebar header {
@@ -389,13 +390,27 @@
       letter-spacing: .12em; text-transform: uppercase; color: #f59e0b;
     }
     #vs-float-header .vs-float-title { flex: 1; }
-    #vs-float-body { padding: 8px 10px 10px; }
+    #vs-float-body { padding: 8px 10px 10px; max-height: 260px; overflow-y: auto; }
     #vs-float-count { font-size: .58rem; color: #6e7681; letter-spacing: .06em; }
+
+    /* ─── FL Altitude Toggle ─────────────────────────────────────────────── */
+    .fl-toggle { display: flex; gap: 2px; margin-left: 4px; }
+    .fl-btn {
+      background: #1c2128; border: 1px solid #30363d; color: #6e7681;
+      border-radius: 3px; padding: 2px 6px; font-size: .57rem;
+      font-family: 'Courier New', monospace; font-weight: 700;
+      letter-spacing: .06em; cursor: pointer; transition: all .12s; line-height: 1.4;
+    }
+    .fl-btn:hover { border-color: #d97706; color: #fbbf24; }
+    .fl-btn.fl-active {
+      background: #78350f; border-color: #d97706; color: #fbbf24;
+      box-shadow: 0 0 5px #d9770640;
+    }
 
     /* ─── Floating aircraft color legend ───────────────────────────────────── */
     #marker-legend {
       position: absolute;
-      top: 262px;
+      top: 360px;
       right: 10px;
       z-index: 1000;
       background: rgba(22, 27, 34, 0.92);
@@ -403,7 +418,7 @@
       border-radius: 6px;
       font-size: 0.72rem;
       color: #c9d1d9;
-      min-width: 156px;
+      min-width: 190px;
     }
 
     #marker-legend-header {
@@ -444,6 +459,31 @@
     .mlgd-sep {
       border-top: 1px solid #30363d;
       margin: 5px 0;
+    }
+
+    .mlgd-sub {
+      color: #6e7681;
+      font-size: 0.60rem;
+      line-height: 1.3;
+      margin-top: 1px;
+      margin-bottom: 3px;
+      padding-left: 16px;
+    }
+
+    .mlgd-badge-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      margin-bottom: 2px;
+    }
+
+    @keyframes pulse-ring {
+      0%   { r: 7; opacity: 0.8; }
+      70%  { r: 11; opacity: 0; }
+      100% { r: 11; opacity: 0; }
+    }
+    .anomaly-pulse {
+      animation: pulse-ring 1.4s ease-out infinite;
     }
 
     /* Aircraft popup — flex wrapper positions both cards */
@@ -624,6 +664,14 @@
               &#x2715; EXIT PLAN
             </button>
           </div>
+          <div style="margin-top:6px;display:flex;align-items:center;gap:5px">
+            <span style="font-size:.57rem;color:#6e7681;font-family:'Courier New',monospace;letter-spacing:.06em;text-transform:uppercase">ALT</span>
+            <div class="fl-toggle" title="Simulated aircraft altitude">
+              <button class="fl-btn" data-alt="1524"  onclick="setPlanningFL(1524)">FL50</button>
+              <button class="fl-btn" data-alt="3048"  onclick="setPlanningFL(3048)">FL100</button>
+              <button class="fl-btn fl-active" data-alt="9144" onclick="setPlanningFL(9144)">FL300</button>
+            </div>
+          </div>
           <div id="planning-cov-stats" style="margin-top:8px;font-size:.68rem;color:#6e7681;font-family:'Courier New',monospace">
             Place virtual sensors to see simulated coverage.
           </div>
@@ -631,7 +679,7 @@
       </div>
 
       <!-- Floating minimizable aircraft color legend -->
-      <div id="marker-legend" style="display: none">
+      <div id="marker-legend">
         <div id="marker-legend-header">
           <span id="marker-legend-title">Aircraft Colors</span>
           <button class="collapse-btn" id="marker-legend-toggle" onclick="toggleMarkerLegend()">
@@ -639,33 +687,70 @@
           </button>
         </div>
         <div class="panel-body" id="marker-legend-body">
-          <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #22c55e"></span><span>Excellent GDOP &lt;2</span>
+
+          <!-- GDOP tiers — hidden in ADS-B mode by JS -->
+          <div id="mlgd-gdop-section">
+            <div class="mlgd-row"><span class="mlgd-dot" style="background:#22c55e"></span><span>Excellent GDOP &lt;2</span></div>
+            <div class="mlgd-sub">Tight geometry · sub-100 m fix</div>
+            <div class="mlgd-row"><span class="mlgd-dot" style="background:#14b8a6"></span><span>Good GDOP 2–5</span></div>
+            <div class="mlgd-sub">Adequate geometry · ~200–400 m</div>
+            <div class="mlgd-row"><span class="mlgd-dot" style="background:#eab308"></span><span>Fair GDOP 5–10</span></div>
+            <div class="mlgd-sub">Weak geometry · 400–800 m</div>
+            <div class="mlgd-row"><span class="mlgd-dot" style="background:#f97316"></span><span>Poor GDOP &gt;10</span></div>
+            <div class="mlgd-sub">Marginal fix · solver near limit</div>
+            <div class="mlgd-sep"></div>
           </div>
+
+          <!-- Status markers with SVG previews matching actual map icons -->
           <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #14b8a6"></span><span>Good GDOP 2–5</span>
+            <svg width="14" height="14" viewBox="0 0 14 14" overflow="visible" style="flex-shrink:0">
+              <circle cx="7" cy="7" r="7" fill="none" stroke="#ef4444" stroke-width="1.5" class="anomaly-pulse"/>
+              <circle cx="7" cy="7" r="5" fill="#ef4444" stroke="#000" stroke-width="1.5"/>
+            </svg>
+            <span>Anomaly detected</span>
           </div>
+          <div class="mlgd-sub">ML classifier · confidence &gt;75% · pulsing ring</div>
+
           <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #eab308"></span><span>Fair GDOP 5–10</span>
+            <svg width="14" height="14" viewBox="0 0 14 14" overflow="visible" style="flex-shrink:0">
+              <circle cx="7" cy="7" r="6" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3 2"/>
+              <circle cx="7" cy="7" r="5" fill="#f59e0b" stroke="#000" stroke-width="1.5"/>
+            </svg>
+            <span>Spoof flag</span>
           </div>
+          <div class="mlgd-sub">MLAT vs ADS-B divergence &gt;500 m · dashed ring</div>
+
           <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #f97316"></span><span>Poor GDOP &gt;10</span>
+            <span class="mlgd-dot" style="background:#22c55e"></span>
+            <span>Normal / no alert</span>
           </div>
+          <div class="mlgd-sub">No anomaly or divergence detected</div>
+
           <div class="mlgd-sep"></div>
-          <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #ef4444"></span><span>Anomaly detected</span>
+
+          <div style="font-size:0.60rem;font-weight:700;letter-spacing:0.08em;color:#8b949e;text-transform:uppercase;margin-bottom:5px;">Sidebar Badges</div>
+
+          <div class="mlgd-badge-row">
+            <span class="badge badge-anomaly" style="flex-shrink:0">ANOMALY</span>
+            <span style="color:#8b949e;font-size:0.60rem;line-height:1.3">ML classifier flagged unusual track</span>
           </div>
-          <div class="mlgd-row">
-            <span class="mlgd-dot" style="background: #f59e0b"></span><span>Spoof flag</span>
+          <div class="mlgd-badge-row">
+            <span class="badge" style="background:#92400e;color:#fef3c7;flex-shrink:0">SPOOF</span>
+            <span style="color:#8b949e;font-size:0.60rem;line-height:1.3">Position diverges from ADS-B claim</span>
           </div>
-          <div style="
-                margin-top: 5px;
-                color: #6e7681;
-                font-size: 0.63rem;
-                line-height: 1.3;
-              ">
-            Lower GDOP = better fix accuracy
+          <div class="mlgd-badge-row">
+            <span class="badge badge-normal" style="flex-shrink:0">NORMAL</span>
+            <span style="color:#8b949e;font-size:0.60rem;line-height:1.3">Classifier: no anomaly</span>
           </div>
+          <div class="mlgd-badge-row">
+            <span class="badge badge-idle" style="flex-shrink:0">IDLE</span>
+            <span style="color:#8b949e;font-size:0.60rem;line-height:1.3">No signal for &gt;30 s</span>
+          </div>
+          <div class="mlgd-badge-row">
+            <span class="badge badge-unknown" style="flex-shrink:0">—</span>
+            <span style="color:#8b949e;font-size:0.60rem;line-height:1.3">Not yet classified</span>
+          </div>
+
         </div>
       </div>
 
@@ -766,7 +851,7 @@
 
       <!-- Heatmap Coverage: unified color key + live stats (visible only when GDOP heatmap active) -->
       <div class="panel" id="heatmap-coverage" style="display: none">
-        <div class="panel-header">
+        <div class="panel-header" style="flex-wrap:wrap; gap:4px">
           <span class="panel-title" style="margin-bottom: 0">GDOP Coverage
             <span class="info-icon"
               data-tip="Each tier shows its GDOP range and the % of monitored airspace at that quality. Lower GDOP = better sensor geometry = more accurate fix.">i</span>
@@ -784,6 +869,11 @@
                   margin-left: 4px;
                 "></span>
           </span>
+          <div class="fl-toggle" title="Aircraft altitude for GDOP computation">
+            <button class="fl-btn" data-alt="1524"  onclick="setLiveFL(1524)">FL50</button>
+            <button class="fl-btn" data-alt="3048"  onclick="setLiveFL(3048)">FL100</button>
+            <button class="fl-btn fl-active" data-alt="9144" onclick="setLiveFL(9144)">FL300</button>
+          </div>
           <button class="collapse-btn" id="heatmap-coverage-toggle"
             onclick="togglePanel('heatmap-coverage-body','heatmap-coverage-toggle')">
             &#8963;
@@ -831,6 +921,12 @@
       if (ws && ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify(obj));
     }
+
+    // Prevent ALL map-overlay panel clicks from bleeding through into the Leaflet map
+    ['vs-float', 'ctrl-rail', 'marker-legend', 'clock-panel', 'ac-popup-wrapper'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) L.DomEvent.disableClickPropagation(el);
+    });
 
     // ─── Planning mode map click ───────────────────────────────────────────────────
     map.on("click", (e) => {
@@ -909,7 +1005,9 @@
 
     // Whether to show this aircraft in the current mode
     function aircraftVisible(state) {
-      return displayMode === "mlat" ? state.gdop > 0 : state.gdop === 0;
+      if (displayMode === "mlat")
+        return state.gdop > 0 || state.observation_mode === "semi_mlat";
+      return state.gdop === 0 && state.observation_mode !== "semi_mlat";
     }
 
     // Add or remove an aircraft's marker + ellipse from the map without deleting state
@@ -938,6 +1036,47 @@
     let gdopVisible = false;
     let gdopStats = null; // Latest coverage statistics
 
+    // FL altitude state (meters) — default FL300 = 9144 m
+    let planningAltitudeM    = 9144;
+    let liveHeatmapAltitudeM = 9144;
+
+    function flLabel(alt) {
+      if (alt === 1524) return "FL50";
+      if (alt === 3048) return "FL100";
+      return "FL300";
+    }
+
+    // Dynamically push #marker-legend below #vs-float when planning panel is open
+    function repositionMarkerLegend() {
+      const vsFloat = document.getElementById('vs-float');
+      const legend  = document.getElementById('marker-legend');
+      if (!legend) return;
+      if (vsFloat && vsFloat.style.display !== 'none') {
+        const gap    = 10;
+        const bottom = vsFloat.getBoundingClientRect().bottom;
+        const mapTop = document.getElementById('map').getBoundingClientRect().top;
+        legend.style.top = (bottom - mapTop + gap) + 'px';
+      } else {
+        legend.style.top = ''; // revert to CSS default
+      }
+    }
+
+    function setPlanningFL(altM) {
+      planningAltitudeM = altM;
+      document.querySelectorAll('#vs-float-body .fl-btn').forEach(btn => {
+        btn.classList.toggle('fl-active', parseInt(btn.dataset.alt) === altM);
+      });
+      wsSend({ type: "set_planning_altitude", altitude_m: altM });
+    }
+
+    function setLiveFL(altM) {
+      liveHeatmapAltitudeM = altM;
+      document.querySelectorAll('#heatmap-coverage .fl-btn').forEach(btn => {
+        btn.classList.toggle('fl-active', parseInt(btn.dataset.alt) === altM);
+      });
+      wsSend({ type: "set_live_heatmap_altitude", altitude_m: altM });
+    }
+
     const MAX_TRAIL_POINTS = 300;
     const MAX_TRAIL_AGE_MS = 10 * 60 * 1000; // 10 minutes
     let trailPolylines = []; // active L.polyline[] for the selected trail
@@ -958,14 +1097,28 @@
       return "#22c55e";
     }
 
-    function makeIcon(color) {
+    function markerStatus(state) {
+      if (state.anomaly_label === "anomalous" && state.anomaly_confidence > 0.75)
+        return "anomaly";
+      if (state.spoof_flag) return "spoof";
+      return "normal";
+    }
+
+    function makeIcon(color, status) {
+      let extra = "";
+      if (status === "anomaly") {
+        extra = `<circle cx="7" cy="7" r="7" fill="none" stroke="#ef4444" stroke-width="1.5" class="anomaly-pulse"/>`;
+      } else if (status === "spoof") {
+        extra = `<circle cx="7" cy="7" r="6" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="3 2"/>`;
+      }
       return L.divIcon({
         className: "",
-        html: `<svg width="14" height="14" viewBox="0 0 14 14">
+        html: `<svg width="16" height="16" viewBox="0 0 14 14" overflow="visible">
+             ${extra}
              <circle cx="7" cy="7" r="5" fill="${color}" stroke="#000" stroke-width="1.5"/>
            </svg>`,
-        iconSize: [14, 14],
-        iconAnchor: [7, 7],
+        iconSize: [16, 16],
+        iconAnchor: [8, 8],
       });
     }
 
@@ -1082,44 +1235,70 @@
 
     // ─── Aircraft update ──────────────────────────────────────────────────────────
     function ellipseFillOpacity(state) {
+      if (state.observation_mode === "semi_mlat") return 0.10;
       if (state.gdop === 0) return 0.06;
       const tier = gdopTier(state.gdop);
       return tier ? [0.06, 0.08, 0.12, 0.18][tier.tier - 1] : 0.08;
     }
 
     function updateAircraft(state) {
+      // Carry over last known classification — Rust resets to "unknown" on every
+      // new solve; only accept "unknown" if this aircraft has never been classified.
+      const prev = aircraft[state.icao24];
+      if (state.anomaly_label === "unknown" && prev && prev.state.anomaly_label !== "unknown") {
+        state.anomaly_label    = prev.state.anomaly_label;
+        state.anomaly_confidence = prev.state.anomaly_confidence;
+      }
+
+      // Carry forward last valid altitude when backend flags altitude as invalid
+      if (!state.altitude_valid && prev != null) {
+        const lastAlt = prev.last_valid_alt_m ?? prev.state.alt_m;
+        if (lastAlt != null) {
+          state.alt_m = lastAlt;
+          state._alt_estimated = true;
+        }
+      }
+      if (state.altitude_valid) state._alt_estimated = false;
+
       const {icao24, lat, lon, anomaly_label, spoof_flag} = state;
       if (lat == null || lon == null) return;
       if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
       if (lat === 0 && lon === 0) return;
 
-      const color = markerColor(state);
+      const color  = markerColor(state);
+      const status = markerStatus(state);
       const pos = [lat, lon];
       const visible = aircraftVisible(state);
       const fillOpacity = ellipseFillOpacity(state);
+      const isSemiMlat = state.observation_mode === "semi_mlat";
+      const ellipseColor = isSemiMlat ? "#14b8a6" : color;
+      const ellipseDash  = isSemiMlat ? "6 4" : null;
 
       if (!aircraft[icao24]) {
         const tooltipLabel = state.callsign
           ? `${state.callsign} (${icao24.toUpperCase()})`
           : icao24.toUpperCase();
-        const marker = L.marker(pos, {icon: makeIcon(color)}).bindTooltip(
+        const marker = L.marker(pos, {icon: makeIcon(color, status)}).bindTooltip(
           tooltipLabel,
           {permanent: false, direction: "top"},
         );
         marker.on("click", () => focusAircraft(icao24));
-        const ellipse = L.circle(pos, {
+        const ellipseOpts = {
           radius: Math.max(state.confidence_ellipse_m || 200, 100),
-          color,
-          fillColor: color,
+          color: ellipseColor,
+          fillColor: ellipseColor,
           fillOpacity,
-          weight: 1,
-        });
+          weight: isSemiMlat ? 1.5 : 1,
+        };
+        if (ellipseDash) ellipseOpts.dashArray = ellipseDash;
+        const ellipse = L.circle(pos, ellipseOpts);
         aircraft[icao24] = {
           marker,
           ellipse,
           state,
           lastSeen: Date.now(),
           idle: false,
+          last_valid_alt_m: state.altitude_valid ? state.alt_m : null,
         };
         if (visible) {
           marker.addTo(map);
@@ -1130,15 +1309,18 @@
       } else {
         const ac = aircraft[icao24];
         if (visible) {
-          ac.marker.setLatLng(pos).setIcon(makeIcon(color));
+          ac.marker.setLatLng(pos).setIcon(makeIcon(color, status));
+          const ellipseStyle = { color: ellipseColor, fillColor: ellipseColor, fillOpacity, weight: isSemiMlat ? 1.5 : 1 };
+          if (ellipseDash) ellipseStyle.dashArray = ellipseDash;
           ac.ellipse
             .setLatLng(pos)
             .setRadius(Math.max(state.confidence_ellipse_m || 200, 100))
-            .setStyle({color, fillColor: color, fillOpacity});
+            .setStyle(ellipseStyle);
         }
         setAircraftMapVisibility(icao24, visible);
         ac.lastSeen = Date.now();
         ac.state = state;
+        if (state.altitude_valid) ac.last_valid_alt_m = state.alt_m;
         // Update hover tooltip with callsign when enrichment arrives.
         const newLabel = state.callsign
           ? `${state.callsign} (${icao24.toUpperCase()})`
@@ -1146,7 +1328,7 @@
         ac.marker.getTooltip()?.setContent(newLabel);
         if (ac.idle) {
           ac.idle = false;
-          if (visible) ac.marker.setIcon(makeIcon(color));
+          if (visible) ac.marker.setIcon(makeIcon(color, status));
         }
         pushTrailPoint(icao24, state);
         if (selectedIcao === icao24) flushTrailSource(icao24);
@@ -1158,6 +1340,11 @@
       scheduleRenderList();
 
       if (anomaly_label === "anomalous" || spoof_flag) addAlert(state);
+
+      const prevMode = prev?.state?.observation_mode;
+      if (state.observation_mode === "semi_mlat" && prevMode !== "semi_mlat") {
+        addSemiMlatAlert(state);
+      }
 
       if (selectedIcao === icao24 && visible) {
         refreshPopup();
@@ -1173,6 +1360,19 @@
       row.className = "alert-entry";
       const flag = state.spoof_flag ? "GPS-SPOOF" : "ANOMALY";
       row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24} — ${flag}`;
+      el.insertBefore(row, el.firstChild);
+      if (el.children.length > 40) el.removeChild(el.lastChild);
+    }
+
+    function addSemiMlatAlert(state) {
+      const el = document.getElementById("alert-list");
+      const em = el.querySelector("em");
+      if (em) em.remove();
+      const row = document.createElement("div");
+      row.className = "alert-entry";
+      row.style.color = "#60a5fa";
+      const sdopStr = state.sdop != null ? `, SDOP ${Math.round(state.sdop)}m` : "";
+      row.textContent = `[${new Date().toLocaleTimeString()}] ${state.icao24.toUpperCase()} — Semi-MLAT acquired (2 sensors${sdopStr})`;
       el.insertBefore(row, el.firstChild);
       if (el.children.length > 40) el.removeChild(el.lastChild);
     }
@@ -1224,6 +1424,10 @@
           ? `<span class="badge badge-idle">IDLE</span>`
           : "";
 
+        const semiMlatBadge = s.observation_mode === "semi_mlat"
+          ? `<span class="badge" style="background:#0e7490;color:#fff" title="Positioned via 2-sensor semi-MLAT (Kalman-assisted MAP solver)">SEMI</span>`
+          : "";
+
         // Show GDOP tier badge for Fair (3) and Poor (4) only — Excellent/Good are clean
         let gdopBadge = "";
         if (displayMode === "mlat" && s.gdop > 0) {
@@ -1235,8 +1439,8 @@
 
         row.innerHTML = `
       <span class="ac-icao">${icao.toUpperCase()}</span>
-      <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m</span>
-      ${badge}${spoofBadge}${gdopBadge}${idleBadge}`;
+      <span class="ac-pos">${s.lat?.toFixed(4)}° ${s.lon?.toFixed(4)}° ${Math.round(s.alt_m ?? 0)}m${s._alt_estimated ? '~' : ''}</span>
+      ${badge}${spoofBadge}${semiMlatBadge}${gdopBadge}${idleBadge}`;
         list.appendChild(row);
       }
       document.getElementById("ac-count").textContent = sorted.length;
@@ -1263,10 +1467,11 @@
         const shouldBeIdle = age > IDLE_WARNING_MS;
         if (shouldBeIdle !== ac.idle) {
           ac.idle = shouldBeIdle;
-          const color = markerColor(ac.state);
+          const color  = markerColor(ac.state);
+          const status = markerStatus(ac.state);
           if (aircraftVisible(ac.state)) {
             ac.marker.setIcon(
-              shouldBeIdle ? makeIdleIcon(color) : makeIcon(color),
+              shouldBeIdle ? makeIdleIcon(color) : makeIcon(color, status),
             );
           }
         }
@@ -1307,10 +1512,10 @@
       const lbl = document.getElementById("ctrl-mode-label");
       if (lbl) lbl.textContent = displayMode === "mlat" ? "MLAT" : "ADS-B";
 
-      if (displayMode === "mlat") {
-        document.getElementById("marker-legend").style.display = "block";
-      } else {
-        document.getElementById("marker-legend").style.display = "none";
+      // Legend stays visible in both modes; only the GDOP section is mode-specific
+      const gdopSection = document.getElementById("mlgd-gdop-section");
+      if (gdopSection) {
+        gdopSection.style.display = displayMode === "mlat" ? "block" : "none";
       }
 
       // Reapply visibility and recolor every tracked aircraft
@@ -1318,14 +1523,15 @@
         const visible = aircraftVisible(ac.state);
         setAircraftMapVisibility(icao, visible);
         if (visible) {
-          const color = markerColor(ac.state);
-          ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color));
+          const color  = markerColor(ac.state);
+          const status = markerStatus(ac.state);
+          ac.marker.setIcon(ac.idle ? makeIdleIcon(color) : makeIcon(color, status));
           if (ac.ellipse) {
-            ac.ellipse.setStyle({
-              color,
-              fillColor: color,
-              fillOpacity: ellipseFillOpacity(ac.state),
-            });
+            const isSemi = ac.state.observation_mode === "semi_mlat";
+            const eColor = isSemi ? "#14b8a6" : color;
+            const eStyle = { color: eColor, fillColor: eColor, fillOpacity: ellipseFillOpacity(ac.state), weight: isSemi ? 1.5 : 1 };
+            if (isSemi) eStyle.dashArray = "6 4";
+            ac.ellipse.setStyle(eStyle);
           }
         }
       }
@@ -1599,7 +1805,8 @@
     <span style="color:#6e7681;font-size:.65rem;text-align:right;min-width:36px">Cover</span>
   </div>`;
 
-      body.innerHTML = `<div style="font-size:.72rem;line-height:1.5;padding-top:4px">${header}${rows}${noDataRow}${meanRow}</div>`;
+      const altLine = `<div style="font-size:.63rem;color:#d97706;font-family:monospace;margin-bottom:4px">&#9992; ${flLabel(liveHeatmapAltitudeM)}</div>`;
+      body.innerHTML = `<div style="font-size:.72rem;line-height:1.5;padding-top:4px">${altLine}${header}${rows}${noDataRow}${meanRow}</div>`;
     }
 
     // ─── Sensor health chart (time-series) ───────────────────────────────────────
@@ -1795,6 +2002,8 @@
       document.getElementById("ac-popup-wrapper").style.display = "flex";
       drawAttributionLines(icao24);
       flushTrailSource(icao24);
+      // Request OpenSky enrichment (callsign/squawk/country) on demand
+      wsSend({ type: "request_aircraft_info", icao24 });
     }
 
     function refreshPopup() {
@@ -1804,10 +2013,13 @@
       const age = Date.now() - ac.lastSeen;
 
       // Source badge + GDOP tier badge
-      const isAdsb = s.gdop === 0;
+      const isAdsb    = s.gdop === 0 && s.observation_mode !== "semi_mlat";
+      const isSemiMlat = s.observation_mode === "semi_mlat";
       let srcBadge;
       if (isAdsb) {
         srcBadge = `<span class="badge" style="background:#1d4ed8;color:#fff">ADS-B</span>`;
+      } else if (isSemiMlat) {
+        srcBadge = `<span class="badge" style="background:#0e7490;color:#fff" title="Positioned via 2-sensor semi-MLAT (Kalman-assisted MAP solver)">SEMI-MLAT</span>`;
       } else {
         const tier = gdopTier(s.gdop);
         const tierBadge =
@@ -1834,8 +2046,13 @@
           ? `${Math.round(durationMs / 1000)}s`
           : `${Math.floor(durationMs / 60000)}m ${Math.round((durationMs % 60000) / 1000)}s`;
 
-      // GDOP row — show numeric + tier label for MLAT, N/A for ADS-B
-      const gdopCell = (() => {
+      // DOP row — SDOP for semi-MLAT, GDOP otherwise
+      const isSemiMlatPopup = s.observation_mode === "semi_mlat";
+      const dopRowLabel = isSemiMlatPopup ? "SDOP" : "GDOP";
+      const dopCell = (() => {
+        if (isSemiMlatPopup) {
+          return `${Math.round(s.sdop ?? 0)}m <span style="color:#8b949e;font-size:.68rem" title="Semi-MLAT Dilution of Precision — 1σ uncertainty from 2-sensor MAP solver">(2-sensor MAP)</span>`;
+        }
         if (s.gdop === 0) return "N/A (ADS-B)";
         const tier = gdopTier(s.gdop);
         const tierHtml = tier
@@ -1852,7 +2069,7 @@
 
       // LEFT card (ac-popup-right, DOM 1st): quality + tracking
       const qualityRows = [
-        ["GDOP", gdopCell],
+        [dopRowLabel, dopCell],
         [
           "Accuracy",
           `\u00b1${Math.round(s.confidence_ellipse_m)}m (2\u03c3)`,
@@ -1880,11 +2097,12 @@
 
       // RIGHT card (ac-popup, DOM 2nd): identity + flight state
       const identityRows = [];
-      if (s.callsign) identityRows.push(["Callsign", `<b>${s.callsign}</b>`]);
+      const fetching = `<span style="color:#444c56;font-size:.7rem;font-style:italic">fetching…</span>`;
+      identityRows.push(["Callsign", s.callsign ? `<b>${s.callsign}</b>` : fetching]);
       if (s.squawk) identityRows.push(["Squawk", s.squawk]);
       if (s.origin_country) identityRows.push(["Country", s.origin_country]);
       identityRows.push(
-        ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft`],
+        ["Alt", `${Math.round(s.alt_m)}m / ${Math.round(s.alt_m * 3.281)}ft${s._alt_estimated ? ' (est)' : ''}`],
         ["Speed", `${speedKts.toFixed(0)} kts`],
         ["Heading", `${headingDeg.toFixed(0)}\u00b0`],
       );
@@ -2287,7 +2505,10 @@
       dotEl.style.background = color;
       labelEl.textContent = label;
       labelEl.style.color = color;
-      countEl.textContent = `${active} / ${total} sensors`;
+      const fullCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "full_mlat").length;
+      const semiCount = Object.values(aircraft).filter(ac => ac.state.observation_mode === "semi_mlat").length;
+      const modeStr = (fullCount + semiCount) > 0 ? ` · ${fullCount} full / ${semiCount} semi` : "";
+      countEl.textContent = `${active} / ${total} sensors${modeStr}`;
     }
 
     function updateClockPanelHeader(clockData) {
@@ -2346,6 +2567,10 @@
 
       ws.onopen = () => {
         document.getElementById("conn-dot").style.background = "#22c55e";
+        if (liveHeatmapAltitudeM !== 9144)
+          wsSend({ type: "set_live_heatmap_altitude", altitude_m: liveHeatmapAltitudeM });
+        if (planningAltitudeM !== 9144)
+          wsSend({ type: "set_planning_altitude", altitude_m: planningAltitudeM });
       };
 
       ws.onclose = () => {
@@ -2396,6 +2621,14 @@
           onVsCleared();
         } else if (msg.type === "virtual_sensor_error") {
           showVsError(msg.message);
+        } else if (msg.type === "aircraft_info_result") {
+          const key = msg.icao24.toLowerCase();
+          if (aircraft[key]) {
+            if (msg.callsign)       aircraft[key].state.callsign       = msg.callsign;
+            if (msg.squawk)         aircraft[key].state.squawk         = msg.squawk;
+            if (msg.origin_country) aircraft[key].state.origin_country = msg.origin_country;
+            if (selectedIcao === key) refreshPopup();
+          }
         } else {
           // aircraft state update
           updateAircraft(msg);
@@ -2411,6 +2644,7 @@
       if (!body) return;
       body.classList.toggle("collapsed");
       btn.textContent = body.classList.contains("collapsed") ? "⌄" : "⌃";
+      repositionMarkerLegend();
     }
 
     // ─── Planning Mode ────────────────────────────────────────────────────────────
@@ -2423,6 +2657,7 @@
       document.getElementById("planning-toggle").classList.add("active");
       map.getContainer().style.cursor = "crosshair";
       document.getElementById("vs-float").style.display = "block";
+      repositionMarkerLegend();
       // Ensure live GDOP heatmap is visible so user sees what they're improving
       if (!gdopVisible) toggleGdopHeatmap();
       planningGdopLayer.addTo(map);
@@ -2437,6 +2672,7 @@
       map.removeLayer(planningGdopLayer);
       planningGdopLayer.clearLayers();
       document.getElementById("vs-float").style.display = "none";
+      repositionMarkerLegend();
       document.getElementById("planning-badge").style.display = "none";
       document.getElementById("planning-cov-stats").innerHTML =
         "Place virtual sensors to see simulated coverage.";
@@ -2536,6 +2772,7 @@
       // Update floating panel counter
       const cnt = document.getElementById("vs-float-count");
       if (cnt) cnt.textContent = `${Object.keys(virtualSensors).length} placed`;
+      repositionMarkerLegend();
     }
 
     // ─── Planning-Mode GDOP Heatmap ───────────────────────────────────────────────
@@ -2584,7 +2821,7 @@
       const badge = document.getElementById("planning-badge");
       if (badge) {
         badge.style.display = "inline";
-        badge.textContent = `SIMULATED · ${data.real_sensor_count}R+${data.virtual_sensor_count}V`;
+        badge.textContent = `SIMULATED · ${data.real_sensor_count}R+${data.virtual_sensor_count}V · ${flLabel(planningAltitudeM)}`;
       }
 
       // Update planning coverage stats in VS panel
@@ -2597,7 +2834,7 @@
       if (statsEl) {
         statsEl.innerHTML = `
       <div style="font-size:.7rem;line-height:1.65;font-family:monospace">
-        <div style="color:#f59e0b;font-weight:700;margin-bottom:3px;letter-spacing:.05em">SIMULATED COVERAGE</div>
+        <div style="color:#f59e0b;font-weight:700;margin-bottom:3px;letter-spacing:.05em">SIMULATED COVERAGE · ${flLabel(planningAltitudeM)}</div>
         <div style="display:flex;justify-content:space-between"><span style="color:#22c55e">Excellent</span><span>${pct("excellent")}</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:#84cc16">Good</span><span>${pct("good")}</span></div>
         <div style="display:flex;justify-content:space-between"><span style="color:#eab308">Moderate</span><span>${pct("moderate")}</span></div>

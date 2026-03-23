@@ -1,22 +1,23 @@
 import torch
 import torch.nn as nn
+from constants import NUM_FEATURES, HIDDEN_SIZE, NUM_LSTM_LAYERS, DROPOUT_RATE, NUM_CLASSES
 
 
 class AircraftLSTM(nn.Module):
     """
     LSTM anomaly classifier for aircraft tracks.
 
-    Input:  (batch, seq_len=20, features=6)
-            features = [lat, lon, alt_m, vel_lat, vel_lon, vel_alt]
+    Input:  (batch, seq_len=20, features=8)
+            features = [lat, lon, alt_m, vel_lat, vel_lon, vel_alt, gdop, divergence_m]
     Output: (batch, 2) raw logits  →  softmax gives [p_normal, p_anomalous]
     """
 
     def __init__(
         self,
-        input_size: int = 6,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.3,
+        input_size: int = NUM_FEATURES,
+        hidden_size: int = HIDDEN_SIZE,
+        num_layers: int = NUM_LSTM_LAYERS,
+        dropout: float = DROPOUT_RATE,
     ):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -27,7 +28,7 @@ class AircraftLSTM(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, 2)
+        self.fc = nn.Linear(hidden_size, NUM_CLASSES)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)

@@ -62,7 +62,7 @@ impl SensorRegistry {
         let centroid = self.ecef.values().fold(Vector3::zeros(), |a, s| a + s) / n;
         let norm = centroid.norm();
         if norm > 1.0 {
-            self.initial_guess_ecef = Some(centroid * ((6_371_000.0 + 10_000.0) / norm));
+            self.initial_guess_ecef = Some(centroid * (crate::consts::EARTH_RADIUS_CRUISE_ALT_M / norm));
         }
     }
 

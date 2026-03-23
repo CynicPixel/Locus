@@ -12,6 +12,8 @@ struct KalmanStatePoint {
     vel_lat: f64,
     vel_lon: f64,
     vel_alt: f64,
+    gdop: f64,
+    divergence_m: f64,
 }
 
 #[derive(Serialize)]
@@ -43,21 +45,23 @@ impl AnomalyClient {
     }
 
     /// Classify a track history.  `history` contains tuples
-    /// `(lat, lon, alt_m, vel_lat, vel_lon, vel_alt)`.
+    /// `(lat, lon, alt_m, vel_lat, vel_lon, vel_alt, gdop, divergence_m)`.
     pub async fn classify(
         &self,
         icao24: &str,
-        history: &[(f64, f64, f64, f64, f64, f64)],
+        history: &[(f64, f64, f64, f64, f64, f64, f64, f64)],
     ) -> anyhow::Result<ClassifyResponse> {
         let states: Vec<KalmanStatePoint> = history
             .iter()
-            .map(|&(lat, lon, alt_m, vel_lat, vel_lon, vel_alt)| KalmanStatePoint {
+            .map(|&(lat, lon, alt_m, vel_lat, vel_lon, vel_alt, gdop, divergence_m)| KalmanStatePoint {
                 lat,
                 lon,
                 alt_m,
                 vel_lat,
                 vel_lon,
                 vel_alt,
+                gdop,
+                divergence_m,
             })
             .collect();
 
@@ -65,7 +69,7 @@ impl AnomalyClient {
             .client
             .post(format!("{}/classify", self.base_url))
             .json(&ClassifyRequest { icao24, states })
-            .timeout(std::time::Duration::from_millis(500))
+            .timeout(std::time::Duration::from_millis(crate::consts::ML_SERVICE_TIMEOUT_MS))
             .send()
             .await?
             .json::<ClassifyResponse>()

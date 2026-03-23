@@ -23,19 +23,16 @@ use crate::global_clock_solver::{ClockObservation, GlobalClockSolver, SolveResul
 use crate::ingestor::RawFrame;
 use crate::sensors::SensorRegistry;
 
-const WINDOW_SIZE: usize = 50; // ~5 s at 10 beacon obs/s
-/// Speed of light in air (m/ns). c_vacuum/1.0003 — matches mlat-server Cair.
-const C_M_PER_NS: f64 = 0.299_702_547;
-
-/// Pair validity window: corrections become zero if not updated for this long.
-const PAIR_VALIDITY_NS: u64 = 30_000_000_000; // 30 seconds
-/// Pair expiry: remove pair state if silent for this long.
-const PAIR_EXPIRY_NS: u64 = 120_000_000_000; // 120 seconds
-/// Minimum observations before using a pair's estimate.
-const MIN_SAMPLE_COUNT: usize = 2;
-/// Maximum age of a global result before drift extrapolation is disabled (Audit Bug #3).
-/// Beyond this, the raw offset is used without drift correction to prevent unbounded error growth.
-const MAX_DRIFT_EXTRAPOLATION_NS: u64 = 120_000_000_000; // 120 seconds
+// Clock sync constants are defined in crate::consts — see CLOCK_WINDOW_SIZE, C_M_PER_NS,
+// PAIR_VALIDITY_NS, PAIR_EXPIRY_NS, MIN_SAMPLE_COUNT, MAX_DRIFT_EXTRAPOLATION_NS.
+use crate::consts::{
+    CLOCK_WINDOW_SIZE as WINDOW_SIZE,
+    C_M_PER_NS,
+    PAIR_VALIDITY_NS,
+    PAIR_EXPIRY_NS,
+    MIN_SAMPLE_COUNT,
+    MAX_DRIFT_EXTRAPOLATION_NS,
+};
 
 // ---------------------------------------------------------------------------
 // Per-pair state — OLS regression replaces windowed median (FIX-6)
@@ -139,7 +136,7 @@ impl PairState {
     /// Uses the regression-residual MAD converted to sigma: σ ≈ MAD / 0.6745 (Gaussian).
     fn variance_ns2(&mut self) -> f64 {
         self.recompute_if_dirty();
-        let sigma = self.cached_mad.max(50.0) / 0.6745;
+        let sigma = self.cached_mad.max(50.0) / crate::consts::MAD_TO_SIGMA;
         sigma * sigma
     }
 
