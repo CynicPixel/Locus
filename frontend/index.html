@@ -1190,6 +1190,7 @@
         anomaly_label: state.anomaly_label,
         anomaly_confidence: state.anomaly_confidence,
         spoof_flag: state.spoof_flag,
+        observation_mode: state.observation_mode,
         ts: Date.now(),
       };
 
@@ -1214,8 +1215,18 @@
       const ac = aircraft[icao24];
       if (!ac || !ac.trail || ac.trail.length < 2) return;
 
-      const trail = ac.trail;
+      // Filter to only points matching the current display mode
+      let trail = ac.trail;
+      if (displayMode === "smlat") {
+        trail = ac.trail.filter(p => p.observation_mode === "semi_mlat");
+      } else if (displayMode === "mlat") {
+        trail = ac.trail.filter(p => p.observation_mode === "full_mlat");
+      } else if (displayMode === "adsb") {
+        trail = ac.trail.filter(p => p.observation_mode === "adsb");
+      }
+
       const total = trail.length;
+      if (total < 2) return;
 
       for (let i = 0; i < total - 1; i++) {
         const p0 = trail[i],
@@ -1229,6 +1240,10 @@
           (p1.anomaly_label === "anomalous" && p1.anomaly_confidence > 0.75)
         ) {
           color = "#ef4444";
+        } else if (p1.observation_mode === "semi_mlat") {
+          // SMLAT trail — teal, compact dash (matches ellipse color)
+          color = "#14b8a6";
+          dashArray = "3 3";
         } else if (p1.gdop > 0) {
           // MLAT trail — color by GDOP tier
           const tier = gdopTier(p1.gdop);
@@ -2084,7 +2099,7 @@
     function refreshPopup() {
       if (!selectedIcao || !aircraft[selectedIcao]) return;
       const ac = aircraft[selectedIcao];
-      const s = ac.state;
+      const s = getActiveState(ac) ?? ac.state;
       const age = Date.now() - ac.lastSeen;
 
       // Source badge + GDOP tier badge
@@ -2217,14 +2232,15 @@
     function drawAttributionLines(icao24) {
       clearAttributionLines();
       const ac = aircraft[icao24];
-      if (!ac || !ac.state.sensor_ids?.length || ac.state.gdop === 0) return;
-      for (const sid of ac.state.sensor_ids) {
+      const activeState = getActiveState(ac) ?? ac.state;
+      if (!ac || !activeState?.sensor_ids?.length) return;
+      for (const sid of activeState.sensor_ids) {
         const sd = sensorData[sid];
         if (!sd) continue;
         const line = L.polyline(
           [
             [sd.lat, sd.lon],
-            [ac.state.lat, ac.state.lon],
+            [activeState.lat, activeState.lon],
           ],
           {color: "#60a5fa", weight: 1.5, opacity: 0.7, dashArray: "5 4"},
         ).addTo(map);
