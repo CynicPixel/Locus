@@ -106,7 +106,7 @@ impl Correlator {
     pub fn new() -> Self {
         Self {
             groups: HashMap::new(),
-            min_sensors: 3,
+            min_sensors: 2, // Changed from 3 to enable semi-MLAT (2-sensor observations)
             window_ns: 200_000_000, // FIX-19: 200 ms (was 50 ms) — captures late-arriving frames
         }
     }
@@ -207,11 +207,11 @@ mod tests {
             c.ingest(make_frame(sensor, icao, base_ns + sensor as u64 * 1_000_000));
         }
 
-        // Not evicted yet — window is 50 ms
+        // Not evicted yet — window is 200 ms
         assert!(c.evict_stale(base_ns + 10_000_000).is_empty());
 
-        // After 60 ms, should emit one group with 4 sensors
-        let emitted = c.evict_stale(base_ns + 60_000_000);
+        // After 210 ms, should emit one group with 4 sensors
+        let emitted = c.evict_stale(base_ns + 210_000_000);
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].frames.len(), 4);
     }
@@ -222,12 +222,10 @@ mod tests {
         let icao = [0x01, 0x02, 0x03];
         let base_ns = 1_700_000_000_000_000_000u64;
 
-        // Only 2 sensors (below min_sensors=3)
-        for sensor in 1..=2 {
-            c.ingest(make_frame(sensor, icao, base_ns));
-        }
+        // Only 1 sensor (below min_sensors=2) — semi-MLAT requires at least 2
+        c.ingest(make_frame(1, icao, base_ns));
 
-        let emitted = c.evict_stale(base_ns + 60_000_000);
+        let emitted = c.evict_stale(base_ns + 210_000_000);
         assert!(emitted.is_empty());
     }
 }

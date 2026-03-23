@@ -18,6 +18,7 @@ pub struct SensorInfo {
     pub alt_m: f64,
 }
 
+#[derive(Clone)]
 pub struct SensorRegistry {
     ecef: HashMap<i64, Vector3<f64>>,
     wgs84: HashMap<i64, (f64, f64, f64)>,  // sensor_id → (lat, lon, alt_m)
