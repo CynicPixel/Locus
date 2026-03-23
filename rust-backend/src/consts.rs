@@ -116,7 +116,11 @@ pub const INITIAL_POS_VARIANCE_M2: f64 = 1_000_000.0;
 /// Initial velocity variance on filter creation (m²/s² ≈ 200 m/s spread)
 pub const INITIAL_VEL_VARIANCE_M2: f64 = 40_000.0;
 /// Process noise modelled as constant acceleration (m/s²)
-pub const PROCESS_NOISE_ACCEL_MS2: f64 = 1.0;
+/// FIX: Increased from 1.0 to 100.0 for 6-state CV model with sparse MLAT measurements.
+/// With sparse measurements (5-30s intervals), velocity uncertainty must grow by ~32 m/s
+/// over 10s to cover aircraft maneuvers (±3σ = ±96 m/s). Based on Bar-Shalom (2001)
+/// recommendation for CV models with irregular measurements.
+pub const PROCESS_NOISE_ACCEL_MS2: f64 = 0.5;
 /// Minimum measurement noise variance — floor on sensor noise (metres²)
 pub const MEASUREMENT_NOISE_FLOOR_M2: f64 = 10_000.0;
 /// Squared Mahalanobis gate for outlier rejection (= 15²)
@@ -126,7 +130,9 @@ pub const OUTLIER_COUNT_RESET: u32 = 3;
 /// Velocity variance reset to this value after a hard filter reset (m²/s²)
 pub const RESET_VEL_VARIANCE_M2: f64 = 40_000.0;
 /// Maximum plausible aircraft speed — updates beyond this are rejected (m/s)
-pub const MAX_SPEED_MS: f64 = 350.0;
+/// FIX: Reduced from 350.0 (680 knots, supersonic) to 300.0 (583 knots).
+/// Commercial aircraft max cruise ~280 m/s (Mach 0.85 at FL350).
+pub const MAX_SPEED_MS: f64 = 583.0;
 
 // ===== CLOCK SYNC & QUALITY =====
 
