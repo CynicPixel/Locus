@@ -35,6 +35,10 @@ pub struct AircraftState {
     /// Meters per second vertical.
     pub vel_alt: f64,
     pub gdop: f64,
+    /// Vertical DOP - quality indicator for altitude estimate.
+    pub vdop: f64,
+    /// True if altitude is within valid range (-500m to 15,000m).
+    pub altitude_valid: bool,
     /// 2-sigma horizontal confidence ellipse radius (meters).
     pub confidence_ellipse_m: f64,
     pub spoof_flag: bool,
@@ -83,6 +87,7 @@ enum ClientMessage {
     AddVirtualSensor { lat: f64, lon: f64, alt_m: f64 },
     RemoveVirtualSensor { id: u64 },
     ClearVirtualSensors,
+    SetPlanningAltitude { altitude_m: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,7 @@ pub async fn run_ws_server(
 
             let (mut sink, mut source) = ws.split();
             let mut virtual_registry = VirtualSensorRegistry::new(20);
+            let mut planning_altitude = 3048.0; // FL100 default
 
             // Send cached heatmap immediately — no wait for next 60s tick
             {
@@ -167,6 +173,7 @@ pub async fn run_ws_server(
                                     &mut sink,
                                     &sensor_registry,
                                     peer,
+                                    &mut planning_altitude,
                                 ).await;
                             }
                             Some(Ok(Message::Close(_))) | None => break,
@@ -196,6 +203,7 @@ async fn handle_client_msg(
     sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
     sreg: &Arc<RwLock<SensorRegistry>>,
     peer: SocketAddr,
+    planning_altitude: &mut f64,
 ) {
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -212,7 +220,7 @@ async fn handle_client_msg(
                     send_json(sink, &ClientResponse::VirtualSensorAdded {
                         id: id.0, lat, lon, alt_m,
                     }).await;
-                    recompute_planning_gdop(vreg, sink, sreg).await;
+                    recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
                 }
                 Err(e) => {
                     send_json(sink, &ClientResponse::VirtualSensorError { message: e }).await;
@@ -222,12 +230,24 @@ async fn handle_client_msg(
         ClientMessage::RemoveVirtualSensor { id } => {
             vreg.remove(VirtualSensorId(id));
             send_json(sink, &ClientResponse::VirtualSensorRemoved { id }).await;
-            recompute_planning_gdop(vreg, sink, sreg).await;
+            recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
         }
         ClientMessage::ClearVirtualSensors => {
             vreg.clear();
             send_json(sink, &ClientResponse::VirtualSensorsCleared).await;
             // No recompute — client exits planning mode, live heatmap resumes
+        }
+        ClientMessage::SetPlanningAltitude { altitude_m } => {
+            // Validate altitude (positive, reasonable range)
+            if altitude_m > 0.0 && altitude_m <= 15_000.0 {
+                *planning_altitude = altitude_m;
+                tracing::debug!(altitude_m, "updated planning mode altitude");
+                recompute_planning_gdop(vreg, sink, sreg, *planning_altitude).await;
+            } else {
+                send_json(sink, &ClientResponse::VirtualSensorError {
+                    message: format!("Invalid altitude: {altitude_m}m (must be 0-15000m)"),
+                }).await;
+            }
         }
     }
 }
@@ -240,6 +260,7 @@ async fn recompute_planning_gdop(
     vreg: &VirtualSensorRegistry,
     sink: &mut SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>,
     sreg: &Arc<RwLock<SensorRegistry>>,
+    altitude_m: f64,
 ) {
     // Snapshot both registries — release async lock before spawn_blocking.
     // SensorRegistry: #[derive(Clone)], VirtualSensorRegistry: #[derive(Clone)]
@@ -250,8 +271,8 @@ async fn recompute_planning_gdop(
         crate::gdop_heatmap::compute_grid_with_virtual(
             &real_snap,
             &virt_snap,
-            9144.0, // FL300 — same as live heatmap
-            0.1,    // 0.1° resolution — same as live heatmap
+            altitude_m, // User-configurable altitude (FL050/FL100/FL300)
+            0.1,        // 0.1° resolution — same as live heatmap
         )
     })
     .await;
