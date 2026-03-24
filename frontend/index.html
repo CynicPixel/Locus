@@ -632,6 +632,45 @@
       color: #6e7681;
       min-width: 60px;
     }
+
+  /* ─── Demo video floating pill ──────────────────────────────── */
+  #demo-btn {
+    position: absolute;
+    bottom: 34px;
+    right: 10px;
+    z-index: 1001;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 13px 7px 10px;
+    background: rgba(13, 17, 23, 0.97);
+    border: 1px solid #2dd4bf;
+    border-radius: 20px;
+    color: #2dd4bf;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    text-decoration: none;
+    font-family: 'Courier New', Courier, monospace;
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0);
+    transition: background 0.15s, box-shadow 0.2s, border-color 0.15s, color 0.15s;
+    cursor: pointer;
+    user-select: none;
+  }
+  #demo-btn:hover {
+    background: rgba(45, 212, 191, 0.08);
+    border-color: #5eead4;
+    color: #5eead4;
+    box-shadow: 0 0 10px rgba(45, 212, 191, 0.28), 0 2px 8px rgba(0,0,0,0.55);
+  }
+  #demo-btn:active { background: rgba(45, 212, 191, 0.15); }
+  #demo-btn .demo-play-icon {
+    font-size: 0.85rem;
+    color: #f87171;
+    line-height: 1;
+    flex-shrink: 0;
+  }
   </style>
 </head>
 
@@ -813,6 +852,15 @@
           <table id="popup-table"></table>
         </div>
       </div>
+      <!-- Demo video pill — always visible for hackathon reviewers -->
+      <a id="demo-btn"
+         href="https://youtu.be/3yB2SLVSIsk"
+         target="_blank"
+         rel="noopener noreferrer"
+         title="Watch the demo walkthrough on YouTube">
+        <span class="demo-play-icon">&#9654;</span>
+        <span>Watch Demo</span>
+      </a>
     </div>
     <div id="sidebar">
       <header>
@@ -946,7 +994,7 @@
     }
 
     // Prevent ALL map-overlay panel clicks from bleeding through into the Leaflet map
-    ['vs-float', 'ctrl-rail', 'marker-legend', 'clock-panel', 'ac-popup-wrapper'].forEach(id => {
+    ['vs-float', 'ctrl-rail', 'marker-legend', 'clock-panel', 'ac-popup-wrapper', 'demo-btn'].forEach(id => {
       const el = document.getElementById(id);
       if (el) L.DomEvent.disableClickPropagation(el);
     });
