@@ -772,37 +772,88 @@ These optimizations are explicitly **deferred** until scaling demands or specifi
 
 ### Prerequisites
 
-- **Rust** (1.75+) with `cargo`
-- **Python** (3.10+) with `pip` (for ML service)
-- **Node.js** (optional, for frontend development)
-- A Mode S data source (e.g., `dump1090` feeding frames via Unix socket)
+**Docker deployment (recommended)**
+- **Docker** 20.10+ and **Docker Compose** v2
 
-### Build & Run
+**Local dev (no Docker)**
+- **Rust** 1.75+ with `cargo`
+- **Python** 3.10+ with `pip`
+- **Go** 1.24+
+
+### Environment Setup
+
+Locus requires two separate env files before running:
+
+**1. Root `.env`** — Docker Compose reads this automatically for the ingestor's public endpoint:
+```bash
+cp .env.example .env
+# Fill in:
+#   MY_PUBLIC_IP=<your public IP>
+#   MY_PUBLIC_PORT=<your public port>
+#   token / clientId / clientSecret  (optional, for OpenSky enrichment)
+```
+
+**2. `go-ingestor/.env`** — P2P / Hedera network credentials (create this manually):
+```ini
+eth_rpc_url=https://testnet.hashio.io/api
+hedera_evm_id=<your hedera EVM address>
+hedera_id=<your hedera account id>
+location={"lat":<lat>,"lon":<lon>,"alt":0.0}
+mirror_api_url=https://testnet.mirrornode.hedera.com/api/v1
+private_key=<your private key>
+smart_contract_address=<contract address>
+list_of_sellers=<comma-separated seller pubkeys>
+port=61339
+```
+
+### Build & Run — Docker Compose (recommended)
 
 ```bash
-# 1. Build the Rust backend
-cd rust-backend
-cargo build --release
+# After completing Environment Setup above:
+docker compose up --build
+```
 
-# 2. Install Python ML dependencies
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:3000 |
+| ML API | http://localhost:8000 |
+| WebSocket engine | ws://localhost:9001 |
+
+```bash
+# Stop all services
+docker compose down
+```
+
+### Build & Run — Local Dev (no Docker)
+
+```bash
+# 1. Start Go ingestor  (from project root)
+cd go-ingestor
+go run main.go \
+  --port=61339 \
+  --mode=peer \
+  --buyer-or-seller=buyer \
+  --list-of-sellers-source=env \
+  --envFile=.env \
+  --my-public-ip=<YOUR_PUBLIC_IP> \
+  --my-public-port=<YOUR_PUBLIC_PORT> &
+
+# 2. Install + start ML service
 cd ../ml-service
 pip install -r requirements.txt
-
-# 3. (Optional) Train the anomaly classifier
-python train.py --epochs 20 --output model.pt
-
-# 4. Start the ML service
 uvicorn main:app --host 0.0.0.0 --port 8000 &
 
-# 5. Start the Rust backend
+# 3. Build + start Rust backend
 cd ../rust-backend
-./target/release/locus-backend \
+mkdir -p /tmp/locus
+RUST_LOG=locus_backend=debug cargo run -- \
   --ws-addr 0.0.0.0:9001 \
-  --ml-service-url http://localhost:8000
+  --ml-service-url http://localhost:8000 &
 
-# 6. Open the dashboard
-open frontend/index.html
-# Connect to ws://localhost:9001
+# 4. Serve frontend
+cd ../frontend
+python3 -m http.server 3000 &
+# Open http://localhost:3000
 ```
 
 ### Configuration
